@@ -269,3 +269,35 @@ LSW (Linux Subsystem for Windows) is an independent open-source project and is *
 "Windows," "WSL," and "Windows Subsystem for Linux" are trademarks or registered trademarks of Microsoft Corporation.
 
 LSW is a descriptive name referring to functionality (running Windows applications on Linux systems) and is not intended to cause confusion with Microsoft's WSL product.
+
+## Package Management Integration
+
+LSW integrates with Windows package managers for seamless app installation:
+
+### Winget Support
+
+```bash
+# Install Windows apps using Microsoft's official package manager
+lsw winget install Microsoft.VisualStudioCode
+lsw winget install Google.Chrome
+lsw winget search photoshop
+lsw winget upgrade --all
+
+# Full winget compatibility on Linux
+```
+
+### MSI Installer Support
+
+```bash
+# Install from .msi files
+lsw install application.msi
+
+# Silent installation
+lsw install --silent app.msi
+```
+
+### Benefits
+- No manual downloads needed
+- Uses Microsoft's official repositories
+- Automatic updates via winget
+- Familiar Windows package management on Linux
