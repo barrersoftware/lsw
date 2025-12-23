@@ -258,3 +258,14 @@ One kernel. Two worlds. Native performance.
 🚀 The Future of Cross-Platform Computing
 
 **LSW - Because Linux users deserve Windows apps too.**
+
+
+---
+
+## Trademark Disclaimer
+
+LSW (Linux Subsystem for Windows) is an independent open-source project and is **not affiliated with, endorsed by, or sponsored by Microsoft Corporation or the Windows Subsystem for Linux (WSL) project.**
+
+"Windows," "WSL," and "Windows Subsystem for Linux" are trademarks or registered trademarks of Microsoft Corporation.
+
+LSW is a descriptive name referring to functionality (running Windows applications on Linux systems) and is not intended to cause confusion with Microsoft's WSL product.
