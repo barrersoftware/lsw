@@ -5,10 +5,23 @@
  */
 
 #include "lsw_filesystem.h"
+#include "lsw_config.h"
 #include <string.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <ctype.h>
+
+// Global config (loaded at startup)
+static lsw_config_t g_config;
+static bool g_config_loaded = false;
+
+// Ensure config is loaded
+static void ensure_config(void) {
+    if (!g_config_loaded) {
+        lsw_config_load(&g_config);
+        g_config_loaded = true;
+    }
+}
 
 // ============================================================================
 // SECTION: Path Translation
@@ -17,9 +30,9 @@
 /**
  * Convert Windows path to Linux path
  * 
- * What: C:\Windows\System32 → /mnt/c/Windows/System32
+ * What: C:\Windows\System32 → <drive_root>/Windows/System32
  * Why: Linux kernel needs Linux paths
- * How: Map drive letter, replace backslashes
+ * How: Look up drive mapping in config, replace backslashes
  */
 lsw_status_t lsw_fs_win_to_linux(
     const char* windows_path,
@@ -30,21 +43,42 @@ lsw_status_t lsw_fs_win_to_linux(
         return LSW_ERROR_INVALID_PARAMETER;
     }
 
+    // Load config if needed
+    ensure_config();
+
     // Check for drive letter (C:, D:, etc.)
     if (strlen(windows_path) >= 2 && windows_path[1] == ':') {
-        char drive = tolower(windows_path[0]);
+        char drive = toupper(windows_path[0]);
         
-        // Build Linux path: /mnt/c/...
-        int written = snprintf(linux_path, buffer_size, "/mnt/%c", drive);
-        if (written < 0 || (size_t)written >= buffer_size) {
+        // Get drive root from config
+        const char* drive_root = lsw_config_get_drive_root(&g_config, drive);
+        if (!drive_root) {
+            // Unknown drive
             return LSW_ERROR_INVALID_PARAMETER;
         }
         
-        // Skip drive letter (C:)
+        // Build Linux path: <drive_root>/...
+        // Handle root drive (/) specially to avoid double slash
+        size_t pos = 0;
+        if (strcmp(drive_root, "/") == 0) {
+            // Root drive - don't add extra slash
+            linux_path[pos++] = '/';
+        } else {
+            // Non-root drive - copy full path
+            int written = snprintf(linux_path, buffer_size, "%s", drive_root);
+            if (written < 0 || (size_t)written >= buffer_size) {
+                return LSW_ERROR_INVALID_PARAMETER;
+            }
+            pos = written;
+        }
+        
+        // Skip drive letter (C:) and leading backslash if present
         const char* path_part = windows_path + 2;
+        if (*path_part == '\\' || *path_part == '/') {
+            path_part++;  // Skip the leading slash
+        }
         
         // Copy rest of path, converting backslashes to forward slashes
-        size_t pos = written;
         while (*path_part && pos < buffer_size - 1) {
             if (*path_part == '\\') {
                 linux_path[pos++] = '/';
@@ -71,9 +105,9 @@ lsw_status_t lsw_fs_win_to_linux(
 /**
  * Convert Linux path to Windows path
  * 
- * What: /mnt/c/Windows → C:\Windows
+ * What: <drive_root>/Windows → C:\Windows  
  * Why: Some Windows APIs expect Windows paths
- * How: Reverse of win_to_linux
+ * How: Detect which drive root matches, build Windows path
  */
 lsw_status_t lsw_fs_linux_to_win(
     const char* linux_path,
@@ -84,18 +118,24 @@ lsw_status_t lsw_fs_linux_to_win(
         return LSW_ERROR_INVALID_PARAMETER;
     }
 
-    // Check for /mnt/ prefix
-    if (strncmp(linux_path, "/mnt/", 5) == 0 && linux_path[6] == '/') {
-        char drive = toupper(linux_path[5]);
+    // Load config if needed
+    ensure_config();
+
+    // Check if path starts with C: drive root
+    const char* c_root = g_config.c_drive_root;
+    size_t c_root_len = strlen(c_root);
+    
+    if (strncmp(linux_path, c_root, c_root_len) == 0) {
+        // It's on C: drive
+        const char* path_part = linux_path + c_root_len;
         
         // Build Windows path: C:\...
-        int written = snprintf(windows_path, buffer_size, "%c:", drive);
+        int written = snprintf(windows_path, buffer_size, "C:");
         if (written < 0 || (size_t)written >= buffer_size) {
             return LSW_ERROR_INVALID_PARAMETER;
         }
         
         // Copy rest, converting slashes to backslashes
-        const char* path_part = linux_path + 6;  // Skip /mnt/c
         size_t pos = written;
         while (*path_part && pos < buffer_size - 1) {
             windows_path[pos++] = (*path_part == '/') ? '\\' : *path_part;
@@ -104,7 +144,7 @@ lsw_status_t lsw_fs_linux_to_win(
         windows_path[pos] = '\0';
         
     } else {
-        // Not a /mnt path - convert slashes anyway
+        // Not a known drive - convert slashes anyway
         size_t i;
         for (i = 0; i < buffer_size - 1 && linux_path[i]; i++) {
             windows_path[i] = (linux_path[i] == '/') ? '\\' : linux_path[i];

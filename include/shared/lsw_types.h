@@ -175,15 +175,10 @@ typedef enum {
 } lsw_log_level_t;
 
 // ============================================================================
-// SECTION: Configuration
+// SECTION: Configuration (see lsw_config.h for full definition)
 // ============================================================================
 
-typedef struct {
-    lsw_windows_version_t default_win_version;
-    lsw_log_level_t       log_level;
-    bool                  debug_mode;
-    bool                  verbose;
-    char                  registry_path[LSW_MAX_PATH];
-} lsw_config_t;
+// Forward declaration - full definition in lsw_config.h
+typedef struct lsw_config lsw_config_t;
 
 #endif // LSW_TYPES_H
