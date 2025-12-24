@@ -2,6 +2,20 @@
 
 **Windows binary support for Linux kernels - WSL2 in reverse**
 
+## 🆓 ALWAYS FREE
+
+**LSW is and will always be free.**
+
+- ✅ Free to download
+- ✅ Free to use
+- ✅ Free to modify
+- ✅ Free to distribute
+- ❌ NEVER for sale
+
+If anyone is charging you for LSW, report them: legal@barrersoftware.com
+
+**Built on free resources (Microsoft Open Specs, WSL) → Must remain free forever**
+
 ## Vision
 
 Enable native Windows application execution on Linux-based operating systems without emulation overhead. Just as WSL2 allows Linux binaries to run on Windows kernel, LSW allows Windows binaries to run on Linux kernel with native performance.
@@ -11,7 +25,7 @@ Enable native Windows application execution on Linux-based operating systems wit
 - **Native Performance**: Direct syscall translation, no emulation layer
 - **Full Resource Access**: Windows apps access hardware directly through Linux kernel
 - **Universal Compatibility**: Works on any Linux distribution (Ubuntu, Arch, Fedora, BarrerOS, etc.)
-- **Open Source**: MIT licensed for community adoption and contribution
+- **Open Source**: BarrerSoftware License - free forever, cannot be sold
 - **Standards-Based**: Built from Microsoft Open Specifications documentation
 
 ## Architecture Overview
@@ -213,10 +227,25 @@ lsw-run myapp.exe
 
 ## Community
 
-- **License**: MIT (open source, community-driven)
+- **License**: BarrerSoftware License v1.0 (open source, free forever)
 - **Target**: All Linux distributions
 - **First Implementation**: BarrerOS (dogfooding)
 - **Goal**: Industry standard for Windows app support on Linux
+
+## 💝 Support BarrerSoftware
+
+LSW is FREE software and will always be free.
+
+If you'd like to support our work:
+- 🌟 Star this repo
+- 📢 Tell others about it  
+- 💰 [Support our mission](https://barrersoftware.com/support)
+
+Or check out our paid products:
+- **Velocity Panel** - Premium server management
+- **CleanVM Enterprise** - Enterprise virtualization
+
+**No pressure. Just appreciation.**
 
 ## Why LSW?
 

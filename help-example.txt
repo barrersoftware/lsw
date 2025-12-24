@@ -1,0 +1,61 @@
+# LSW Help System - Detailed Command Explanations
+
+## Example: lsw --winget --help
+
+🏴‍☠️ LSW WINGET - Windows Package Manager Integration
+
+DESCRIPTION:
+    --winget integrates Microsoft's Windows Package Manager (winget) with LSW.
+    Use this to install, search, and manage Windows applications directly on Linux
+    without manually downloading executables.
+
+USAGE:
+    lsw --winget <subcommand> [-flags] [package]
+
+SUBCOMMANDS:
+    search <query>         Search for Windows packages
+    install <package>      Install a Windows application
+    uninstall <package>    Remove a Windows application  
+    upgrade <package>      Upgrade to latest version
+    upgrade --all          Upgrade all installed packages
+    list                   List installed packages
+    show <package>         Show package details
+
+FLAGS:
+    -silent, -s           Silent installation (no prompts)
+    -interactive, -i      Interactive installation (show prompts)
+    -verbose, -v          Show detailed output
+    -source <url>         Use alternate package source
+
+EXAMPLES:
+
+    # Search for packages
+    lsw --winget search chrome
+    lsw winget search "visual studio"
+
+    # Install packages
+    lsw --winget install Google.Chrome
+    lsw winget install -silent Microsoft.VisualStudioCode
+    lsw winget install -s Adobe.Photoshop
+
+    # Manage packages
+    lsw --winget upgrade --all
+    lsw winget uninstall Google.Chrome
+    lsw winget list
+
+    # Get package info
+    lsw winget show Microsoft.Office
+
+WHAT HAPPENS:
+    1. LSW connects to Microsoft's winget repository
+    2. Downloads the Windows package (.exe or .msi)
+    3. Installs via LSW's Windows compatibility layer
+    4. Registers in LSW package database
+    5. App runs natively on Linux via LSW
+
+MORE HELP:
+    lsw --help              General LSW help
+    lsw --install --help    MSI installer help
+    lsw --run --help        Running executables help
+
+🏴‍☠️ LSW - Making Windows software universal
