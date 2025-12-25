@@ -48,6 +48,10 @@ void lsw_config_defaults(lsw_config_t* config) {
     config->default_win_version = LSW_WIN_10;
     config->auto_detect_version = true;
     
+    // CPU emulation defaults
+    config->emulated_cpu_speed_mhz = 0;   // 0 = native speed (no throttling)
+    config->enable_cpu_throttling = false;
+    
     // Logging
     config->log_level = LSW_LOG_INFO;
     config->debug_mode = false;
@@ -197,6 +201,12 @@ lsw_status_t lsw_config_save(const lsw_config_t* config) {
     fprintf(f, "[windows]\n");
     fprintf(f, "version = %d\n", config->default_win_version);
     fprintf(f, "auto_detect = %s\n\n", config->auto_detect_version ? "true" : "false");
+    
+    fprintf(f, "[cpu]\n");
+    fprintf(f, "# CPU speed emulation (0 = native speed, no throttling)\n");
+    fprintf(f, "# Examples: 5 (IBM PC), 25 (486), 100 (Pentium), 500 (Pentium III)\n");
+    fprintf(f, "speed_mhz = %u\n", config->emulated_cpu_speed_mhz);
+    fprintf(f, "throttling = %s\n\n", config->enable_cpu_throttling ? "true" : "false");
     
     fprintf(f, "[logging]\n");
     fprintf(f, "level = %d\n", config->log_level);

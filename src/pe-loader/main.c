@@ -159,6 +159,7 @@ int main(int argc, char* argv[]) {
     bool debug_mode = false;
     bool verbose = false;
     lsw_windows_version_t win_version = LSW_WIN_AUTO;
+    uint32_t cpu_speed_mhz = 0;  // 0 = native
     char* executable_path = NULL;
     
     // Check for help requests (forgiving!)
@@ -202,7 +203,9 @@ int main(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-version") == 0) {
             if (i + 1 < argc) {
                 i++;
-                if (strcmp(argv[i], "xp") == 0) {
+                if (strcmp(argv[i], "dos") == 0) {
+                    win_version = LSW_WIN_XP;  // Use XP as placeholder for now
+                } else if (strcmp(argv[i], "xp") == 0) {
                     win_version = LSW_WIN_XP;
                 } else if (strcmp(argv[i], "vista") == 0) {
                     win_version = LSW_WIN_VISTA;
@@ -224,6 +227,28 @@ int main(int argc, char* argv[]) {
                     fprintf(stderr, "\nExample: lsw --launch app.exe -version win7\n\n");
                     return 1;
                 }
+            }
+        } else if (strcmp(argv[i], "-cpu") == 0) {
+            if (i + 1 < argc) {
+                i++;
+                // Parse CPU speed: "25mhz", "100mhz", "500mhz"
+                char* speed_str = argv[i];
+                int parsed = sscanf(speed_str, "%umhz", &cpu_speed_mhz);
+                if (parsed != 1) {
+                    // Try without "mhz" suffix
+                    parsed = sscanf(speed_str, "%u", &cpu_speed_mhz);
+                }
+                if (parsed != 1 || cpu_speed_mhz == 0) {
+                    fprintf(stderr, "⚠️  Invalid CPU speed: %s\n\n", speed_str);
+                    fprintf(stderr, "Examples:\n");
+                    fprintf(stderr, "  5mhz    (IBM PC - 4.77 MHz)\n");
+                    fprintf(stderr, "  25mhz   (486 - 25 MHz)\n");
+                    fprintf(stderr, "  100mhz  (Pentium - 100 MHz)\n");
+                    fprintf(stderr, "  500mhz  (Pentium III)\n\n");
+                    fprintf(stderr, "Example: lsw --launch game.exe -cpu 25mhz\n\n");
+                    return 1;
+                }
+                LSW_LOG_INFO("CPU throttling enabled: %u MHz", cpu_speed_mhz);
             }
         }
     }

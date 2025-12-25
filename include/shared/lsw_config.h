@@ -31,6 +31,10 @@ typedef struct lsw_config {
     lsw_windows_version_t default_win_version;
     bool auto_detect_version;             // Try to detect from PE header
     
+    // CPU emulation
+    uint32_t emulated_cpu_speed_mhz;      // Target CPU speed (0 = native)
+    bool     enable_cpu_throttling;       // Enable speed limiting
+    
     // Behavior
     lsw_log_level_t log_level;
     bool debug_mode;
