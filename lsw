@@ -1,0 +1,8 @@
+#!/bin/bash
+# LSW Wrapper Script
+# Sets library path and runs LSW PE loader
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LD_LIBRARY_PATH="$SCRIPT_DIR/build/lib:$LD_LIBRARY_PATH"
+
+exec "$SCRIPT_DIR/build/bin/lsw-pe-loader" "$@"

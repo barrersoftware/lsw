@@ -7,7 +7,7 @@
 # Compiler settings
 CC := gcc
 CFLAGS := -Wall -Wextra -std=c11 -pedantic -O2 -fPIC
-INCLUDES := -Iinclude -Iinclude/shared
+INCLUDES := -Iinclude -Iinclude/shared -Iinclude/pe-loader
 DEBUG_FLAGS := -g -DDEBUG
 
 # Directories

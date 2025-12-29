@@ -7,6 +7,9 @@
 #include "lsw_types.h"
 #include "lsw_log.h"
 #include "lsw_filesystem.h"
+#include "pe-loader/pe_loader.h"
+#include "pe-loader/pe_parser.h"
+#include "pe-loader/pe_format.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -285,12 +288,32 @@ int main(int argc, char* argv[]) {
     
     LSW_LOG_INFO("File found: %s", executable_path);
     
-    // TODO: Actually load and execute the PE file
-    fprintf(stderr, "\n");
-    fprintf(stderr, "🚧 LSW is still in early development\n\n");
-    fprintf(stderr, "The foundation is built, but PE loading isn't implemented yet.\n");
-    fprintf(stderr, "Check back soon, or contribute on GitHub!\n\n");
-    fprintf(stderr, "https://github.com/barrersoftware/lsw\n\n");
+    // Load and execute PE file
+    pe_image_t image;
+    if (!pe_load_image(&image, executable_path)) {
+        fprintf(stderr, "\n❌ Failed to load PE file\n\n");
+        return 1;
+    }
     
-    return 0;
+    // Display PE info
+    printf("\n");
+    printf("✅ PE file loaded successfully\n\n");
+    printf("Architecture: %s\n", image.pe.is_64bit ? "x64 (64-bit)" : "x86 (32-bit)");
+    printf("Subsystem: %s\n", 
+           pe_get_subsystem(&image.pe) == PE_SUBSYSTEM_WINDOWS_GUI ? "GUI" :
+           pe_get_subsystem(&image.pe) == PE_SUBSYSTEM_WINDOWS_CUI ? "Console" : "Other");
+    printf("Type: %s\n", pe_is_dll(&image.pe) ? "DLL" : "Executable");
+    printf("Image Base: 0x%llx\n", (unsigned long long)pe_get_image_base(&image.pe));
+    printf("Entry Point: %p (RVA: 0x%08x)\n", image.entry_point, pe_get_entry_point(&image.pe));
+    printf("Image Size: 0x%lx bytes\n", image.image_size);
+    printf("Sections: %u\n", image.pe.num_sections);
+    printf("\n");
+    
+    // Execute
+    int exit_code = pe_execute(&image, argc, argv);
+    
+    // Clean up
+    pe_unload_image(&image);
+    
+    return exit_code;
 }
