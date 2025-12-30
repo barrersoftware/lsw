@@ -1,281 +1,257 @@
-# The BarrerSoftware License (BSL)
-## Version 1.0
+================================================================================
+THE BARRER OPEN SOURCE LICENSE (BOSL) - Version 1.1-BLF
+================================================================================
 
 Copyright (c) 2025 BarrerSoftware
 
----
+================================================================================
+SIMPLE TERMS (Human-Readable Summary)
+================================================================================
 
-## Preamble
+Core Principle: "If it's free, it's free. Period."
 
-This license governs software released by BarrerSoftware that 
-is designated as FREE software.
+✅ YOU CAN:
+  • Use this software for anything
+  • Study how it works
+  • Modify and improve it
+  • Share it with others
+  • Contribute improvements back
+  
+❌ YOU CANNOT:
+  • Sell this software or charge for it
+  • Create paid versions or tiers
+  • Monetize it in ANY way
+  • Bundle it with paid products (unless this stays free)
+  • Charge for downloads or access
+  
+⚠️  IMPORTANT:
+  • Modified versions MUST stay free forever
+  • Must keep this license and attribution
+  • You CAN charge for SERVICES (support, training, consulting)
+  • You CANNOT charge for the SOFTWARE itself
 
-**Core Principle:**
+That's it. Free software stays free. Forever.
 
-"If it's free, it's free. Period."
+================================================================================
+And now, for the lawyers...
+(The simple terms above and formal terms below are both legally binding)
+================================================================================
 
-Software under this license is provided to the community at
-zero cost and MUST remain at zero cost forever.
+THE BARRERSOFTWARE LICENSE (BSL)
+Version 1.1
 
----
+PREAMBLE
 
-## Grant of Rights
+This license governs software released by BarrerSoftware that is designated 
+as FREE software.
 
-Permission is hereby granted, free of charge, to any person
-obtaining a copy of this software to:
+Core Principle: "If it's free, it's free. Period."
 
-✅ **USE** - Use the software for any purpose
-✅ **STUDY** - Examine how the software works  
-✅ **MODIFY** - Make changes and improvements
-✅ **DISTRIBUTE** - Share copies with others
-✅ **CONTRIBUTE** - Submit improvements back
+Software under this license is provided to the community at zero cost and 
+MUST remain at zero cost forever.
 
----
+GRANT OF RIGHTS
 
-## Mandatory Restrictions
+Permission is hereby granted, free of charge, to any person obtaining a copy 
+of this software and associated documentation files (the "Software"), to:
 
-### 1. NO COMMERCIALIZATION
+  • USE - Use the software for any purpose
+  • STUDY - Examine how the software works
+  • MODIFY - Make changes and improvements
+  • DISTRIBUTE - Share copies with others
+  • CONTRIBUTE - Submit improvements back
 
-**YOU MUST NOT:**
+MANDATORY RESTRICTIONS
 
-❌ Sell this software or any derivative work
-❌ Charge fees for access to this software
-❌ Create paid tiers, editions, or versions
-❌ Implement subscription or licensing models
-❌ Bundle with paid products (unless this remains free)
-❌ Charge for downloads, installations, or usage
-❌ Monetize this software in ANY form
+1. NO COMMERCIALIZATION
 
-**This software MUST remain free.**
+YOU MUST NOT:
+  ❌ Sell this software or any derivative work
+  ❌ Charge fees for access to this software
+  ❌ Create paid tiers, editions, or versions
+  ❌ Implement subscription or licensing models
+  ❌ Bundle with paid products (unless this remains free)
+  ❌ Charge for downloads, installations, or usage
+  ❌ Monetize this software in ANY form
 
-### 2. PERPETUAL FREE STATUS
+This software MUST remain free.
+
+2. PERPETUAL FREE STATUS
 
 Any modified or derivative version MUST:
-- Remain under this license (or compatible)
-- Stay free of charge forever
-- Include this license in full
-- Maintain attribution to BarrerSoftware
+  • Remain under this license (or compatible)
+  • Stay free of charge forever
+  • Include this license in full
+  • Maintain attribution to BarrerSoftware
 
-### 3. SERVICE EXCEPTION
+3. SERVICE EXCEPTION
 
 You MAY charge for SERVICES, not SOFTWARE:
-
-✅ Technical support contracts
-✅ Installation and setup services
-✅ Training and education
-✅ Custom integration work
-✅ Consulting services
+  ✅ Technical support contracts
+  ✅ Installation and setup services
+  ✅ Training and education
+  ✅ Custom integration work
+  ✅ Consulting services
 
 ❌ The software itself must remain free
 
----
-
-## Attribution Requirements
+ATTRIBUTION REQUIREMENTS
 
 You MUST:
-- Keep copyright notices intact
-- Include this license with all copies
-- Credit BarrerSoftware in documentation
-- Link to original source repository
+  • Keep copyright notices intact
+  • Include this license with all copies
+  • Credit BarrerSoftware in documentation
+  • Link to original source repository
 
 You MUST NOT:
-- Remove or alter copyright notices
-- Claim you created the original software
-- Imply BarrerSoftware endorses your version
+  • Remove or alter copyright notices
+  • Claim you created the original software
+  • Imply BarrerSoftware endorses your version
 
----
+PATENT GRANT
 
-## Patent Grant
-
-BarrerSoftware grants you a perpetual, worldwide, 
-non-exclusive, no-charge, royalty-free patent license to:
-- Use
-- Make
-- Have made
-- Import
-- Distribute
-
+BarrerSoftware grants you a perpetual, worldwide, non-exclusive, no-charge, 
+royalty-free patent license to use, make, have made, import, and distribute 
 this software.
 
-If you initiate patent litigation against BarrerSoftware
-or this software, this license terminates.
+If you initiate patent litigation against BarrerSoftware or this software, 
+this license terminates immediately.
 
----
+RATIONALE
 
-## Rationale
+Why This License Exists:
 
-### Why This License Exists
-
-BarrerSoftware releases most software for FREE because:
-
-1. **Built on free resources**
+1. Built on free resources
    - We use public specifications
    - We study open source code
    - We learn from community work
    - What was given freely, must remain free
 
-2. **Accessibility matters**
+2. Accessibility matters
    - Students can't always afford software
    - Developing countries need access
    - Hobbyists deserve good tools
    - Everyone should have opportunity
 
-3. **Community over commerce**
+3. Community over commerce
    - We profit from 2 paid products only
    - Everything else is free
    - If we don't profit from it, no one should
    - Fair and ethical
 
-### The Problem We're Solving
+The Problem We're Solving:
 
 We've observed companies:
-- Fork free/open source software
-- Add minimal "enterprise features"
-- Charge significant fees
-- Profit from community work
+  • Fork free/open source software
+  • Add minimal "enterprise features"
+  • Charge significant fees
+  • Profit from community work
 
-**Examples:**
-- Forked package managers sold as "enterprise"
-- Free tools rebranded and monetized
-- Community work exploited for profit
+BarrerSoftware will not allow this exploitation of free software.
 
-**BarrerSoftware will not allow this.**
+ENFORCEMENT
 
-### Our Commitment
+Violations (particularly commercialization) will result in:
 
-BarrerSoftware's free software will NEVER:
-- Be sold by us
-- Be paywalled
-- Have premium tiers
-- Require subscriptions
-
-**We set the example.**
-
-**We enforce the rule.**
-
----
-
-## Enforcement
-
-### Violations
-
-Using this software in violation of this license
-(particularly commercialization) will result in:
-
-1. **Public disclosure**
+1. Public disclosure
    - Violator name published
    - Violation details shared
    - Community warned
 
-2. **Legal action**
+2. Legal action
    - Immediate cease and desist
    - Injunction to stop distribution
    - Recovery of all profits made
    - Legal fees paid by violator
 
-3. **Permanent ban**
+3. Permanent ban
    - Excluded from BarrerSoftware ecosystem
    - No future license grants
    - Community blacklist
 
-### Reporting Violations
+Zero tolerance policy.
 
-If you encounter a paid version of BarrerSoftware 
-free software:
+REPORTING VIOLATIONS
 
-**Report immediately:**
-- Email: legal@barrersoftware.com
-- Subject: "BSL Violation - [Software Name]"
-- Include: Evidence, links, pricing, screenshots
+If you encounter a paid version of BarrerSoftware free software:
 
-**We will:**
-- Investigate within 24 hours
-- Take immediate action
-- Protect free access for all
-- Update community on resolution
+Report immediately:
+  • Email: legal@barrersoftware.com
+  • Subject: "BSL Violation - [Software Name]"
+  • Include: Evidence, links, pricing, screenshots
 
-**Zero tolerance policy.**
+We will:
+  • Investigate within 24 hours
+  • Take immediate action
+  • Protect free access for all
+  • Update community on resolution
 
----
+DISCLAIMER
 
-## Disclaimer
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
-THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL BARRERSOFTWARE BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER 
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, 
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN 
+THE SOFTWARE.
 
-IN NO EVENT SHALL BARRERSOFTWARE BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE.
+COMPATIBILITY
 
----
+Compatible Licenses:
+  • BarrerSoftware License (this license)
+  • GNU GPL v3.0 (with non-commercial addendum)
+  • Creative Commons BY-NC-SA 4.0
+  • Any license that prohibits commercialization
 
-## Compatibility
+Incompatible Licenses:
+  ❌ MIT License (too permissive)
+  ❌ Apache 2.0 (allows commercialization)
+  ❌ BSD Licenses (allow commercialization)
+  ❌ Any license permitting sale
 
-### Compatible Licenses
+SPECIAL PROVISIONS
 
-Modified versions may use these licenses:
-- BarrerSoftware License (this license)
-- GNU GPL v3.0 (with non-commercial addendum)
-- Creative Commons BY-NC-SA 4.0
-- Any license that prohibits commercialization
-
-### Incompatible Licenses
-
-❌ MIT License (too permissive)
-❌ Apache 2.0 (allows commercialization)
-❌ BSD Licenses (allow commercialization)
-❌ Any license permitting sale
-
----
-
-## Special Provisions
-
-### BarrerSoftware Paid Products
+BarrerSoftware Paid Products:
 
 BarrerSoftware has TWO paid products:
-- Velocity Panel
-- CleanVM Enterprise
+  • Velocity Panel
+  • CleanVM Enterprise
 
-**These are NOT under this license.**
+These are NOT under this license. All other BarrerSoftware software is free 
+and under this license or compatible.
 
-All other BarrerSoftware software is free and
-under this license or compatible.
-
-### Educational Use
+Educational Use:
 
 Academic institutions MAY:
-- Use in courses (free)
-- Include in curriculum (free)
-- Provide to students (free)
-- Research and modify (free)
+  • Use in courses (free)
+  • Include in curriculum (free)
+  • Provide to students (free)
+  • Research and modify (free)
 
 Academic institutions MUST NOT:
-- Charge students for software access
-- Include in paid course materials only
-- Require purchase for participation
+  • Charge students for software access
+  • Include in paid course materials only
+  • Require purchase for participation
 
 Education must remain accessible.
 
-### Government Use
+Government Use:
 
 Government agencies MAY:
-- Use for any purpose (free)
-- Deploy widely (free)
-- Modify for needs (free)
+  • Use for any purpose (free)
+  • Deploy widely (free)
+  • Modify for needs (free)
 
 Government agencies MUST NOT:
-- Charge other agencies for access
-- Sell to contractors
-- Create paid derivatives
+  • Charge other agencies for access
+  • Sell to contractors
+  • Create paid derivatives
 
 Public software for public good.
 
----
-
-## Philosophy
+PHILOSOPHY
 
 "If it's free, it's free. Period."
 
@@ -283,35 +259,167 @@ What we build for the community stays with the community.
 
 No exploitation. No paywalls. No profit.
 
-**Community over commerce.**
+Community over commerce.
+Access over revenue.
+Forever free.
 
-**Access over revenue.**
+CONTACT
 
-**Forever free.**
+BarrerSoftware
+  • Website: https://barrersoftware.com
+  • GitHub: https://github.com/barrersoftware
+  • License questions: legal@barrersoftware.com
+  • General: contact@barrersoftware.com
 
----
+VERSION HISTORY
 
-## Contact
+v1.0 (2025) - Initial release
 
-**BarrerSoftware**
+🏴‍☠️ BarrerSoftware - Building bridges, not walls
 
-- Website: https://barrersoftware.com
-- GitHub: https://github.com/barrersoftware
-- License questions: legal@barrersoftware.com
-- General: contact@barrersoftware.com
+What is given freely, must remain free.
 
----
+================================================================================
+APPENDIX: LEGAL FORMALITIES
+================================================================================
 
-## Version History
+(The human-readable license above is legally binding and takes precedence)
 
-- **v1.0** (2025) - Initial release
+PRIMACY CLAUSE
 
----
+This appendix does not supersede, modify, or contradict the main license text 
+above. In case of any conflict between this appendix and the human-readable 
+license terms, the human-readable terms shall govern and control.
 
-🏴‍☠️ **BarrerSoftware - Building bridges, not walls**
+FORMAL GRANT OF LICENSE
 
-*What is given freely, must remain free.*
+WHEREAS the Licensor, BarrerSoftware (hereinafter "Licensor"), holds copyright 
+in certain software (hereinafter "the Software"), and
 
----
+WHEREAS Licensor desires to grant permission for use, modification, and 
+distribution of the Software subject to certain restrictions, and
 
+WHEREAS Licensee (any person or entity obtaining a copy of the Software) 
+desires to use the Software under the terms herein,
+
+NOW THEREFORE, in consideration of the mutual covenants and agreements herein 
+contained, Licensor hereby grants to Licensee a perpetual, worldwide, 
+non-exclusive, royalty-free license to:
+
+  • Use the Software for any lawful purpose;
+  • Study the source code and internal workings of the Software;
+  • Modify, adapt, or create derivative works based upon the Software;
+  • Distribute copies of the Software or derivative works;
+  • Contribute modifications back to the original project.
+
+RESTRICTION ON COMMERCIAL EXPLOITATION
+
+Notwithstanding the grant of license above, Licensee shall NOT:
+
+  • Sell, offer for sale, or otherwise commercially distribute the Software 
+    or any derivative work thereof;
+  • Charge any fee, subscription, or other monetary consideration for access 
+    to, use of, or distribution of the Software;
+  • Create or market paid editions, tiers, or versions of the Software;
+  • Bundle the Software with paid products or services unless the Software 
+    component remains freely accessible;
+  • Monetize the Software through any means including but not limited to 
+    advertising, data collection, or indirect revenue generation.
+
+CLARIFICATION ON SERVICES
+
+Licensee may charge for services related to the Software (including but not 
+limited to technical support, installation, training, integration, and 
+consulting) provided that the Software itself remains free of charge and the 
+service fees are clearly for labor and expertise, not for software licensing.
+
+ATTRIBUTION AND COPYRIGHT NOTICE
+
+Licensee shall:
+
+  • Retain all copyright notices, license text, and attribution in all copies 
+    and derivative works;
+  • Credit BarrerSoftware as the original author in all documentation and 
+    derivative works;
+  • Include a hyperlink or reference to the original source repository;
+  • Not misrepresent the origin of the Software or claim authorship of code 
+    written by Licensor.
+
+PATENT GRANT AND DEFENSIVE TERMINATION
+
+Subject to the terms herein, Licensor grants Licensee a perpetual, worldwide, 
+non-exclusive, no-charge, royalty-free patent license to make, have made, use, 
+offer to sell, import, and otherwise transfer the Software, where such license 
+applies only to those patent claims licensable by Licensor that are necessarily 
+infringed by their contribution(s) alone or by combination of their 
+contribution(s) with the Software.
+
+If Licensee institutes patent litigation against any entity (including a 
+cross-claim or counterclaim in a lawsuit) alleging that the Software or a 
+contribution incorporated within the Software constitutes direct or contributory 
+patent infringement, then any patent licenses granted to Licensee under this 
+License for that Software shall terminate as of the date such litigation is 
+filed.
+
+PERPETUAL FREE STATUS AND COPYLEFT
+
+Any modified version or derivative work of the Software MUST:
+
+  • Remain licensed under this License or a compatible license that prohibits 
+    commercialization;
+  • Remain free of charge in perpetuity;
+  • Include the full text of this License;
+  • Maintain attribution to BarrerSoftware.
+
+For purposes of this License, "compatible license" means any license that 
+includes substantially similar restrictions on commercial exploitation and 
+requirements for perpetual free availability.
+
+WARRANTY DISCLAIMER
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR 
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, 
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT. IN NO EVENT 
+SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, 
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, 
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
+DEALINGS IN THE SOFTWARE.
+
+LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL LICENSOR 
+BE LIABLE FOR ANY SPECIAL, INCIDENTAL, INDIRECT, OR CONSEQUENTIAL DAMAGES 
+WHATSOEVER (INCLUDING, WITHOUT LIMITATION, DAMAGES FOR LOSS OF BUSINESS 
+PROFITS, BUSINESS INTERRUPTION, LOSS OF BUSINESS INFORMATION, OR ANY OTHER 
+PECUNIARY LOSS) ARISING OUT OF THE USE OF OR INABILITY TO USE THE SOFTWARE, 
+EVEN IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+SEVERABILITY
+
+If any provision of this License is held to be unenforceable or invalid, that 
+provision shall be reformed to the minimum extent necessary to make it 
+enforceable and valid, and the remaining provisions shall remain in full force 
+and effect.
+
+GOVERNING LAW AND JURISDICTION
+
+This License shall be governed by and construed in accordance with the laws of 
+the jurisdiction in which BarrerSoftware operates, without regard to its 
+conflict of law provisions. Any disputes arising under or related to this 
+License shall be subject to the exclusive jurisdiction of the courts in that 
+jurisdiction.
+
+ENTIRE AGREEMENT
+
+This License, including the human-readable terms above and this formal appendix, 
+constitutes the entire agreement between Licensor and Licensee with respect to 
+the Software and supersedes all prior or contemporaneous understandings 
+regarding such subject matter.
+
+================================================================================
 END OF LICENSE
+================================================================================
+
+Note: This license uses Barrer License Format (BLF) - a presentation standard 
+that puts human-readable terms first, followed by formal legal language. Both 
+sections are equally legally binding. Learn more at: barrersoftware.com/blf.html
