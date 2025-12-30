@@ -202,6 +202,106 @@ void lsw_memory_get_info(__u32 pid, __u32 *count, __u64 *total_size)
 }
 
 /**
+ * lsw_memory_read - Read memory from a process
+ * 
+ * Used by anti-cheat to inspect process memory for injected code
+ */
+int lsw_memory_read(__u32 pid, __u64 base, void *buffer, __u64 size)
+{
+    struct lsw_memory_region *region;
+    int found = 0;
+    __u64 offset;
+    __u64 bytes_to_read;
+    
+    if (!buffer || size == 0) {
+        return -EINVAL;
+    }
+    
+    mutex_lock(&lsw_memory_mutex);
+    
+    /* Find the memory region */
+    list_for_each_entry(region, &lsw_memory_list, list) {
+        if (region->pid == pid && 
+            base >= region->base_address &&
+            base < (region->base_address + region->size)) {
+            
+            found = 1;
+            
+            /* Calculate offset and size */
+            offset = base - region->base_address;
+            bytes_to_read = region->size - offset;
+            if (bytes_to_read > size) {
+                bytes_to_read = size;
+            }
+            
+            /* Copy memory from kernel allocation */
+            memcpy(buffer, (char *)region->kernel_addr + offset, bytes_to_read);
+            
+            lsw_info("Read memory: PID=%u, base=0x%llx, size=%llu bytes",
+                     pid, base, bytes_to_read);
+            
+            mutex_unlock(&lsw_memory_mutex);
+            return (int)bytes_to_read;
+        }
+    }
+    
+    mutex_unlock(&lsw_memory_mutex);
+    
+    if (!found) {
+        lsw_warn("Memory region not found for read: PID=%u, base=0x%llx",
+                 pid, base);
+        return -EINVAL;
+    }
+    
+    return 0;
+}
+
+/**
+ * lsw_memory_protect - Change memory protection flags
+ * 
+ * Used by anti-cheat to verify memory protection hasn't been tampered with
+ */
+int lsw_memory_protect(__u32 pid, __u64 base, __u64 size,
+                       __u32 new_protect, __u32 *old_protect)
+{
+    struct lsw_memory_region *region;
+    int found = 0;
+    
+    mutex_lock(&lsw_memory_mutex);
+    
+    /* Find the memory region */
+    list_for_each_entry(region, &lsw_memory_list, list) {
+        if (region->pid == pid && region->base_address == base) {
+            found = 1;
+            
+            /* Return old protection flags */
+            if (old_protect) {
+                *old_protect = region->protect;
+            }
+            
+            /* Set new protection flags */
+            region->protect = new_protect;
+            
+            lsw_info("Changed memory protection: PID=%u, base=0x%llx, old=0x%x, new=0x%x",
+                     pid, base, old_protect ? *old_protect : 0, new_protect);
+            
+            mutex_unlock(&lsw_memory_mutex);
+            return 0;
+        }
+    }
+    
+    mutex_unlock(&lsw_memory_mutex);
+    
+    if (!found) {
+        lsw_warn("Memory region not found for protect: PID=%u, base=0x%llx",
+                 pid, base);
+        return -EINVAL;
+    }
+    
+    return 0;
+}
+
+/**
  * lsw_memory_init - Initialize memory management
  */
 int lsw_memory_init(void)

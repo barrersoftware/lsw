@@ -29,6 +29,8 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtClose, lsw_syscall_NtClose, "NtClose" },
     { LSW_SYSCALL_NtAllocateVirtualMemory, lsw_syscall_NtAllocateVirtualMemory, "NtAllocateVirtualMemory" },
     { LSW_SYSCALL_NtFreeVirtualMemory, lsw_syscall_NtFreeVirtualMemory, "NtFreeVirtualMemory" },
+    { LSW_SYSCALL_NtReadVirtualMemory, lsw_syscall_NtReadVirtualMemory, "NtReadVirtualMemory" },
+    { LSW_SYSCALL_NtProtectVirtualMemory, lsw_syscall_NtProtectVirtualMemory, "NtProtectVirtualMemory" },
     { LSW_SYSCALL_NtQuerySystemInformation, lsw_syscall_NtQuerySystemInformation, "NtQuerySystemInformation" },
     { 0, NULL, NULL } /* Terminator */
 };
@@ -198,6 +200,103 @@ long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req)
     }
     
     req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtReadVirtualMemory - Read memory from another process
+ * 
+ * Used by anti-cheat to inspect process memory for injected code
+ * 
+ * Win32: NTSTATUS NtReadVirtualMemory(
+ *     HANDLE ProcessHandle,
+ *     PVOID BaseAddress,
+ *     PVOID Buffer,
+ *     SIZE_T BufferSize,
+ *     PSIZE_T NumberOfBytesRead
+ * )
+ */
+long lsw_syscall_NtReadVirtualMemory(struct lsw_syscall_request *req)
+{
+    __u32 target_pid = req->args[0];  /* Process to read from */
+    __u64 base_address = req->args[1];
+    __u64 size = req->args[2];
+    char temp_buffer[256];
+    int bytes_read;
+    
+    /* Use current PID if target is 0 (self) */
+    if (target_pid == 0) {
+        target_pid = current->pid;
+    }
+    
+    lsw_info("NtReadVirtualMemory: target_pid=%u, base=0x%llx, size=%llu",
+             target_pid, base_address, size);
+    
+    /* Limit read size for safety */
+    if (size > sizeof(temp_buffer)) {
+        size = sizeof(temp_buffer);
+    }
+    
+    /* Read memory via LSW memory manager */
+    bytes_read = lsw_memory_read(target_pid, base_address, temp_buffer, size);
+    
+    if (bytes_read < 0) {
+        lsw_err("Memory read failed: %d", bytes_read);
+        req->return_value = 0;
+        req->error_code = bytes_read;
+        return bytes_read;
+    }
+    
+    lsw_info("Successfully read %d bytes from PID %u", bytes_read, target_pid);
+    
+    req->return_value = bytes_read;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtProtectVirtualMemory - Change memory protection
+ * 
+ * Used by anti-cheat to verify memory protection flags
+ * 
+ * Win32: NTSTATUS NtProtectVirtualMemory(
+ *     HANDLE ProcessHandle,
+ *     PVOID *BaseAddress,
+ *     PSIZE_T RegionSize,
+ *     ULONG NewProtect,
+ *     PULONG OldProtect
+ * )
+ */
+long lsw_syscall_NtProtectVirtualMemory(struct lsw_syscall_request *req)
+{
+    __u64 base_address = req->args[0];
+    __u64 size = req->args[1];
+    __u32 new_protect = req->args[2];
+    __u32 old_protect = 0;
+    int ret;
+    
+    lsw_info("NtProtectVirtualMemory: base=0x%llx, size=%llu, new_protect=0x%x",
+             base_address, size, new_protect);
+    
+    /* Use current PID */
+    __u32 pid = current->pid;
+    
+    /* Change protection via LSW memory manager */
+    ret = lsw_memory_protect(pid, base_address, size, new_protect, &old_protect);
+    
+    if (ret != 0) {
+        lsw_err("Memory protect failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    lsw_info("Protection changed: old=0x%x, new=0x%x", old_protect, new_protect);
+    
+    req->return_value = old_protect;  /* Return old protection flags */
     req->error_code = 0;
     
     return 0;

@@ -82,6 +82,32 @@ int lsw_memory_free(__u32 pid, __u64 base, __u64 size, __u32 free_type);
 void lsw_memory_cleanup_process(__u32 pid);
 
 /**
+ * lsw_memory_read - Read memory from a process
+ * 
+ * @pid: Process ID to read from
+ * @base: Base address to read
+ * @buffer: Output buffer
+ * @size: Number of bytes to read
+ * 
+ * Returns: Number of bytes read, or negative on error
+ */
+int lsw_memory_read(__u32 pid, __u64 base, void *buffer, __u64 size);
+
+/**
+ * lsw_memory_protect - Change memory protection flags
+ * 
+ * @pid: Process ID
+ * @base: Base address
+ * @size: Size of region
+ * @new_protect: New protection flags
+ * @old_protect: Returns old protection flags
+ * 
+ * Returns: 0 on success, negative on error
+ */
+int lsw_memory_protect(__u32 pid, __u64 base, __u64 size,
+                       __u32 new_protect, __u32 *old_protect);
+
+/**
  * lsw_memory_get_info - Get information about allocated memory
  * 
  * @pid: Process ID

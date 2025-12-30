@@ -43,6 +43,8 @@ __used __section("__versions") =
 	"__rcu_read_lock\0"
 	"\x18\x00\x00\x00\x47\x67\x64\x75"
 	"class_destroy\0\0\0"
+	"\x10\x00\x00\x00\x38\xdf\xac\x69"
+	"memcpy\0\0"
 	"\x10\x00\x00\x00\xba\x0c\x7a\x03"
 	"kfree\0\0\0"
 	"\x14\x00\x00\x00\x71\x84\xbe\x44"
@@ -106,4 +108,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "747A323A8D102626707BA26");
+MODULE_INFO(srcversion, "F5EFF9A658243DBCCF2CB07");

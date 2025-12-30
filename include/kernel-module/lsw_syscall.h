@@ -20,6 +20,8 @@
 #define LSW_SYSCALL_NtClose               0x000f
 #define LSW_SYSCALL_NtAllocateVirtualMemory 0x0018
 #define LSW_SYSCALL_NtFreeVirtualMemory   0x001e
+#define LSW_SYSCALL_NtReadVirtualMemory   0x003f
+#define LSW_SYSCALL_NtProtectVirtualMemory 0x0050
 #define LSW_SYSCALL_NtCreateThread        0x004e
 #define LSW_SYSCALL_NtTerminateThread     0x0053
 #define LSW_SYSCALL_NtQueryInformationProcess 0x0019
@@ -48,6 +50,8 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req);
 long lsw_syscall_NtClose(struct lsw_syscall_request *req);
 long lsw_syscall_NtAllocateVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtReadVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtProtectVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req);
 
 /* Initialize syscall translation system */
