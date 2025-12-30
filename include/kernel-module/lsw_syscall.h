@@ -27,6 +27,11 @@
 #define LSW_SYSCALL_NtQueryInformationProcess 0x0019
 #define LSW_SYSCALL_NtDelayExecution      0x0033
 #define LSW_SYSCALL_NtQuerySystemInformation 0x0036
+#define LSW_SYSCALL_NtCreateEvent         0x0048
+#define LSW_SYSCALL_NtCreateMutant        0x00c4
+#define LSW_SYSCALL_NtWaitForSingleObject 0x0004
+#define LSW_SYSCALL_NtSetEvent            0x000e
+#define LSW_SYSCALL_NtReleaseMutant       0x001d
 
 /* Syscall request structure from userspace */
 struct lsw_syscall_request {
@@ -53,6 +58,11 @@ long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtReadVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtProtectVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateEvent(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateMutant(struct lsw_syscall_request *req);
+long lsw_syscall_NtWaitForSingleObject(struct lsw_syscall_request *req);
+long lsw_syscall_NtSetEvent(struct lsw_syscall_request *req);
+long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req);
 
 /* Initialize syscall translation system */
 int lsw_syscall_init(void);
