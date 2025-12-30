@@ -13,6 +13,7 @@
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_device.h"
 #include "../include/kernel-module/lsw_syscall.h"
+#include "../include/kernel-module/lsw_memory.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
@@ -71,6 +72,14 @@ static int __init lsw_init(void)
         return ret;
     }
     
+    /* Initialize memory management system */
+    ret = lsw_memory_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize memory management: %d", ret);
+        lsw_syscall_exit();
+        return ret;
+    }
+    
     /* Initialize device interface */
     ret = lsw_device_init();
     if (ret != 0) {
@@ -97,6 +106,9 @@ static void __exit lsw_exit(void)
     
     /* Cleanup device interface */
     lsw_device_exit();
+    
+    /* Cleanup memory management */
+    lsw_memory_exit();
     
     /* Cleanup syscall system */
     lsw_syscall_exit();

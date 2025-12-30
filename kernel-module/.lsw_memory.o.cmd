@@ -1,8 +1,8 @@
-savedcmd_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := gcc-13 -Wp,-MMD,/home/ssfdre38/lsw-project/kernel-module/.lsw_syscall.o.d -nostdinc -I./arch/x86/include -I./arch/x86/include/generated  -I./include -I./arch/x86/include/uapi -I./arch/x86/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -I./ubuntu/include -include ./include/linux/compiler_types.h -D__KERNEL__ -fmacro-prefix-map=./= -std=gnu11 -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -fcf-protection=none -m64 -falign-jumps=1 -falign-loops=1 -mno-80387 -mno-fp-ret-in-387 -mpreferred-stack-boundary=3 -mskip-rax-setup -mtune=generic -mno-red-zone -mcmodel=kernel -Wno-sign-compare -fno-asynchronous-unwind-tables -mindirect-branch=thunk-extern -mindirect-branch-register -mindirect-branch-cs-prefix -mfunction-return=thunk-extern -fno-jump-tables -mharden-sls=all -fpatchable-function-entry=16,16 -fno-delete-null-pointer-checks -O2 -fno-allow-store-data-races -fstack-protector-strong -fno-omit-frame-pointer -fno-optimize-sibling-calls -ftrivial-auto-var-init=zero -fno-stack-clash-protection -fzero-call-used-regs=used-gpr -pg -mrecord-mcount -mfentry -DCC_USING_FENTRY -falign-functions=16 -fstrict-flex-arrays=3 -fno-strict-overflow -fno-stack-check -fconserve-stack -Wall -Wundef -Werror=implicit-function-declaration -Werror=implicit-int -Werror=return-type -Werror=strict-prototypes -Wno-format-security -Wno-trigraphs -Wno-frame-address -Wno-address-of-packed-member -Wmissing-declarations -Wmissing-prototypes -Wframe-larger-than=1024 -Wno-main -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-dangling-pointer -Wvla -Wno-pointer-sign -Wcast-function-type -Wno-stringop-overflow -Wno-array-bounds -Wno-alloc-size-larger-than -Wimplicit-fallthrough=5 -Werror=date-time -Werror=incompatible-pointer-types -Werror=designated-init -Wenum-conversion -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-restrict -Wno-packed-not-aligned -Wno-format-overflow -Wno-format-truncation -Wno-stringop-truncation -Wno-override-init -Wno-missing-field-initializers -Wno-type-limits -Wno-shift-negative-value -Wno-maybe-uninitialized -Wno-sign-compare -g -gdwarf-5 -I/usr/src/linux-headers-6.8.0-90-generic/include/kernel-module -DDEBUG  -fsanitize=bounds-strict -fsanitize=shift -fsanitize=bool -fsanitize=enum  -DMODULE  -DKBUILD_BASENAME='"lsw_syscall"' -DKBUILD_MODNAME='"lsw"' -D__KBUILD_MODNAME=kmod_lsw -c -o /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.c   ; ./tools/objtool/objtool --hacks=jump_label --hacks=noinstr --hacks=skylake --retpoline --rethunk --sls --stackval --static-call --uaccess --prefix=16   --module /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o
+savedcmd_/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o := gcc-13 -Wp,-MMD,/home/ssfdre38/lsw-project/kernel-module/.lsw_memory.o.d -nostdinc -I./arch/x86/include -I./arch/x86/include/generated  -I./include -I./arch/x86/include/uapi -I./arch/x86/include/generated/uapi -I./include/uapi -I./include/generated/uapi -include ./include/linux/compiler-version.h -include ./include/linux/kconfig.h -I./ubuntu/include -include ./include/linux/compiler_types.h -D__KERNEL__ -fmacro-prefix-map=./= -std=gnu11 -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -fcf-protection=none -m64 -falign-jumps=1 -falign-loops=1 -mno-80387 -mno-fp-ret-in-387 -mpreferred-stack-boundary=3 -mskip-rax-setup -mtune=generic -mno-red-zone -mcmodel=kernel -Wno-sign-compare -fno-asynchronous-unwind-tables -mindirect-branch=thunk-extern -mindirect-branch-register -mindirect-branch-cs-prefix -mfunction-return=thunk-extern -fno-jump-tables -mharden-sls=all -fpatchable-function-entry=16,16 -fno-delete-null-pointer-checks -O2 -fno-allow-store-data-races -fstack-protector-strong -fno-omit-frame-pointer -fno-optimize-sibling-calls -ftrivial-auto-var-init=zero -fno-stack-clash-protection -fzero-call-used-regs=used-gpr -pg -mrecord-mcount -mfentry -DCC_USING_FENTRY -falign-functions=16 -fstrict-flex-arrays=3 -fno-strict-overflow -fno-stack-check -fconserve-stack -Wall -Wundef -Werror=implicit-function-declaration -Werror=implicit-int -Werror=return-type -Werror=strict-prototypes -Wno-format-security -Wno-trigraphs -Wno-frame-address -Wno-address-of-packed-member -Wmissing-declarations -Wmissing-prototypes -Wframe-larger-than=1024 -Wno-main -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-dangling-pointer -Wvla -Wno-pointer-sign -Wcast-function-type -Wno-stringop-overflow -Wno-array-bounds -Wno-alloc-size-larger-than -Wimplicit-fallthrough=5 -Werror=date-time -Werror=incompatible-pointer-types -Werror=designated-init -Wenum-conversion -Wno-unused-but-set-variable -Wno-unused-const-variable -Wno-restrict -Wno-packed-not-aligned -Wno-format-overflow -Wno-format-truncation -Wno-stringop-truncation -Wno-override-init -Wno-missing-field-initializers -Wno-type-limits -Wno-shift-negative-value -Wno-maybe-uninitialized -Wno-sign-compare -g -gdwarf-5 -I/usr/src/linux-headers-6.8.0-90-generic/include/kernel-module -DDEBUG  -fsanitize=bounds-strict -fsanitize=shift -fsanitize=bool -fsanitize=enum  -DMODULE  -DKBUILD_BASENAME='"lsw_memory"' -DKBUILD_MODNAME='"lsw"' -D__KBUILD_MODNAME=kmod_lsw -c -o /home/ssfdre38/lsw-project/kernel-module/lsw_memory.o /home/ssfdre38/lsw-project/kernel-module/lsw_memory.c   ; ./tools/objtool/objtool --hacks=jump_label --hacks=noinstr --hacks=skylake --retpoline --rethunk --sls --stackval --static-call --uaccess --prefix=16   --module /home/ssfdre38/lsw-project/kernel-module/lsw_memory.o
 
-source_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.c
+source_/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o := /home/ssfdre38/lsw-project/kernel-module/lsw_memory.c
 
-deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
+deps_/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o := \
   include/linux/compiler-version.h \
     $(wildcard include/config/CC_VERSION_TEXT) \
   include/linux/kconfig.h \
@@ -1030,6 +1030,11 @@ deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
     $(wildcard include/config/HAVE_MOD_ARCH_SPECIFIC) \
     $(wildcard include/config/MODULES_USE_ELF_REL) \
     $(wildcard include/config/MODULES_USE_ELF_RELA) \
+  include/linux/vmalloc.h \
+    $(wildcard include/config/HAVE_ARCH_HUGE_VMALLOC) \
+  arch/x86/include/asm/vmalloc.h \
+    $(wildcard include/config/HAVE_ARCH_HUGE_VMAP) \
+  arch/x86/include/asm/pgtable_areas.h \
   include/linux/mm.h \
     $(wildcard include/config/HAVE_ARCH_MMAP_RND_BITS) \
     $(wildcard include/config/HAVE_ARCH_MMAP_RND_COMPAT_BITS) \
@@ -1069,7 +1074,6 @@ deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
     $(wildcard include/config/ARCH_HAS_HW_PTE_YOUNG) \
     $(wildcard include/config/GUP_GET_PXX_LOW_HIGH) \
     $(wildcard include/config/ARCH_WANT_PMD_MKWRITE) \
-    $(wildcard include/config/HAVE_ARCH_HUGE_VMAP) \
     $(wildcard include/config/X86_ESPFIX64) \
   include/linux/memremap.h \
     $(wildcard include/config/DEVICE_PRIVATE) \
@@ -1087,11 +1091,10 @@ deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
     $(wildcard include/config/BALLOON_COMPACTION) \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_kernel.h \
   include/generated/uapi/linux/version.h \
-  /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_syscall.h \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_memory.h \
 
-/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o: $(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o)
+/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o: $(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o)
 
-$(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o):
+$(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o):
 
-/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o: $(wildcard ./tools/objtool/objtool)
+/home/ssfdre38/lsw-project/kernel-module/lsw_memory.o: $(wildcard ./tools/objtool/objtool)

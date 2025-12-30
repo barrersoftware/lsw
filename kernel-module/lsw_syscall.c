@@ -12,6 +12,7 @@
 #include <linux/slab.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_syscall.h"
+#include "../include/kernel-module/lsw_memory.h"
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -116,35 +117,83 @@ long lsw_syscall_NtClose(struct lsw_syscall_request *req)
 }
 
 /**
- * lsw_syscall_NtAllocateVirtualMemory - Translate to Linux mmap()
+ * lsw_syscall_NtAllocateVirtualMemory - Translate to Linux vmalloc/mmap
  * 
  * This is critical for PE loader memory allocation
+ * 
+ * Win32: NTSTATUS NtAllocateVirtualMemory(
+ *     HANDLE ProcessHandle,
+ *     PVOID *BaseAddress,
+ *     ULONG_PTR ZeroBits,
+ *     PSIZE_T RegionSize,
+ *     ULONG AllocationType,
+ *     ULONG Protect
+ * )
  */
 long lsw_syscall_NtAllocateVirtualMemory(struct lsw_syscall_request *req)
 {
     __u64 base_address = req->args[0];
     __u64 region_size = req->args[1];
+    __u32 alloc_type = req->args[2];
+    __u32 protect = req->args[3];
+    __u64 allocated_base;
     
-    lsw_info("NtAllocateVirtualMemory: base=0x%llx, size=0x%llx (STUB)",
-             base_address, region_size);
+    lsw_info("NtAllocateVirtualMemory: base=0x%llx, size=0x%llx, type=0x%x, protect=0x%x",
+             base_address, region_size, alloc_type, protect);
     
-    /* TODO: Actually allocate memory via kernel mm subsystem
-     * For now, return stub */
+    /* Use current PID as process identifier */
+    __u32 pid = current->pid;
     
-    req->return_value = base_address; /* Return requested address */
+    /* Allocate memory via LSW memory manager */
+    allocated_base = lsw_memory_allocate(pid, base_address, region_size, 
+                                         protect, alloc_type);
+    
+    if (allocated_base == 0) {
+        lsw_err("Memory allocation failed");
+        req->return_value = 0;
+        req->error_code = -ENOMEM;
+        return -ENOMEM;
+    }
+    
+    /* Return allocated address */
+    req->return_value = allocated_base;
     req->error_code = 0;
     
     return 0;
 }
 
 /**
- * lsw_syscall_NtFreeVirtualMemory - Translate to Linux munmap()
+ * lsw_syscall_NtFreeVirtualMemory - Translate to Linux vfree
+ * 
+ * Win32: NTSTATUS NtFreeVirtualMemory(
+ *     HANDLE ProcessHandle,
+ *     PVOID *BaseAddress,
+ *     PSIZE_T RegionSize,
+ *     ULONG FreeType
+ * )
  */
 long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req)
 {
     __u64 base_address = req->args[0];
+    __u64 region_size = req->args[1];
+    __u32 free_type = req->args[2];
+    int ret;
     
-    lsw_info("NtFreeVirtualMemory: base=0x%llx (STUB)", base_address);
+    lsw_info("NtFreeVirtualMemory: base=0x%llx, size=0x%llx, type=0x%x",
+             base_address, region_size, free_type);
+    
+    /* Use current PID */
+    __u32 pid = current->pid;
+    
+    /* Free memory via LSW memory manager */
+    ret = lsw_memory_free(pid, base_address, region_size, free_type);
+    
+    if (ret != 0) {
+        lsw_err("Memory free failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
     
     req->return_value = 0;
     req->error_code = 0;
