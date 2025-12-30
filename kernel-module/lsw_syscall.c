@@ -641,9 +641,16 @@ long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req)
 {
-    const char *path = "/tmp/hello.exe";  /* TODO: Get from userspace */
+    const char *path = (const char *)req->args[0];
     __u32 win32_pid = 0;
     int ret;
+    
+    if (!path) {
+        lsw_err("NtCreateProcess: NULL path");
+        req->return_value = 0;
+        req->error_code = -EINVAL;
+        return -EINVAL;
+    }
     
     lsw_info("NtCreateProcess: path='%s'", path);
     
