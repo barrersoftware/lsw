@@ -1,0 +1,1 @@
+savedcmd_/home/ssfdre38/lsw-project/kernel-module/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /home/ssfdre38/lsw-project/kernel-module/Module.symvers -T /home/ssfdre38/lsw-project/kernel-module/modules.order -i Module.symvers -e 

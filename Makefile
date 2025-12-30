@@ -2,7 +2,7 @@
 # Copyright (c) 2025 BarrerSoftware
 # Licensed under BarrerSoftware License (BSL) v1.0
 
-.PHONY: all clean shared pe-loader msi-installer test install help
+.PHONY: all clean shared pe-loader msi-installer test install help test-kernel-comm kernel-module
 
 # Compiler settings
 CC := gcc
@@ -17,9 +17,12 @@ OBJ_DIR := $(BUILD_DIR)/obj
 BIN_DIR := $(BUILD_DIR)/bin
 LIB_DIR := $(BUILD_DIR)/lib
 
-# Shared library components
-SHARED_SOURCES := $(wildcard $(SRC_DIR)/shared/*/*.c)
+# Shared library components  
+SHARED_SOURCES := $(wildcard $(SRC_DIR)/shared/*.c) $(wildcard $(SRC_DIR)/shared/*/*.c)
 SHARED_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SHARED_SOURCES))
+
+# Tests
+TEST_KERNEL_COMM := $(BIN_DIR)/test-kernel-comm
 
 # PE loader
 PE_SOURCES := $(wildcard $(SRC_DIR)/pe-loader/*.c)
@@ -104,9 +107,25 @@ debug: clean all
 	@echo "$(COLOR_GREEN)✅ Debug build complete$(COLOR_RESET)"
 
 # Run tests
-test: all
-	@echo "$(COLOR_BLUE)🧪 Running tests...$(COLOR_RESET)"
-	@echo "$(COLOR_YELLOW)⚠️  Tests not yet implemented$(COLOR_RESET)"
+test: test-kernel-comm
+	@echo "$(COLOR_GREEN)✅ All tests complete$(COLOR_RESET)"
+
+# Build and run kernel communication test
+test-kernel-comm: shared $(TEST_KERNEL_COMM)
+	@echo "$(COLOR_BLUE)🧪 Running kernel communication test...$(COLOR_RESET)"
+	@echo "$(COLOR_YELLOW)⚠️  Make sure LSW kernel module is loaded first$(COLOR_RESET)"
+	@echo ""
+	$(TEST_KERNEL_COMM)
+
+$(TEST_KERNEL_COMM): $(SRC_DIR)/tests/test_kernel_comm.c $(SHARED_LIB)
+	@echo "$(COLOR_BLUE)🔗 Building kernel communication test...$(COLOR_RESET)"
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< -L$(LIB_DIR) -llsw-shared
+
+# Build kernel module
+kernel-module:
+	@echo "$(COLOR_BLUE)🔧 Building kernel module...$(COLOR_RESET)"
+	$(MAKE) -C kernel-module
+	@echo "$(COLOR_GREEN)✅ Kernel module built$(COLOR_RESET)"
 
 # Install (requires root)
 install: all
