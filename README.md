@@ -2,7 +2,7 @@
 
 **Windows binary support for Linux kernels - WSL2 in reverse**
 
-[![License](https://img.shields.io/badge/License-BOSL_v1.1-blue.svg)](https://barrersoftware.com/foss-license.html)
+[![License](https://img.shields.io/badge/License-BFSL_v1.2-blue.svg)](https://barrersoftware.com/foss-license.html)
 [![Status](https://img.shields.io/badge/Status-50%25_Complete-yellow.svg)]()
 [![Build](https://img.shields.io/badge/Build-Passing-success.svg)]()
 
@@ -387,4 +387,4 @@ Using Microsoft's official documentation ensures:
 
 ---
 
-**Built with official specifications. Protected by BOSL v1.1. Free forever.** 🏴‍☠️
+**Built with official specifications. Protected by BFSL v1.2. Free forever.** 🏴‍☠️
