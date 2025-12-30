@@ -14,6 +14,7 @@
 #include "../include/kernel-module/lsw_device.h"
 #include "../include/kernel-module/lsw_syscall.h"
 #include "../include/kernel-module/lsw_memory.h"
+#include "../include/kernel-module/lsw_file.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
@@ -80,6 +81,15 @@ static int __init lsw_init(void)
         return ret;
     }
     
+    /* Initialize file I/O system */
+    ret = lsw_file_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize file I/O: %d", ret);
+        lsw_memory_exit();
+        lsw_syscall_exit();
+        return ret;
+    }
+    
     /* Initialize device interface */
     ret = lsw_device_init();
     if (ret != 0) {
@@ -106,6 +116,9 @@ static void __exit lsw_exit(void)
     
     /* Cleanup device interface */
     lsw_device_exit();
+    
+    /* Cleanup file I/O */
+    lsw_file_exit();
     
     /* Cleanup memory management */
     lsw_memory_exit();

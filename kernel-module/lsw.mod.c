@@ -35,6 +35,8 @@ MODULE_INFO(retpoline, "Y");
 
 static const char ____versions[]
 __used __section("__versions") =
+	"\x14\x00\x00\x00\x1e\x24\x0e\x3a"
+	"filp_open\0\0\0"
 	"\x1c\x00\x00\x00\x2b\x2f\xec\xe3"
 	"alloc_chrdev_region\0"
 	"\x18\x00\x00\x00\xc2\x9c\xc4\x13"
@@ -71,12 +73,16 @@ __used __section("__versions") =
 	"random_kmalloc_seed\0"
 	"\x14\x00\x00\x00\x4b\x8d\xfa\x4d"
 	"mutex_lock\0\0"
+	"\x10\x00\x00\x00\xda\xfa\x66\x91"
+	"strncpy\0"
 	"\x24\x00\x00\x00\xe9\xc8\x79\x1a"
 	"__x86_indirect_thunk_r13\0\0\0\0"
 	"\x18\x00\x00\x00\xdb\x75\x43\x94"
 	"_totalram_pages\0"
 	"\x10\x00\x00\x00\xc5\x8f\x57\xfb"
 	"memset\0\0"
+	"\x14\x00\x00\x00\xae\x9a\xe9\xa7"
+	"kernel_read\0"
 	"\x1c\x00\x00\x00\xca\x39\x82\x5b"
 	"__x86_return_thunk\0\0"
 	"\x18\x00\x00\x00\xe1\xbe\x10\x6b"
@@ -87,6 +93,8 @@ __used __section("__versions") =
 	"unregister_chrdev_region\0\0\0\0"
 	"\x18\x00\x00\x00\x38\xf0\x13\x32"
 	"mutex_unlock\0\0\0\0"
+	"\x14\x00\x00\x00\x90\xc4\x0e\x2d"
+	"filp_close\0\0"
 	"\x18\x00\x00\x00\x81\xb4\x40\x5b"
 	"device_destroy\0\0"
 	"\x1c\x00\x00\x00\x65\x62\xf5\x2c"
@@ -101,6 +109,8 @@ __used __section("__versions") =
 	"kmalloc_caches\0\0"
 	"\x14\x00\x00\x00\x3e\xac\x92\xc8"
 	"cdev_del\0\0\0\0"
+	"\x18\x00\x00\x00\x52\x39\xca\x39"
+	"kernel_write\0\0\0\0"
 	"\x18\x00\x00\x00\xeb\x7b\x33\xe1"
 	"module_layout\0\0\0"
 	"\x00\x00\x00\x00\x00\x00\x00\x00";
@@ -108,4 +118,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "F5EFF9A658243DBCCF2CB07");
+MODULE_INFO(srcversion, "5CEE26E013DE03F3D5CFC57");

@@ -1089,6 +1089,7 @@ deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
   include/generated/uapi/linux/version.h \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_syscall.h \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_memory.h \
+  /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_file.h \
 
 /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o: $(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o)
 

@@ -14,6 +14,7 @@
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_syscall.h"
 #include "../include/kernel-module/lsw_memory.h"
+#include "../include/kernel-module/lsw_file.h"
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -69,13 +70,29 @@ long lsw_handle_syscall(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req)
 {
-    /* TODO: Implement full NtCreateFile translation
-     * For now, return stub implementation */
+    const char *path = "/tmp/test.txt";  /* TODO: Get from userspace */
+    __u32 access = req->args[0];
+    __u32 share = req->args[1];
+    __u32 disposition = req->args[2];
+    __u64 handle;
     
-    lsw_info("NtCreateFile called (STUB)");
+    lsw_info("NtCreateFile: path='%s', access=0x%x, share=0x%x, disposition=%u",
+             path, access, share, disposition);
     
-    /* Stub: just return success with dummy handle */
-    req->return_value = 0x1000; /* Fake file handle */
+    /* Use current PID */
+    __u32 pid = current->pid;
+    
+    /* Open file via LSW file manager */
+    handle = lsw_file_open(pid, path, access, share, disposition);
+    
+    if (handle == 0) {
+        lsw_err("File open failed");
+        req->return_value = 0;
+        req->error_code = -ENOENT;
+        return -ENOENT;
+    }
+    
+    req->return_value = handle;
     req->error_code = 0;
     
     return 0;
@@ -86,9 +103,32 @@ long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
 {
-    lsw_info("NtReadFile called (STUB)");
+    __u64 handle = req->args[0];
+    __u64 size = req->args[1];
+    __u64 bytes_read = 0;
+    char temp_buffer[4096];
+    int ret;
     
-    req->return_value = 0;
+    lsw_info("NtReadFile: handle=0x%llx, size=%llu", handle, size);
+    
+    /* Limit read size */
+    if (size > sizeof(temp_buffer)) {
+        size = sizeof(temp_buffer);
+    }
+    
+    /* Read via LSW file manager */
+    ret = lsw_file_read(handle, temp_buffer, size, &bytes_read);
+    
+    if (ret != 0) {
+        lsw_err("File read failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    lsw_info("Read %llu bytes from handle 0x%llx", bytes_read, handle);
+    
+    req->return_value = bytes_read;
     req->error_code = 0;
     
     return 0;
@@ -99,9 +139,27 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
 {
-    lsw_info("NtWriteFile called (STUB)");
+    __u64 handle = req->args[0];
+    const char *data = "LSW Test Write\n";  /* TODO: Get from userspace */
+    __u64 size = strlen(data);
+    __u64 bytes_written = 0;
+    int ret;
     
-    req->return_value = 0;
+    lsw_info("NtWriteFile: handle=0x%llx, size=%llu", handle, size);
+    
+    /* Write via LSW file manager */
+    ret = lsw_file_write(handle, data, size, &bytes_written);
+    
+    if (ret != 0) {
+        lsw_err("File write failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    lsw_info("Wrote %llu bytes to handle 0x%llx", bytes_written, handle);
+    
+    req->return_value = bytes_written;
     req->error_code = 0;
     
     return 0;
@@ -112,7 +170,20 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtClose(struct lsw_syscall_request *req)
 {
-    lsw_info("NtClose called (STUB)");
+    __u64 handle = req->args[0];
+    int ret;
+    
+    lsw_info("NtClose: handle=0x%llx", handle);
+    
+    /* Close via LSW file manager */
+    ret = lsw_file_close(handle);
+    
+    if (ret != 0) {
+        lsw_err("File close failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
     
     req->return_value = 0;
     req->error_code = 0;
