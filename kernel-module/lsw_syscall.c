@@ -15,6 +15,7 @@
 #include "../include/kernel-module/lsw_syscall.h"
 #include "../include/kernel-module/lsw_memory.h"
 #include "../include/kernel-module/lsw_file.h"
+#include "../include/kernel-module/lsw_sync.h"
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -33,6 +34,11 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtReadVirtualMemory, lsw_syscall_NtReadVirtualMemory, "NtReadVirtualMemory" },
     { LSW_SYSCALL_NtProtectVirtualMemory, lsw_syscall_NtProtectVirtualMemory, "NtProtectVirtualMemory" },
     { LSW_SYSCALL_NtQuerySystemInformation, lsw_syscall_NtQuerySystemInformation, "NtQuerySystemInformation" },
+    { LSW_SYSCALL_NtCreateEvent, lsw_syscall_NtCreateEvent, "NtCreateEvent" },
+    { LSW_SYSCALL_NtCreateMutant, lsw_syscall_NtCreateMutant, "NtCreateMutant" },
+    { LSW_SYSCALL_NtWaitForSingleObject, lsw_syscall_NtWaitForSingleObject, "NtWaitForSingleObject" },
+    { LSW_SYSCALL_NtSetEvent, lsw_syscall_NtSetEvent, "NtSetEvent" },
+    { LSW_SYSCALL_NtReleaseMutant, lsw_syscall_NtReleaseMutant, "NtReleaseMutant" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -435,6 +441,137 @@ long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req)
     lsw_info("Information class 0x%x not yet implemented", info_class);
     req->return_value = 0;
     req->error_code = -ENOSYS;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtCreateEvent - Create an event object
+ */
+long lsw_syscall_NtCreateEvent(struct lsw_syscall_request *req)
+{
+    bool manual_reset = req->args[0];
+    bool initial_state = req->args[1];
+    __u64 handle;
+    
+    lsw_info("NtCreateEvent: manual=%d, initial=%d", manual_reset, initial_state);
+    
+    handle = lsw_sync_create_event(current->pid, manual_reset, initial_state);
+    
+    if (handle == 0) {
+        lsw_err("Failed to create event");
+        req->return_value = 0;
+        req->error_code = -ENOMEM;
+        return -ENOMEM;
+    }
+    
+    req->return_value = handle;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtCreateMutant - Create a mutex object
+ */
+long lsw_syscall_NtCreateMutant(struct lsw_syscall_request *req)
+{
+    bool initial_owner = req->args[0];
+    __u64 handle;
+    
+    lsw_info("NtCreateMutant: owned=%d", initial_owner);
+    
+    handle = lsw_sync_create_mutex(current->pid, initial_owner);
+    
+    if (handle == 0) {
+        lsw_err("Failed to create mutex");
+        req->return_value = 0;
+        req->error_code = -ENOMEM;
+        return -ENOMEM;
+    }
+    
+    req->return_value = handle;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtWaitForSingleObject - Wait for object
+ */
+long lsw_syscall_NtWaitForSingleObject(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    __u32 timeout_ms = req->args[1];
+    int ret;
+    
+    lsw_info("NtWaitForSingleObject: handle=0x%llx, timeout=%u ms", handle, timeout_ms);
+    
+    ret = lsw_sync_wait(handle, timeout_ms);
+    
+    if (ret == -ETIMEDOUT) {
+        req->return_value = 0x102;  /* STATUS_TIMEOUT */
+        req->error_code = 0;
+        return 0;
+    } else if (ret < 0) {
+        lsw_err("Wait failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 0;  /* STATUS_SUCCESS */
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtSetEvent - Signal an event
+ */
+long lsw_syscall_NtSetEvent(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    int ret;
+    
+    lsw_info("NtSetEvent: handle=0x%llx", handle);
+    
+    ret = lsw_sync_signal(handle);
+    
+    if (ret < 0) {
+        lsw_err("Set event failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtReleaseMutant - Release a mutex
+ */
+long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    int ret;
+    
+    lsw_info("NtReleaseMutant: handle=0x%llx", handle);
+    
+    ret = lsw_sync_signal(handle);
+    
+    if (ret < 0) {
+        lsw_err("Release mutex failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 0;
+    req->error_code = 0;
     
     return 0;
 }
