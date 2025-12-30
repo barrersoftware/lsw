@@ -229,6 +229,18 @@ bool pe_is_dll(const pe_file_t* pe) {
     return (characteristics & PE_CHAR_DLL) != 0;
 }
 
+pe_data_directory_t* pe_get_data_directory(const pe_file_t* pe, int index) {
+    if (!pe || index < 0 || index >= PE_NUMBER_OF_DIRECTORY_ENTRIES) {
+        return NULL;
+    }
+    
+    if (pe->is_64bit) {
+        return &pe->nt_headers64->OptionalHeader.DataDirectory[index];
+    } else {
+        return &pe->nt_headers32->OptionalHeader.DataDirectory[index];
+    }
+}
+
 void pe_free(pe_file_t* pe) {
     if (pe) {
         // We don't own file_data, so don't free it

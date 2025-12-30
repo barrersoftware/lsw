@@ -56,6 +56,9 @@ uint16_t pe_get_subsystem(const pe_file_t* pe);
 // Check if DLL
 bool pe_is_dll(const pe_file_t* pe);
 
+// Get data directory
+pe_data_directory_t* pe_get_data_directory(const pe_file_t* pe, int index);
+
 // Free PE resources
 void pe_free(pe_file_t* pe);
 

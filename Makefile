@@ -7,7 +7,7 @@
 # Compiler settings
 CC := gcc
 CFLAGS := -Wall -Wextra -std=c11 -pedantic -O2 -fPIC
-INCLUDES := -Iinclude -Iinclude/shared -Iinclude/pe-loader
+INCLUDES := -Iinclude -Iinclude/shared -Iinclude/pe-loader -Iinclude/win32-api
 DEBUG_FLAGS := -g -DDEBUG
 
 # Directories
@@ -20,6 +20,10 @@ LIB_DIR := $(BUILD_DIR)/lib
 # Shared library components  
 SHARED_SOURCES := $(wildcard $(SRC_DIR)/shared/*.c) $(wildcard $(SRC_DIR)/shared/*/*.c)
 SHARED_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SHARED_SOURCES))
+
+# Win32 API
+WIN32_SOURCES := $(wildcard $(SRC_DIR)/win32-api/*.c)
+WIN32_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(WIN32_SOURCES))
 
 # Tests
 TEST_KERNEL_COMM := $(BIN_DIR)/test-kernel-comm
@@ -83,9 +87,9 @@ $(SHARED_LIB): $(SHARED_OBJECTS)
 pe-loader: shared $(PE_LOADER_BIN)
 	@echo "$(COLOR_GREEN)✅ PE loader built$(COLOR_RESET)"
 
-$(PE_LOADER_BIN): $(PE_OBJECTS) $(SHARED_LIB)
+$(PE_LOADER_BIN): $(PE_OBJECTS) $(WIN32_OBJECTS) $(SHARED_LIB)
 	@echo "$(COLOR_BLUE)🔗 Linking PE loader...$(COLOR_RESET)"
-	$(CC) -o $@ $(PE_OBJECTS) -L$(LIB_DIR) -llsw-shared
+	$(CC) -o $@ $(PE_OBJECTS) $(WIN32_OBJECTS) -L$(LIB_DIR) -llsw-shared -lpthread
 
 # Build MSI installer
 msi-installer: shared $(MSI_INSTALLER_BIN)

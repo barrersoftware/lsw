@@ -9,6 +9,7 @@
 #include "pe-loader/pe_loader.h"
 #include "pe-loader/pe_parser.h"
 #include "pe-loader/pe_format.h"
+#include "win32-api/win32_api.h"
 #include "lsw_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,10 +70,22 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
     
     LSW_LOG_INFO("Image size: 0x%lx bytes", image->image_size);
     
-    // Allocate memory for image
-    image->image_base = mmap(NULL, image->image_size, 
+    // Try to allocate memory at preferred base address
+    uint64_t preferred_base = pe_get_image_base(&image->pe);
+    void* hint_addr = (void*)preferred_base;
+    
+    image->image_base = mmap(hint_addr, image->image_size, 
                             PROT_READ | PROT_WRITE | PROT_EXEC,
-                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    
+    if (image->image_base == MAP_FAILED) {
+        // Preferred address not available, try anywhere
+        LSW_LOG_WARN("Could not load at preferred base 0x%llx, loading elsewhere", 
+                    (unsigned long long)preferred_base);
+        image->image_base = mmap(NULL, image->image_size, 
+                                PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     
     if (image->image_base == MAP_FAILED) {
         LSW_LOG_ERROR("Failed to allocate image memory: %s", strerror(errno));
@@ -80,7 +93,8 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
         return false;
     }
     
-    LSW_LOG_INFO("Image base allocated at: %p", image->image_base);
+    LSW_LOG_INFO("Image base allocated at: %p (preferred: 0x%llx)", 
+                image->image_base, (unsigned long long)preferred_base);
     
     // Map sections
     if (!pe_map_sections(image)) {
@@ -95,6 +109,25 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
     image->entry_point = (uint8_t*)image->image_base + entry_rva;
     
     LSW_LOG_INFO("Entry point: %p (RVA: 0x%08x)", image->entry_point, entry_rva);
+    
+    // Initialize Win32 API
+    win32_api_init();
+    
+    // Resolve imports
+    if (!pe_resolve_imports(image)) {
+        LSW_LOG_ERROR("Failed to resolve imports");
+        munmap(image->image_base, image->image_size);
+        munmap(file_data, file_size);
+        return false;
+    }
+    
+    // Apply relocations if needed
+    if (!pe_apply_relocations(image)) {
+        LSW_LOG_ERROR("Failed to apply relocations");
+        munmap(image->image_base, image->image_size);
+        munmap(file_data, file_size);
+        return false;
+    }
     
     image->loaded = true;
     
@@ -159,9 +192,64 @@ bool pe_map_sections(pe_image_t* image) {
 }
 
 bool pe_resolve_imports(pe_image_t* image) {
-    LSW_LOG_INFO("Import resolution not yet implemented");
-    // TODO: Implement import resolution
-    // This is where we'd load DLLs and resolve function addresses
+    pe_data_directory_t* import_dir = pe_get_data_directory(&image->pe, PE_DIR_IMPORT);
+    if (!import_dir || !import_dir->VirtualAddress) {
+        LSW_LOG_INFO("No import directory - skipping import resolution");
+        return true;
+    }
+    
+    LSW_LOG_INFO("Resolving imports...");
+    
+    // Get import descriptor table
+    uint32_t import_rva = import_dir->VirtualAddress;
+    pe_import_descriptor_t* import_desc = (pe_import_descriptor_t*)((uint8_t*)image->image_base + import_rva);
+    
+    int dll_count = 0;
+    int func_count = 0;
+    
+    // Iterate through each DLL
+    while (import_desc->NameRVA != 0) {
+        const char* dll_name = (const char*)((uint8_t*)image->image_base + import_desc->NameRVA);
+        LSW_LOG_INFO("  DLL: %s", dll_name);
+        dll_count++;
+        
+        // Get the Import Address Table (IAT)
+        uint64_t* iat = (uint64_t*)((uint8_t*)image->image_base + import_desc->ImportAddressTableRVA);
+        uint64_t* ilt = (uint64_t*)((uint8_t*)image->image_base + 
+                                     (import_desc->ImportLookupTableRVA ? import_desc->ImportLookupTableRVA : import_desc->ImportAddressTableRVA));
+        
+        // Resolve each function
+        for (int i = 0; ilt[i] != 0; i++) {
+            const char* func_name = NULL;
+            
+            // Check if import by name or ordinal
+            if (!(ilt[i] & PE_ORDINAL_FLAG64)) {
+                // Import by name
+                pe_import_by_name_t* import_name = (pe_import_by_name_t*)((uint8_t*)image->image_base + ilt[i]);
+                func_name = (const char*)import_name->Name;
+            } else {
+                // Import by ordinal - skip for now
+                LSW_LOG_WARN("    Ordinal import not supported yet");
+                continue;
+            }
+            
+            // Resolve the function
+            void* func_addr = win32_api_resolve(dll_name, func_name);
+            if (func_addr) {
+                iat[i] = (uint64_t)func_addr;
+                func_count++;
+                LSW_LOG_DEBUG("    ✓ %s -> %p", func_name, func_addr);
+            } else {
+                LSW_LOG_WARN("    ✗ %s - unresolved", func_name);
+                // Leave as NULL - will crash if called
+                iat[i] = 0;
+            }
+        }
+        
+        import_desc++;
+    }
+    
+    LSW_LOG_INFO("Import resolution complete: %d DLLs, %d functions", dll_count, func_count);
     return true;
 }
 
@@ -185,15 +273,15 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     // TODO: Set up exception handlers
     // TODO: Initialize Win32 API stubs
     
-    LSW_LOG_WARN("⚠️  Execution not fully implemented yet");
-    LSW_LOG_INFO("Would execute function at: %p", image->entry_point);
+    LSW_LOG_INFO("Jumping to entry point...");
     
-    // This would be something like:
-    // typedef int (*entry_func_t)(void);
-    // entry_func_t entry = (entry_func_t)image->entry_point;
-    // return entry();
+    typedef int (*entry_func_t)(void);
+    entry_func_t entry = (entry_func_t)image->entry_point;
+    int result = entry();
     
-    return 0;
+    LSW_LOG_INFO("Program exited with code: %d", result);
+    
+    return result;
 }
 
 void pe_unload_image(pe_image_t* image) {
