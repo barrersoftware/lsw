@@ -17,6 +17,7 @@
 #include "../include/kernel-module/lsw_file.h"
 #include "../include/kernel-module/lsw_sync.h"
 #include "../include/kernel-module/lsw_dll.h"
+#include "../include/kernel-module/lsw_process.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
@@ -113,6 +114,18 @@ static int __init lsw_init(void)
         return ret;
     }
     
+    /* Initialize process/thread management */
+    ret = lsw_process_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize process management: %d", ret);
+        lsw_dll_exit();
+        lsw_sync_exit();
+        lsw_file_exit();
+        lsw_memory_exit();
+        lsw_syscall_exit();
+        return ret;
+    }
+    
     /* Initialize device interface */
     ret = lsw_device_init();
     if (ret != 0) {
@@ -139,6 +152,9 @@ static void __exit lsw_exit(void)
     
     /* Cleanup device interface */
     lsw_device_exit();
+    
+    /* Cleanup process/thread management */
+    lsw_process_exit();
     
     /* Cleanup DLL loading */
     lsw_dll_exit();

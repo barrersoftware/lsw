@@ -6,7 +6,7 @@
 obj-m := lsw.o
 
 # Source files  
-lsw-objs := lsw_main.o lsw_device.o lsw_syscall.o lsw_memory.o lsw_file.o lsw_sync.o lsw_dll.o
+lsw-objs := lsw_main.o lsw_device.o lsw_syscall.o lsw_memory.o lsw_file.o lsw_sync.o lsw_dll.o lsw_process.o
 
 # Kernel source directory (can be overridden)
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build

@@ -34,6 +34,9 @@
 #define LSW_SYSCALL_NtReleaseMutant       0x001d
 #define LSW_SYSCALL_LdrLoadDll            0x0026  /* Custom for DLL loading */
 #define LSW_SYSCALL_LdrGetProcedureAddress 0x00b8
+#define LSW_SYSCALL_NtCreateProcess       0x00b3
+#define LSW_SYSCALL_NtCreateThreadEx      0x00bd
+#define LSW_SYSCALL_NtTerminateProcess    0x002c
 
 /* Syscall request structure from userspace */
 struct lsw_syscall_request {
@@ -67,6 +70,9 @@ long lsw_syscall_NtSetEvent(struct lsw_syscall_request *req);
 long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req);
 long lsw_syscall_LdrLoadDll(struct lsw_syscall_request *req);
 long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateThreadEx(struct lsw_syscall_request *req);
+long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req);
 
 /* Initialize syscall translation system */
 int lsw_syscall_init(void);

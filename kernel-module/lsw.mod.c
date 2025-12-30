@@ -63,6 +63,8 @@ __used __section("__versions") =
 	"__wake_up\0\0\0"
 	"\x14\x00\x00\x00\xbb\x6d\xfb\xbd"
 	"__fentry__\0\0"
+	"\x18\x00\x00\x00\x1c\x61\x7c\xf8"
+	"wake_up_process\0"
 	"\x10\x00\x00\x00\x7e\x3a\x2c\x12"
 	"_printk\0"
 	"\x1c\x00\x00\x00\xad\x8a\xdd\x8d"
@@ -93,6 +95,8 @@ __used __section("__versions") =
 	"__x86_indirect_thunk_r13\0\0\0\0"
 	"\x18\x00\x00\x00\xdb\x75\x43\x94"
 	"_totalram_pages\0"
+	"\x18\x00\x00\x00\x23\x1b\xef\x02"
+	"kthread_stop\0\0\0\0"
 	"\x10\x00\x00\x00\xc5\x8f\x57\xfb"
 	"memset\0\0"
 	"\x14\x00\x00\x00\xae\x9a\xe9\xa7"
@@ -103,6 +107,8 @@ __used __section("__versions") =
 	"_copy_to_user\0\0\0"
 	"\x20\x00\x00\x00\x54\xea\xa5\xd9"
 	"__init_waitqueue_head\0\0\0"
+	"\x20\x00\x00\x00\xd7\x7b\x33\x1f"
+	"kthread_create_on_node\0\0"
 	"\x10\x00\x00\x00\x97\x82\x9e\x99"
 	"vfree\0\0\0"
 	"\x24\x00\x00\x00\x33\xb3\x91\x60"
@@ -119,6 +125,8 @@ __used __section("__versions") =
 	"kmalloc_trace\0\0\0"
 	"\x10\x00\x00\x00\x8f\x68\xee\xd6"
 	"vmalloc\0"
+	"\x10\x00\x00\x00\xf9\x82\xa4\xf9"
+	"msleep\0\0"
 	"\x14\x00\x00\x00\xbe\x69\x8c\x85"
 	"cdev_init\0\0\0"
 	"\x20\x00\x00\x00\x5d\x7b\xc1\xe2"
@@ -136,4 +144,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "5D6735E99241F4A7DFA74D6");
+MODULE_INFO(srcversion, "AFDEEFF06498B4C6FECA5A4");

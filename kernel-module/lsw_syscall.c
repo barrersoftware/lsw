@@ -17,6 +17,7 @@
 #include "../include/kernel-module/lsw_file.h"
 #include "../include/kernel-module/lsw_sync.h"
 #include "../include/kernel-module/lsw_dll.h"
+#include "../include/kernel-module/lsw_process.h"
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -42,6 +43,9 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtReleaseMutant, lsw_syscall_NtReleaseMutant, "NtReleaseMutant" },
     { LSW_SYSCALL_LdrLoadDll, lsw_syscall_LdrLoadDll, "LdrLoadDll" },
     { LSW_SYSCALL_LdrGetProcedureAddress, lsw_syscall_LdrGetProcedureAddress, "LdrGetProcedureAddress" },
+    { LSW_SYSCALL_NtCreateProcess, lsw_syscall_NtCreateProcess, "NtCreateProcess" },
+    { LSW_SYSCALL_NtCreateThreadEx, lsw_syscall_NtCreateThreadEx, "NtCreateThreadEx" },
+    { LSW_SYSCALL_NtTerminateProcess, lsw_syscall_NtTerminateProcess, "NtTerminateProcess" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -627,6 +631,91 @@ long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req)
     }
     
     req->return_value = proc_address;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtCreateProcess - Create a Win32 process
+ */
+long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req)
+{
+    const char *path = "/tmp/hello.exe";  /* TODO: Get from userspace */
+    __u32 win32_pid = 0;
+    int ret;
+    
+    lsw_info("NtCreateProcess: path='%s'", path);
+    
+    ret = lsw_process_create(path, &win32_pid);
+    
+    if (ret != 0) {
+        lsw_err("Process creation failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    lsw_info("Process created: Win32 PID=%u", win32_pid);
+    
+    req->return_value = win32_pid;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtCreateThreadEx - Create a thread
+ */
+long lsw_syscall_NtCreateThreadEx(struct lsw_syscall_request *req)
+{
+    __u32 win32_pid = req->args[0];
+    __u64 start_address = req->args[1];
+    __u64 parameter = req->args[2];
+    __u32 win32_tid = 0;
+    int ret;
+    
+    lsw_info("NtCreateThreadEx: PID=%u, start=0x%llx, param=0x%llx",
+             win32_pid, start_address, parameter);
+    
+    ret = lsw_thread_create(win32_pid, start_address, parameter, &win32_tid);
+    
+    if (ret != 0) {
+        lsw_err("Thread creation failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    lsw_info("Thread created: Win32 TID=%u", win32_tid);
+    
+    req->return_value = win32_tid;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtTerminateProcess - Terminate a process
+ */
+long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req)
+{
+    __u32 win32_pid = req->args[0];
+    __u32 exit_code = req->args[1];
+    int ret;
+    
+    lsw_info("NtTerminateProcess: PID=%u, exit_code=%u", win32_pid, exit_code);
+    
+    ret = lsw_process_terminate(win32_pid, exit_code);
+    
+    if (ret != 0) {
+        lsw_err("Process termination failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 0;
     req->error_code = 0;
     
     return 0;
