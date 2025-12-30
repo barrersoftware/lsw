@@ -10,6 +10,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
+#include <linux/sched/signal.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_syscall.h"
 #include "../include/kernel-module/lsw_memory.h"
@@ -28,6 +29,7 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtClose, lsw_syscall_NtClose, "NtClose" },
     { LSW_SYSCALL_NtAllocateVirtualMemory, lsw_syscall_NtAllocateVirtualMemory, "NtAllocateVirtualMemory" },
     { LSW_SYSCALL_NtFreeVirtualMemory, lsw_syscall_NtFreeVirtualMemory, "NtFreeVirtualMemory" },
+    { LSW_SYSCALL_NtQuerySystemInformation, lsw_syscall_NtQuerySystemInformation, "NtQuerySystemInformation" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -197,6 +199,72 @@ long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req)
     
     req->return_value = 0;
     req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtQuerySystemInformation - Query system information
+ * 
+ * Used by anti-cheat to enumerate processes and get system state
+ * 
+ * Win32: NTSTATUS NtQuerySystemInformation(
+ *     SYSTEM_INFORMATION_CLASS SystemInformationClass,
+ *     PVOID SystemInformation,
+ *     ULONG SystemInformationLength,
+ *     PULONG ReturnLength
+ * )
+ */
+long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req)
+{
+    __u32 info_class = req->args[0];
+    struct task_struct *task;
+    int process_count = 0;
+    
+    lsw_info("NtQuerySystemInformation: class=0x%x (SystemProcessInformation=5)",
+             info_class);
+    
+    /* SystemProcessInformation = 5 (enumerate processes) */
+    if (info_class == 5) {
+        /* Enumerate all processes using Linux kernel */
+        rcu_read_lock();
+        for_each_process(task) {
+            if (process_count < 10) {  /* Show first 10 for demo */
+                lsw_info("  Process: PID=%d, name=%s, state=%ld",
+                         task->pid, task->comm, task->__state);
+            }
+            process_count++;
+        }
+        rcu_read_unlock();
+        
+        lsw_info("Total processes enumerated: %d", process_count);
+        
+        /* Return process count in return_value */
+        req->return_value = process_count;
+        req->error_code = 0;
+        
+        return 0;
+    }
+    
+    /* SystemBasicInformation = 0 (system info) */
+    if (info_class == 0) {
+        lsw_info("  System basic information requested");
+        lsw_info("  Total RAM: %lu KB", totalram_pages() * (PAGE_SIZE / 1024));
+        lsw_info("  Kernel version: %d.%d.%d",
+                 LINUX_VERSION_CODE >> 16,
+                 (LINUX_VERSION_CODE >> 8) & 0xFF,
+                 LINUX_VERSION_CODE & 0xFF);
+        
+        req->return_value = 0;
+        req->error_code = 0;
+        
+        return 0;
+    }
+    
+    /* Other information classes not yet implemented */
+    lsw_info("Information class 0x%x not yet implemented", info_class);
+    req->return_value = 0;
+    req->error_code = -ENOSYS;
     
     return 0;
 }

@@ -39,6 +39,8 @@ __used __section("__versions") =
 	"alloc_chrdev_region\0"
 	"\x18\x00\x00\x00\xc2\x9c\xc4\x13"
 	"_copy_from_user\0"
+	"\x18\x00\x00\x00\x14\x27\x52\x8d"
+	"__rcu_read_lock\0"
 	"\x18\x00\x00\x00\x47\x67\x64\x75"
 	"class_destroy\0\0\0"
 	"\x10\x00\x00\x00\xba\x0c\x7a\x03"
@@ -51,10 +53,14 @@ __used __section("__versions") =
 	"_printk\0"
 	"\x1c\x00\x00\x00\xcb\xf6\xfd\xf0"
 	"__stack_chk_fail\0\0\0\0"
+	"\x14\x00\x00\x00\x5b\x0f\x4c\xa5"
+	"init_task\0\0\0"
 	"\x28\x00\x00\x00\xb3\x1c\xa2\x87"
 	"__ubsan_handle_out_of_bounds\0\0\0\0"
 	"\x14\x00\x00\x00\x75\x23\x73\x6b"
 	"cdev_add\0\0\0\0"
+	"\x1c\x00\x00\x00\x0f\x81\x69\x24"
+	"__rcu_read_unlock\0\0\0"
 	"\x18\x00\x00\x00\x06\xde\x69\x3b"
 	"device_create\0\0\0"
 	"\x18\x00\x00\x00\x6a\xb8\xa9\x6c"
@@ -65,6 +71,8 @@ __used __section("__versions") =
 	"mutex_lock\0\0"
 	"\x24\x00\x00\x00\xe9\xc8\x79\x1a"
 	"__x86_indirect_thunk_r13\0\0\0\0"
+	"\x18\x00\x00\x00\xdb\x75\x43\x94"
+	"_totalram_pages\0"
 	"\x10\x00\x00\x00\xc5\x8f\x57\xfb"
 	"memset\0\0"
 	"\x1c\x00\x00\x00\xca\x39\x82\x5b"
@@ -98,4 +106,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "B44F0B05743C25FC7BC9469");
+MODULE_INFO(srcversion, "747A323A8D102626707BA26");

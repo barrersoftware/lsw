@@ -24,6 +24,7 @@
 #define LSW_SYSCALL_NtTerminateThread     0x0053
 #define LSW_SYSCALL_NtQueryInformationProcess 0x0019
 #define LSW_SYSCALL_NtDelayExecution      0x0033
+#define LSW_SYSCALL_NtQuerySystemInformation 0x0036
 
 /* Syscall request structure from userspace */
 struct lsw_syscall_request {
@@ -47,6 +48,7 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req);
 long lsw_syscall_NtClose(struct lsw_syscall_request *req);
 long lsw_syscall_NtAllocateVirtualMemory(struct lsw_syscall_request *req);
 long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req);
 
 /* Initialize syscall translation system */
 int lsw_syscall_init(void);
