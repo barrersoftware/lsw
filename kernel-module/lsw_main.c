@@ -32,6 +32,11 @@ struct lsw_state lsw_module_state = {
     .pe_process_count = 0,
 };
 
+/* Prevent auto-unload when last process exits */
+static bool module_persistent = true;
+module_param(module_persistent, bool, 0444);
+MODULE_PARM_DESC(module_persistent, "Keep module loaded when no PE processes are running");
+
 /**
  * lsw_init - Initialize LSW kernel module
  * 
@@ -134,6 +139,13 @@ static int __init lsw_init(void)
     }
     
     lsw_module_state.initialized = true;
+    
+    /* Increment module reference count to prevent auto-unload */
+    if (module_persistent) {
+        __module_get(THIS_MODULE);
+        lsw_info("Module persistence enabled - will remain loaded");
+    }
+    
     lsw_info("LSW kernel module initialized successfully");
     lsw_info("Ready to execute Windows PE files on Linux");
     lsw_info("Device: %s", LSW_DEVICE_PATH);
@@ -149,6 +161,12 @@ static int __init lsw_init(void)
 static void __exit lsw_exit(void)
 {
     lsw_info("Shutting down LSW kernel module");
+    
+    /* Release module reference if it was held */
+    if (module_persistent) {
+        module_put(THIS_MODULE);
+        lsw_info("Module reference released");
+    }
     
     /* Cleanup device interface */
     lsw_device_exit();

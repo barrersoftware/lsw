@@ -61,6 +61,8 @@ __used __section("__versions") =
 	"prepare_to_wait_event\0\0\0"
 	"\x14\x00\x00\x00\x44\x43\x96\xe2"
 	"__wake_up\0\0\0"
+	"\x18\x00\x00\x00\x0f\x46\x80\x91"
+	"__module_get\0\0\0\0"
 	"\x14\x00\x00\x00\xbb\x6d\xfb\xbd"
 	"__fentry__\0\0"
 	"\x18\x00\x00\x00\x1c\x61\x7c\xf8"
@@ -73,6 +75,8 @@ __used __section("__versions") =
 	"__stack_chk_fail\0\0\0\0"
 	"\x14\x00\x00\x00\x5b\x0f\x4c\xa5"
 	"init_task\0\0\0"
+	"\x14\x00\x00\x00\xab\x6c\xca\x0f"
+	"module_put\0\0"
 	"\x28\x00\x00\x00\xb3\x1c\xa2\x87"
 	"__ubsan_handle_out_of_bounds\0\0\0\0"
 	"\x14\x00\x00\x00\x75\x23\x73\x6b"
@@ -115,6 +119,8 @@ __used __section("__versions") =
 	"unregister_chrdev_region\0\0\0\0"
 	"\x18\x00\x00\x00\x38\xf0\x13\x32"
 	"mutex_unlock\0\0\0\0"
+	"\x18\x00\x00\x00\x3d\x24\x4b\x36"
+	"param_ops_bool\0\0"
 	"\x14\x00\x00\x00\x90\xc4\x0e\x2d"
 	"filp_close\0\0"
 	"\x18\x00\x00\x00\x81\xb4\x40\x5b"
@@ -123,6 +129,8 @@ __used __section("__versions") =
 	"__dynamic_pr_debug\0\0"
 	"\x18\x00\x00\x00\x4c\x48\xc3\xd0"
 	"kmalloc_trace\0\0\0"
+	"\x2c\x00\x00\x00\xc6\xfa\xb1\x54"
+	"__ubsan_handle_load_invalid_value\0\0\0"
 	"\x10\x00\x00\x00\x8f\x68\xee\xd6"
 	"vmalloc\0"
 	"\x10\x00\x00\x00\xf9\x82\xa4\xf9"
@@ -144,4 +152,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "75297FEED3E687164A4CCC8");
+MODULE_INFO(srcversion, "BD4AD61D3CA6ADC6FB12F5D");
