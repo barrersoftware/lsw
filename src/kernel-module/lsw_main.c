@@ -10,7 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kallsyms.h>
-#include "../../include/kernel-module/lsw_kernel.h"
+#include "../include/kernel-module/lsw_kernel.h"
 
 MODULE_LICENSE("Proprietary");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
@@ -47,26 +47,30 @@ static int __init lsw_init(void)
     /* TODO: Find syscall table address */
     lsw_info("Searching for syscall table...");
     
-#ifdef CONFIG_KALLSYMS
-    /* Use kallsyms to find syscall table if available */
-    lsw_module_state.syscall_table_addr = kallsyms_lookup_name("sys_call_table");
-    if (lsw_module_state.syscall_table_addr) {
-        lsw_info("Found syscall table at: 0x%lx", lsw_module_state.syscall_table_addr);
-    } else {
-        lsw_warn("Could not find syscall table via kallsyms");
-        /* TODO: Fallback methods to find syscall table */
-    }
-#else
-    lsw_warn("CONFIG_KALLSYMS not available");
-#endif
+    /* kallsyms_lookup_name is not exported in newer kernels */
+    /* We'll need alternative methods to find the syscall table */
+    /* For now, just log that we need to implement this */
+    lsw_info("Syscall table lookup - TODO: implement for kernel %d.%d",
+             LINUX_VERSION_CODE >> 16,
+             (LINUX_VERSION_CODE >> 8) & 0xFF);
+    
+    /* Placeholder - will implement kprobes or other method later */
+    lsw_module_state.syscall_table_addr = 0;
     
     /* TODO: Initialize syscall hooks */
     /* TODO: Initialize PE process tracking */
-    /* TODO: Create /proc or /sys entries for userspace communication */
+    
+    /* Initialize device interface */
+    ret = lsw_device_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize device interface: %d", ret);
+        return ret;
+    }
     
     lsw_module_state.initialized = true;
     lsw_info("LSW kernel module initialized successfully");
     lsw_info("Ready to execute Windows PE files on Linux");
+    lsw_info("Device: %s", LSW_DEVICE_PATH);
     
     return 0;
 }
@@ -80,9 +84,11 @@ static void __exit lsw_exit(void)
 {
     lsw_info("Shutting down LSW kernel module");
     
+    /* Cleanup device interface */
+    lsw_device_exit();
+    
     /* TODO: Remove syscall hooks */
     /* TODO: Cleanup PE processes */
-    /* TODO: Remove /proc or /sys entries */
     
     if (lsw_module_state.pe_process_count > 0) {
         lsw_warn("Warning: %u PE processes still active during shutdown",

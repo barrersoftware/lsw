@@ -11,8 +11,9 @@
 #include <linux/init.h>
 #include <linux/kallsyms.h>
 #include "../include/kernel-module/lsw_kernel.h"
+#include "../include/kernel-module/lsw_device.h"
 
-MODULE_LICENSE("Proprietary");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
 MODULE_DESCRIPTION(LSW_MODULE_DESC);
 MODULE_VERSION(LSW_MODULE_VERSION);
@@ -32,6 +33,8 @@ struct lsw_state lsw_module_state = {
  */
 static int __init lsw_init(void)
 {
+    int ret;
+    
     lsw_info("Initializing LSW v%s", LSW_MODULE_VERSION);
     lsw_info("Linux Subsystem for Windows - Kernel Module");
     lsw_info("Kernel version: %d.%d.%d", 
@@ -59,11 +62,18 @@ static int __init lsw_init(void)
     
     /* TODO: Initialize syscall hooks */
     /* TODO: Initialize PE process tracking */
-    /* TODO: Create /proc or /sys entries for userspace communication */
+    
+    /* Initialize device interface */
+    ret = lsw_device_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize device interface: %d", ret);
+        return ret;
+    }
     
     lsw_module_state.initialized = true;
     lsw_info("LSW kernel module initialized successfully");
     lsw_info("Ready to execute Windows PE files on Linux");
+    lsw_info("Device: %s", LSW_DEVICE_PATH);
     
     return 0;
 }
@@ -77,9 +87,11 @@ static void __exit lsw_exit(void)
 {
     lsw_info("Shutting down LSW kernel module");
     
+    /* Cleanup device interface */
+    lsw_device_exit();
+    
     /* TODO: Remove syscall hooks */
     /* TODO: Cleanup PE processes */
-    /* TODO: Remove /proc or /sys entries */
     
     if (lsw_module_state.pe_process_count > 0) {
         lsw_warn("Warning: %u PE processes still active during shutdown",
