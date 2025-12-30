@@ -16,6 +16,7 @@
 #include "../include/kernel-module/lsw_memory.h"
 #include "../include/kernel-module/lsw_file.h"
 #include "../include/kernel-module/lsw_sync.h"
+#include "../include/kernel-module/lsw_dll.h"
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -39,6 +40,8 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtWaitForSingleObject, lsw_syscall_NtWaitForSingleObject, "NtWaitForSingleObject" },
     { LSW_SYSCALL_NtSetEvent, lsw_syscall_NtSetEvent, "NtSetEvent" },
     { LSW_SYSCALL_NtReleaseMutant, lsw_syscall_NtReleaseMutant, "NtReleaseMutant" },
+    { LSW_SYSCALL_LdrLoadDll, lsw_syscall_LdrLoadDll, "LdrLoadDll" },
+    { LSW_SYSCALL_LdrGetProcedureAddress, lsw_syscall_LdrGetProcedureAddress, "LdrGetProcedureAddress" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -571,6 +574,59 @@ long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req)
     }
     
     req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LdrLoadDll - Load a DLL
+ */
+long lsw_syscall_LdrLoadDll(struct lsw_syscall_request *req)
+{
+    const char *path = "/tmp/test.dll";  /* TODO: Get from userspace */
+    __u64 base_address = 0;
+    int ret;
+    
+    lsw_info("LdrLoadDll: path='%s'", path);
+    
+    ret = lsw_dll_load(current->pid, path, &base_address);
+    
+    if (ret != 0) {
+        lsw_err("DLL load failed: %d", ret);
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = base_address;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LdrGetProcedureAddress - Get function address from DLL
+ */
+long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req)
+{
+    __u64 base_address = req->args[0];
+    const char *function_name = "TestFunction";  /* TODO: Get from userspace */
+    __u64 proc_address;
+    
+    lsw_info("LdrGetProcedureAddress: base=0x%llx, function='%s'",
+             base_address, function_name);
+    
+    proc_address = lsw_dll_get_proc_address(base_address, function_name);
+    
+    if (proc_address == 0) {
+        lsw_err("Function not found");
+        req->return_value = 0;
+        req->error_code = -ENOENT;
+        return -ENOENT;
+    }
+    
+    req->return_value = proc_address;
     req->error_code = 0;
     
     return 0;

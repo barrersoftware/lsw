@@ -1091,6 +1091,7 @@ deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o := \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_memory.h \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_file.h \
   /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_sync.h \
+  /home/ssfdre38/lsw-project/kernel-module/../include/kernel-module/lsw_dll.h \
 
 /home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o: $(deps_/home/ssfdre38/lsw-project/kernel-module/lsw_syscall.o)
 
