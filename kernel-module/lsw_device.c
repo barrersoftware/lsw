@@ -13,6 +13,7 @@
 #include <linux/uaccess.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_device.h"
+#include "../include/kernel-module/lsw_syscall.h"
 
 /* Device data */
 static dev_t lsw_dev_number;
@@ -120,6 +121,8 @@ static long lsw_unregister_pe(pid_t pid)
  */
 static long lsw_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
+    struct lsw_syscall_request syscall_req;
+    
     switch (cmd) {
     case LSW_IOCTL_REGISTER_PE:
         return lsw_register_pe((struct lsw_pe_info __user *)arg);
@@ -130,6 +133,20 @@ static long lsw_device_ioctl(struct file *file, unsigned int cmd, unsigned long 
     case LSW_IOCTL_GET_STATUS:
         if (copy_to_user((int __user *)arg, &pe_process_count, sizeof(int)))
             return -EFAULT;
+        return 0;
+        
+    case LSW_IOCTL_SYSCALL:
+        /* Copy syscall request from userspace */
+        if (copy_from_user(&syscall_req, (void __user *)arg, sizeof(syscall_req)))
+            return -EFAULT;
+        
+        /* Handle the syscall */
+        lsw_handle_syscall(&syscall_req);
+        
+        /* Copy result back to userspace */
+        if (copy_to_user((void __user *)arg, &syscall_req, sizeof(syscall_req)))
+            return -EFAULT;
+        
         return 0;
         
     default:

@@ -1,0 +1,179 @@
+/*
+ * LSW (Linux Subsystem for Windows) - Kernel Module
+ * Copyright (c) 2025 BarrerSoftware
+ * Licensed under Barrer Free Software License (BFSL) v1.2
+ * 
+ * Win32 to Linux Syscall Translation Implementation
+ */
+
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include "../include/kernel-module/lsw_kernel.h"
+#include "../include/kernel-module/lsw_syscall.h"
+
+/* Syscall handler table */
+struct lsw_syscall_entry {
+    __u32 syscall_number;
+    lsw_syscall_handler_t handler;
+    const char *name;
+};
+
+static struct lsw_syscall_entry syscall_table[] = {
+    { LSW_SYSCALL_NtCreateFile, lsw_syscall_NtCreateFile, "NtCreateFile" },
+    { LSW_SYSCALL_NtReadFile, lsw_syscall_NtReadFile, "NtReadFile" },
+    { LSW_SYSCALL_NtWriteFile, lsw_syscall_NtWriteFile, "NtWriteFile" },
+    { LSW_SYSCALL_NtClose, lsw_syscall_NtClose, "NtClose" },
+    { LSW_SYSCALL_NtAllocateVirtualMemory, lsw_syscall_NtAllocateVirtualMemory, "NtAllocateVirtualMemory" },
+    { LSW_SYSCALL_NtFreeVirtualMemory, lsw_syscall_NtFreeVirtualMemory, "NtFreeVirtualMemory" },
+    { 0, NULL, NULL } /* Terminator */
+};
+
+/**
+ * lsw_handle_syscall - Main syscall dispatcher
+ */
+long lsw_handle_syscall(struct lsw_syscall_request *req)
+{
+    int i;
+    
+    if (!req) {
+        return -EINVAL;
+    }
+    
+    /* Find handler for this syscall */
+    for (i = 0; syscall_table[i].handler != NULL; i++) {
+        if (syscall_table[i].syscall_number == req->syscall_number) {
+            lsw_debug("Dispatching syscall: %s (0x%04x)",
+                     syscall_table[i].name, req->syscall_number);
+            
+            /* Call the handler */
+            return syscall_table[i].handler(req);
+        }
+    }
+    
+    lsw_warn("Unimplemented syscall: 0x%04x", req->syscall_number);
+    return -ENOSYS;
+}
+
+/**
+ * lsw_syscall_NtCreateFile - Translate NtCreateFile to Linux open()
+ * 
+ * Win32: NTSTATUS NtCreateFile(PHANDLE FileHandle, ACCESS_MASK DesiredAccess, ...)
+ * Linux: int open(const char *pathname, int flags, mode_t mode)
+ */
+long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req)
+{
+    /* TODO: Implement full NtCreateFile translation
+     * For now, return stub implementation */
+    
+    lsw_info("NtCreateFile called (STUB)");
+    
+    /* Stub: just return success with dummy handle */
+    req->return_value = 0x1000; /* Fake file handle */
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtReadFile - Translate NtReadFile to Linux read()
+ */
+long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
+{
+    lsw_info("NtReadFile called (STUB)");
+    
+    req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtWriteFile - Translate NtWriteFile to Linux write()
+ */
+long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
+{
+    lsw_info("NtWriteFile called (STUB)");
+    
+    req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtClose - Translate NtClose to Linux close()
+ */
+long lsw_syscall_NtClose(struct lsw_syscall_request *req)
+{
+    lsw_info("NtClose called (STUB)");
+    
+    req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtAllocateVirtualMemory - Translate to Linux mmap()
+ * 
+ * This is critical for PE loader memory allocation
+ */
+long lsw_syscall_NtAllocateVirtualMemory(struct lsw_syscall_request *req)
+{
+    __u64 base_address = req->args[0];
+    __u64 region_size = req->args[1];
+    
+    lsw_info("NtAllocateVirtualMemory: base=0x%llx, size=0x%llx (STUB)",
+             base_address, region_size);
+    
+    /* TODO: Actually allocate memory via kernel mm subsystem
+     * For now, return stub */
+    
+    req->return_value = base_address; /* Return requested address */
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtFreeVirtualMemory - Translate to Linux munmap()
+ */
+long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req)
+{
+    __u64 base_address = req->args[0];
+    
+    lsw_info("NtFreeVirtualMemory: base=0x%llx (STUB)", base_address);
+    
+    req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_init - Initialize syscall translation system
+ */
+int lsw_syscall_init(void)
+{
+    int count = 0;
+    int i;
+    
+    /* Count registered syscalls */
+    for (i = 0; syscall_table[i].handler != NULL; i++) {
+        count++;
+    }
+    
+    lsw_info("Syscall translation system initialized: %d syscalls registered", count);
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_exit - Cleanup syscall translation system
+ */
+void lsw_syscall_exit(void)
+{
+    lsw_info("Syscall translation system cleaned up");
+}

@@ -57,6 +57,8 @@ __used __section("__versions") =
 	"class_create\0\0\0\0"
 	"\x14\x00\x00\x00\x4b\x8d\xfa\x4d"
 	"mutex_lock\0\0"
+	"\x24\x00\x00\x00\xe9\xc8\x79\x1a"
+	"__x86_indirect_thunk_r13\0\0\0\0"
 	"\x1c\x00\x00\x00\xca\x39\x82\x5b"
 	"__x86_return_thunk\0\0"
 	"\x18\x00\x00\x00\xe1\xbe\x10\x6b"
@@ -80,4 +82,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "BED73572268E0E016E3A850");
+MODULE_INFO(srcversion, "D52F91FC3A320FCC56E8E25");

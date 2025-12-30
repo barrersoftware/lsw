@@ -12,6 +12,7 @@
 #include <linux/kallsyms.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_device.h"
+#include "../include/kernel-module/lsw_syscall.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
@@ -63,6 +64,13 @@ static int __init lsw_init(void)
     /* TODO: Initialize syscall hooks */
     /* TODO: Initialize PE process tracking */
     
+    /* Initialize syscall translation system */
+    ret = lsw_syscall_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize syscall system: %d", ret);
+        return ret;
+    }
+    
     /* Initialize device interface */
     ret = lsw_device_init();
     if (ret != 0) {
@@ -89,6 +97,9 @@ static void __exit lsw_exit(void)
     
     /* Cleanup device interface */
     lsw_device_exit();
+    
+    /* Cleanup syscall system */
+    lsw_syscall_exit();
     
     /* TODO: Remove syscall hooks */
     /* TODO: Cleanup PE processes */

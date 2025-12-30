@@ -34,6 +34,7 @@ struct lsw_pe_info {
 #define LSW_IOCTL_REGISTER_PE   _IOW(LSW_IOCTL_MAGIC, 1, struct lsw_pe_info)
 #define LSW_IOCTL_UNREGISTER_PE _IOW(LSW_IOCTL_MAGIC, 2, __u32)
 #define LSW_IOCTL_GET_STATUS    _IOR(LSW_IOCTL_MAGIC, 3, __u32)
+#define LSW_IOCTL_SYSCALL       _IOWR(LSW_IOCTL_MAGIC, 4, struct lsw_syscall_request)
 
 /* Device functions */
 int lsw_device_init(void);
