@@ -10,6 +10,7 @@
 #include "pe-loader/pe_parser.h"
 #include "pe-loader/pe_format.h"
 #include "win32-api/win32_api.h"
+#include "shared/lsw_kernel_client.h"
 #include "lsw_log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -266,22 +267,58 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
         return -1;
     }
     
-    LSW_LOG_INFO("🚀 Executing PE image...");
+    LSW_LOG_INFO("🚀 Executing PE image via kernel module...");
     LSW_LOG_INFO("Entry point: %p", image->entry_point);
     
-    // TODO: Set up Windows environment (TEB, PEB, etc.)
-    // TODO: Set up exception handlers
-    // TODO: Initialize Win32 API stubs
+    // Open kernel device
+    int kernel_fd = lsw_kernel_open();
+    if (kernel_fd < 0) {
+        LSW_LOG_ERROR("Failed to open kernel device /dev/lsw");
+        LSW_LOG_ERROR("Make sure the LSW kernel module is loaded: sudo insmod kernel-module/lsw.ko");
+        return -1;
+    }
     
-    LSW_LOG_INFO("Jumping to entry point...");
+    // Prepare PE info for kernel
+    struct lsw_pe_info pe_info;
+    memset(&pe_info, 0, sizeof(pe_info));
+    pe_info.pid = getpid();
+    pe_info.base_address = (uint64_t)image->image_base;
+    pe_info.entry_point = (uint64_t)image->entry_point;
+    pe_info.image_size = image->image_size;
+    pe_info.is_64bit = image->pe.is_64bit ? 1 : 0;
     
-    typedef int (*entry_func_t)(void);
-    entry_func_t entry = (entry_func_t)image->entry_point;
-    int result = entry();
+    // Get executable path from argv or use placeholder
+    const char* exe_path = (argc > 0 && argv && argv[0]) ? argv[0] : "unknown.exe";
+    strncpy(pe_info.executable_path, exe_path, sizeof(pe_info.executable_path) - 1);
     
-    LSW_LOG_INFO("Program exited with code: %d", result);
+    LSW_LOG_INFO("Registering PE with kernel:");
+    LSW_LOG_INFO("  PID: %u", pe_info.pid);
+    LSW_LOG_INFO("  Base: 0x%lx", pe_info.base_address);
+    LSW_LOG_INFO("  Entry: 0x%lx", pe_info.entry_point);
+    LSW_LOG_INFO("  Size: 0x%x", pe_info.image_size);
+    LSW_LOG_INFO("  Arch: %s", pe_info.is_64bit ? "64-bit" : "32-bit");
     
-    return result;
+    // Register PE with kernel
+    int ret = lsw_kernel_register_pe(kernel_fd, &pe_info);
+    if (ret < 0) {
+        LSW_LOG_ERROR("Failed to register PE with kernel");
+        lsw_kernel_close(kernel_fd);
+        return -1;
+    }
+    
+    LSW_LOG_INFO("✅ PE registered with kernel successfully");
+    LSW_LOG_INFO("TODO: Kernel needs to execute the PE at entry point");
+    LSW_LOG_INFO("For now, PE is loaded and registered but not executed");
+    
+    // TODO: Trigger kernel execution
+    // TODO: Wait for execution completion
+    // TODO: Get exit code from kernel
+    
+    // Cleanup
+    lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
+    lsw_kernel_close(kernel_fd);
+    
+    return 0;
 }
 
 void pe_unload_image(pe_image_t* image) {
