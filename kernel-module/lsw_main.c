@@ -33,7 +33,7 @@ struct lsw_state lsw_module_state = {
 };
 
 /* Prevent auto-unload when last process exits */
-static bool module_persistent = true;
+static bool module_persistent = false;  // Changed to false for easier hot-reloading
 module_param(module_persistent, bool, 0444);
 MODULE_PARM_DESC(module_persistent, "Keep module loaded when no PE processes are running");
 
