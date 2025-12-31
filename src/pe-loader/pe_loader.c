@@ -10,6 +10,7 @@
 #include "pe-loader/pe_parser.h"
 #include "pe-loader/pe_format.h"
 #include "win32-api/win32_api.h"
+#include "win32-api/win32_teb.h"
 #include "shared/lsw_kernel_client.h"
 #include "lsw_log.h"
 #include <stdio.h>
@@ -19,6 +20,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
+#include <execinfo.h>
+
+static void segfault_handler(int sig) {
+    LSW_LOG_ERROR("SEGFAULT! Signal: %d", sig);
+    LSW_LOG_ERROR("PE code crashed - likely missing CRT or TEB/PEB structures");
+    
+    // Print backtrace
+    void *buffer[10];
+    int nptrs = backtrace(buffer, 10);
+    LSW_LOG_ERROR("Backtrace (%d frames):", nptrs);
+    backtrace_symbols_fd(buffer, nptrs, STDERR_FILENO);
+    
+    exit(139);
+}
 
 bool pe_load_image(pe_image_t* image, const char* filepath) {
     if (!image || !filepath) {
@@ -173,10 +189,14 @@ bool pe_map_sections(pe_image_t* image) {
         LSW_LOG_DEBUG("Mapped section %s: %p (0x%x bytes)", name, dest, copy_size);
         
         // Set memory protections
-        int prot = 0;
-        if (section->Characteristics & PE_SCN_MEM_READ) prot |= PROT_READ;
-        if (section->Characteristics & PE_SCN_MEM_WRITE) prot |= PROT_WRITE;
-        if (section->Characteristics & PE_SCN_MEM_EXECUTE) prot |= PROT_EXEC;
+        // For now, make everything RWX to avoid protection issues during CRT init
+        // TODO: Apply proper protections after CRT initialization completes
+        int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+        
+        // Original protection logic (disabled for now):
+        // if (section->Characteristics & PE_SCN_MEM_READ) prot |= PROT_READ;
+        // if (section->Characteristics & PE_SCN_MEM_WRITE) prot |= PROT_WRITE;
+        // if (section->Characteristics & PE_SCN_MEM_EXECUTE) prot |= PROT_EXEC;
         
         // Apply protections (aligned to page boundary)
         size_t page_size = sysconf(_SC_PAGESIZE);
@@ -307,18 +327,83 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     }
     
     LSW_LOG_INFO("✅ PE registered with kernel successfully");
-    LSW_LOG_INFO("TODO: Kernel needs to execute the PE at entry point");
-    LSW_LOG_INFO("For now, PE is loaded and registered but not executed");
     
-    // TODO: Trigger kernel execution
-    // TODO: Wait for execution completion
-    // TODO: Get exit code from kernel
+    // Execute PE in kernel
+    LSW_LOG_INFO("🚀 Requesting kernel to execute PE...");
+    ret = lsw_kernel_execute_pe(kernel_fd, pe_info.pid);
+    if (ret < 0) {
+        LSW_LOG_ERROR("Failed to execute PE in kernel");
+        lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
+        lsw_kernel_close(kernel_fd);
+        return -1;
+    }
+    
+    LSW_LOG_INFO("✅ Kernel acknowledged execution request");
+    
+    // NOW: Actually jump to the PE entry point in userspace!
+    LSW_LOG_INFO("🚀 Jumping to PE entry point: 0x%lx", (unsigned long)image->entry_point);
+    
+    // Set up entry point function pointer
+    // PE entry points are typically: int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+    // For console apps: int main(void)
+    typedef int (*pe_entry_func_t)(void);
+    pe_entry_func_t entry_func = (pe_entry_func_t)image->entry_point;
+    
+    // Install segfault handler to debug crashes
+    signal(SIGSEGV, segfault_handler);
+    
+    LSW_LOG_INFO("WARNING: About to execute PE code - this may crash!");
+    LSW_LOG_INFO("Entry point type: %s", 
+                 image->pe.nt_headers64 && image->pe.nt_headers64->OptionalHeader.Subsystem == 3 ? 
+                 "Console" : "GUI");
+    
+    // Set up Win32 environment (TEB, PEB, etc)
+    LSW_LOG_INFO("Setting up Windows environment (TEB/PEB)...");
+    if (win32_teb_init() != 0) {
+        LSW_LOG_ERROR("Failed to initialize TEB/PEB");
+        lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
+        lsw_kernel_close(kernel_fd);
+        return -1;
+    }
+    
+    // Set PEB image base
+    win32_teb_t* teb = win32_teb_get();
+    if (teb && teb->ProcessEnvironmentBlock) {
+        win32_peb_t* peb = (win32_peb_t*)teb->ProcessEnvironmentBlock;
+        peb->ImageBaseAddress = image->image_base;
+        LSW_LOG_INFO("PEB ImageBaseAddress set to: %p", image->image_base);
+    }
+    
+    int exit_code = 0;
+    LSW_LOG_INFO("Calling PE entry point at 0x%lx...", (unsigned long)entry_func);
+    LSW_LOG_INFO("Image base: 0x%lx, Size: 0x%x", 
+                 (unsigned long)image->image_base, image->image_size);
+    
+    // HACK: Make our .text section writable temporarily
+    // The PE's CRT tries to write to imported function addresses
+    // This is a workaround - proper solution is IAT trampolines
+    extern void lsw__initenv(void);
+    void* page_addr = (void*)((uintptr_t)lsw__initenv & ~0xFFF);
+    if (mprotect(page_addr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+        LSW_LOG_INFO("Made our .text section writable at %p (HACK)", page_addr);
+    }
+    
+    // Give Win32 APIs access to kernel fd for syscalls
+    win32_api_set_kernel_fd(kernel_fd);
+    
+    // This is where we actually execute Windows code on Linux!
+    // The PE entry point expects proper Windows environment
+    LSW_LOG_INFO("🚀 Executing PE with kernel syscall routing enabled!");
+    exit_code = entry_func();
+    
+    LSW_LOG_INFO("✅ PE execution returned: exit_code=%d", exit_code);
+    LSW_LOG_INFO("Ring-3 → Ring-0 → Ring-3 → PE EXECUTION → Ring-3 complete!");
     
     // Cleanup
     lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
     lsw_kernel_close(kernel_fd);
     
-    return 0;
+    return exit_code;
 }
 
 void pe_unload_image(pe_image_t* image) {

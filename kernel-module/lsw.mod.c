@@ -39,6 +39,8 @@ __used __section("__versions") =
 	"filp_open\0\0\0"
 	"\x1c\x00\x00\x00\x2b\x2f\xec\xe3"
 	"alloc_chrdev_region\0"
+	"\x1c\x00\x00\x00\x48\x9f\xdb\x88"
+	"__check_object_size\0"
 	"\x18\x00\x00\x00\xc2\x9c\xc4\x13"
 	"_copy_from_user\0"
 	"\x18\x00\x00\x00\x14\x27\x52\x8d"
@@ -152,4 +154,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "33ACA630942A9CE0D031511");
+MODULE_INFO(srcversion, "E2EB7FDA757506F7C35CC64");

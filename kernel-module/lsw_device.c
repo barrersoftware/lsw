@@ -117,6 +117,55 @@ static long lsw_unregister_pe(pid_t pid)
 }
 
 /**
+ * lsw_execute_pe - Execute a registered PE process  
+ */
+static long lsw_execute_pe(pid_t pid)
+{
+    struct lsw_pe_info *info = NULL;
+    int i;
+    
+    lsw_info("Executing PE process: PID=%u", pid);
+    
+    /* Find the PE in our registry */
+    mutex_lock(&pe_list_mutex);
+    
+    for (i = 0; i < LSW_MAX_PE_PROCESSES; i++) {
+        if (pe_processes[i].pid == pid) {
+            info = &pe_processes[i];
+            break;
+        }
+    }
+    
+    if (!info) {
+        mutex_unlock(&pe_list_mutex);
+        lsw_err("PE not registered: PID=%u", pid);
+        return -ESRCH;
+    }
+    
+    lsw_info("Found PE: base=0x%llx, entry=0x%llx, %s-bit",
+             info->base_address, info->entry_point,
+             info->is_64bit ? "64" : "32");
+    
+    /* TODO: This is where we would jump to the entry point
+     * For now, we'll just log that we would execute it
+     * Real implementation needs:
+     * 1. Create kernel thread for PE execution
+     * 2. Set up register state (RIP/EIP = entry_point)
+     * 3. Switch to user mode at entry point
+     * 4. Handle syscalls when PE makes Win32 API calls
+     */
+    
+    lsw_info("TODO: Jump to entry point 0x%llx", info->entry_point);
+    lsw_info("TODO: Set up syscall interception for Win32 APIs");
+    lsw_info("For now, simulating successful execution...");
+    
+    mutex_unlock(&pe_list_mutex);
+    
+    /* Return 0 to indicate "success" */
+    return 0;
+}
+
+/**
  * lsw_device_ioctl - Handle ioctl commands
  */
 static long lsw_device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -134,6 +183,9 @@ static long lsw_device_ioctl(struct file *file, unsigned int cmd, unsigned long 
         if (copy_to_user((int __user *)arg, &pe_process_count, sizeof(int)))
             return -EFAULT;
         return 0;
+        
+    case LSW_IOCTL_EXECUTE_PE:
+        return lsw_execute_pe((pid_t)arg);
         
     case LSW_IOCTL_SYSCALL:
         /* Copy syscall request from userspace */

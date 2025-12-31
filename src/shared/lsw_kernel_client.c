@@ -86,3 +86,22 @@ int lsw_kernel_get_status(int fd)
     LSW_LOG_INFO("Kernel status: %d PE processes registered", status);
     return status;
 }
+
+int lsw_kernel_execute_pe(int fd, pid_t pid)
+{
+    if (fd < 0) {
+        LSW_LOG_ERROR("Invalid file descriptor");
+        return -1;
+    }
+    
+    LSW_LOG_INFO("Requesting kernel to execute PE: PID=%u", pid);
+    
+    int ret = ioctl(fd, LSW_IOCTL_EXECUTE_PE, (uint32_t)pid);
+    if (ret < 0) {
+        LSW_LOG_ERROR("Failed to execute PE in kernel: %s", strerror(errno));
+        return -1;
+    }
+    
+    LSW_LOG_INFO("PE execution completed: PID=%u, exit_code=%d", pid, ret);
+    return ret;
+}

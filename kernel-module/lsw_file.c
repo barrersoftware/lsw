@@ -178,6 +178,24 @@ int lsw_file_write(__u64 handle, const void *buffer, __u64 size, __u64 *bytes_wr
         return -EINVAL;
     }
     
+    // Special case for stdout/stderr (common Windows handles)
+    // STD_OUTPUT_HANDLE = 0xfffffff5 (-11) or similar pseudo-handles
+    // Just write to printk for now as a proof of concept
+    if ((int64_t)handle < 0 || handle < 0x100) {
+        // This looks like a standard handle, write to kernel log
+        char log_buffer[512];
+        size_t log_size = size > sizeof(log_buffer) - 1 ? sizeof(log_buffer) - 1 : size;
+        memcpy(log_buffer, buffer, log_size);
+        log_buffer[log_size] = '\0';
+        
+        lsw_info("WIN32 STDOUT: %s", log_buffer);
+        
+        if (bytes_written) {
+            *bytes_written = size;
+        }
+        return 0;
+    }
+    
     mutex_lock(&lsw_file_mutex);
     
     /* Find file handle */

@@ -34,6 +34,7 @@ struct lsw_pe_info {
 #define LSW_IOCTL_REGISTER_PE   _IOW(LSW_IOCTL_MAGIC, 1, struct lsw_pe_info)
 #define LSW_IOCTL_UNREGISTER_PE _IOW(LSW_IOCTL_MAGIC, 2, uint32_t)
 #define LSW_IOCTL_GET_STATUS    _IOR(LSW_IOCTL_MAGIC, 3, uint32_t)
+#define LSW_IOCTL_EXECUTE_PE    _IOW(LSW_IOCTL_MAGIC, 4, uint32_t)
 
 /**
  * Initialize connection to LSW kernel module
@@ -63,5 +64,11 @@ int lsw_kernel_unregister_pe(int fd, pid_t pid);
  * Returns: number of processes on success, -1 on error
  */
 int lsw_kernel_get_status(int fd);
+
+/**
+ * Execute a registered PE process
+ * Returns: 0 on success, -1 on error
+ */
+int lsw_kernel_execute_pe(int fd, pid_t pid);
 
 #endif /* LSW_KERNEL_CLIENT_H */

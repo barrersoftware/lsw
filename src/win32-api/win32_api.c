@@ -8,6 +8,7 @@
 
 #include "win32_api.h"
 #include "lsw_log.h"
+#include "shared/lsw_kernel_client.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,32 @@
 #include <locale.h>
 #include <signal.h>
 #include <wchar.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+
+// Syscall structure (from kernel module)
+struct lsw_syscall_request {
+    uint32_t syscall_number;
+    uint32_t arg_count;
+    uint64_t args[8];
+    uint64_t return_value;
+    int32_t error_code;
+};
+
+// Syscall numbers
+#define LSW_SYSCALL_NtWriteFile 0x0008
+
+// ioctl command  
+#define LSW_IOCTL_MAGIC 'L'
+#define LSW_IOCTL_SYSCALL _IOWR(LSW_IOCTL_MAGIC, 5, struct lsw_syscall_request)
+
+// Global kernel fd for syscalls
+static int g_kernel_fd = -1;
+
+void win32_api_set_kernel_fd(int fd) {
+    g_kernel_fd = fd;
+    LSW_LOG_INFO("Win32 API: kernel fd set to %d", fd);
+}
 
 // msvcrt.dll stub implementations - map to libc
 void* lsw_malloc(size_t size) {
@@ -154,6 +181,11 @@ typedef void (*func_ptr)(void);
 
 void lsw__initterm(func_ptr* start, func_ptr* end) {
     // Call all initializers in the table
+    // Check for NULL pointers - PE may pass NULL if no initializers
+    if (!start || !end || start >= end) {
+        return; // No initializers to call
+    }
+    
     while (start < end) {
         if (*start) {
             (*start)();
@@ -293,6 +325,85 @@ int lsw_VirtualProtect(void* addr, size_t size, uint32_t new_protect, uint32_t* 
     return 1;
 }
 
+// KERNEL32 Console I/O Functions
+#define STD_INPUT_HANDLE  ((void*)(uintptr_t)(-10))
+#define STD_OUTPUT_HANDLE ((void*)(uintptr_t)(-11))
+#define STD_ERROR_HANDLE  ((void*)(uintptr_t)(-12))
+
+void* lsw_GetStdHandle(uint32_t std_handle) {
+    // Win32: STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12
+    switch (std_handle) {
+        case (uint32_t)-10: return STD_INPUT_HANDLE;
+        case (uint32_t)-11: return STD_OUTPUT_HANDLE;
+        case (uint32_t)-12: return STD_ERROR_HANDLE;
+        default: return NULL;
+    }
+}
+
+int lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uint32_t* bytes_written, void* overlapped) {
+    (void)overlapped; // Not used for console I/O
+    
+    LSW_LOG_INFO("WriteFile called: handle=%p, bytes=%u", handle, bytes_to_write);
+    
+    if (!handle || !buffer) {
+        if (bytes_written) *bytes_written = 0;
+        return 0;
+    }
+    
+    // If kernel fd is available, route through kernel module
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing WriteFile through kernel module!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtWriteFile;
+        req.arg_count = 3;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        req.args[1] = (uint64_t)(uintptr_t)buffer;
+        req.args[2] = bytes_to_write;
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            LSW_LOG_INFO("Kernel syscall returned: %lld", req.return_value);
+            if (bytes_written) *bytes_written = (uint32_t)req.return_value;
+            return 1; // Success
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback to direct userspace implementation
+    LSW_LOG_WARN("Using userspace fallback for WriteFile");
+    
+    // Map Win32 handles to file descriptors
+    int fd = -1;
+    if (handle == STD_OUTPUT_HANDLE) {
+        fd = STDOUT_FILENO;
+    } else if (handle == STD_ERROR_HANDLE) {
+        fd = STDERR_FILENO;
+    } else {
+        // Assume it's a raw file descriptor for now
+        fd = (int)(uintptr_t)handle;
+    }
+    
+    ssize_t result = write(fd, buffer, bytes_to_write);
+    if (result < 0) {
+        if (bytes_written) *bytes_written = 0;
+        return 0; // Failure
+    }
+    
+    if (bytes_written) *bytes_written = (uint32_t)result;
+    return 1; // Success
+}
+
+int lsw_lstrlenA(const char* str) {
+    if (!str) return 0;
+    return (int)strlen(str);
+}
+
+// Disable pedantic warnings for function pointer to void* casts
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+
 // Global API mapping table
 static const win32_api_mapping_t api_mappings[] = {
     // msvcrt.dll - CRT functions
@@ -343,6 +454,9 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "EnterCriticalSection", (void*)lsw_EnterCriticalSection},
     {"KERNEL32.dll", "LeaveCriticalSection", (void*)lsw_LeaveCriticalSection},
     {"KERNEL32.dll", "VirtualProtect", (void*)lsw_VirtualProtect},
+    {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
+    {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
+    {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},
     {"KERNEL32.dll", "IsDBCSLeadByteEx", (void*)lsw_IsDBCSLeadByteEx},
     {"KERNEL32.dll", "MultiByteToWideChar", (void*)lsw_MultiByteToWideChar},
     {"KERNEL32.dll", "WideCharToMultiByte", (void*)lsw_WideCharToMultiByte},
@@ -350,7 +464,15 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "VirtualQuery", (void*)lsw_VirtualQuery},
 };
 
+#pragma GCC diagnostic pop
+
 static const size_t api_mappings_count = sizeof(api_mappings) / sizeof(api_mappings[0]);
+
+// Generic stub for unresolved functions
+static int generic_stub(void) {
+    LSW_LOG_WARN("Called unresolved Win32 API function - returning 0");
+    return 0;
+}
 
 void win32_api_init(void) {
     LSW_LOG_INFO("Initialized %zu Win32 API mappings", api_mappings_count);
@@ -366,7 +488,8 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
     }
     
     LSW_LOG_WARN("Could not resolve %s!%s - returning stub", dll_name, function_name);
-    return NULL;
+    // Cast through uintptr_t to avoid pedantic warning
+    return (void*)(uintptr_t)generic_stub;
 }
 
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count) {

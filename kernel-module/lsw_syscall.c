@@ -153,15 +153,28 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
 long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
 {
     __u64 handle = req->args[0];
-    const char *data = "LSW Test Write\n";  /* TODO: Get from userspace */
-    __u64 size = strlen(data);
+    __u64 buffer_ptr = req->args[1];  /* Userspace buffer pointer */
+    __u64 size = req->args[2];
     __u64 bytes_written = 0;
+    char kernel_buffer[4096];
     int ret;
+    size_t copy_size;
     
-    lsw_info("NtWriteFile: handle=0x%llx, size=%llu", handle, size);
+    lsw_info("NtWriteFile: handle=0x%llx, buffer=0x%llx, size=%llu", handle, buffer_ptr, size);
+    
+    /* Limit size to our buffer */
+    copy_size = size > sizeof(kernel_buffer) ? sizeof(kernel_buffer) : size;
+    
+    /* Copy data from userspace */
+    if (copy_from_user(kernel_buffer, (void __user *)buffer_ptr, copy_size)) {
+        lsw_err("Failed to copy buffer from userspace");
+        req->return_value = 0;
+        req->error_code = -EFAULT;
+        return -EFAULT;
+    }
     
     /* Write via LSW file manager */
-    ret = lsw_file_write(handle, data, size, &bytes_written);
+    ret = lsw_file_write(handle, kernel_buffer, copy_size, &bytes_written);
     
     if (ret != 0) {
         lsw_err("File write failed: %d", ret);

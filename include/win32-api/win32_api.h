@@ -22,6 +22,9 @@ typedef struct {
 // Initialize Win32 API system
 void win32_api_init(void);
 
+// Set kernel fd for syscalls
+void win32_api_set_kernel_fd(int fd);
+
 // Resolve a function by DLL and name
 void* win32_api_resolve(const char* dll_name, const char* function_name);
 
