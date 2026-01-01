@@ -330,7 +330,7 @@ int lsw_VirtualProtect(void* addr, size_t size, uint32_t new_protect, uint32_t* 
 #define STD_OUTPUT_HANDLE ((void*)(uintptr_t)(-11))
 #define STD_ERROR_HANDLE  ((void*)(uintptr_t)(-12))
 
-void* lsw_GetStdHandle(uint32_t std_handle) {
+void* __attribute__((ms_abi)) lsw_GetStdHandle(uint32_t std_handle) {
     // Win32: STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12
     switch (std_handle) {
         case (uint32_t)-10: return STD_INPUT_HANDLE;
@@ -340,10 +340,12 @@ void* lsw_GetStdHandle(uint32_t std_handle) {
     }
 }
 
-int lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uint32_t* bytes_written, void* overlapped) {
+int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uint32_t* bytes_written, void* overlapped) {
     (void)overlapped; // Not used for console I/O
     
-    LSW_LOG_INFO("WriteFile called: handle=%p, bytes=%u", handle, bytes_to_write);
+    LSW_LOG_INFO("WriteFile called: handle=%p, buffer=%p, bytes=%u", handle, buffer, bytes_to_write);
+    LSW_LOG_INFO("  Buffer content (first 32 bytes): %.32s", buffer ? (const char*)buffer : "(null)");
+    LSW_LOG_INFO("  bytes_written ptr: %p", bytes_written);
     
     if (!handle || !buffer) {
         if (bytes_written) *bytes_written = 0;
@@ -353,6 +355,8 @@ int lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uin
     // If kernel fd is available, route through kernel module
     if (g_kernel_fd >= 0) {
         LSW_LOG_INFO("Routing WriteFile through kernel module!");
+        LSW_LOG_INFO("  Packing args: handle=0x%lx, buffer=0x%lx, size=%u", 
+                     (uint64_t)(uintptr_t)handle, (uint64_t)(uintptr_t)buffer, bytes_to_write);
         
         struct lsw_syscall_request req;
         memset(&req, 0, sizeof(req));
@@ -361,6 +365,9 @@ int lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uin
         req.args[0] = (uint64_t)(uintptr_t)handle;
         req.args[1] = (uint64_t)(uintptr_t)buffer;
         req.args[2] = bytes_to_write;
+        
+        LSW_LOG_INFO("  Request prepared: syscall=0x%x, args=[0x%lx, 0x%lx, %lu]",
+                     req.syscall_number, req.args[0], req.args[1], req.args[2]);
         
         if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
             LSW_LOG_INFO("Kernel syscall returned: %lld", req.return_value);
@@ -395,7 +402,7 @@ int lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uin
     return 1; // Success
 }
 
-int lsw_lstrlenA(const char* str) {
+int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     if (!str) return 0;
     return (int)strlen(str);
 }
