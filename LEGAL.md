@@ -236,3 +236,70 @@ This is the same legal foundation that has allowed Wine, ReactOS, Samba, and cou
 **Maintained By:** BarrerSoftware
 
 🏴‍☠️ **Built legally, built right, built to last.**
+
+---
+
+## LSW vs Wine - Legal Comparison
+
+### Wine's Approach
+Wine provides excellent Windows compatibility through clean-room API implementation. However:
+
+**Potential Gray Area:**
+- **Winetricks** (Wine's helper tool) downloads actual Microsoft DLLs
+- Users can install native Windows components (d3dx9, vcrun, etc.)
+- These are Microsoft binaries redistributed without explicit license
+- Wine argues this is user choice, not Wine distribution
+- **Microsoft has not challenged this in 30+ years**
+
+### LSW's Approach - Cleaner Legal Position
+
+**LSW implements EVERYTHING in-house:**
+```
+❌ NO Microsoft DLLs
+❌ NO Microsoft CAB files  
+❌ NO Microsoft binaries
+❌ NO Microsoft redistributables
+✅ 100% BarrerSoftware implementation
+✅ Pure clean-room code
+✅ Zero Microsoft binary dependencies
+```
+
+**Why This Matters:**
+1. **No Redistribution Issues:** We never touch Microsoft binaries
+2. **Clearer Legal Position:** No gray areas whatsoever
+3. **Full Control:** We control every line of code
+4. **Independence:** No reliance on Microsoft components
+5. **True Open Source:** Everything is our code, BFSL licensed
+
+**Legal Advantage:**
+- Wine: "We're clean-room, but users can add MS DLLs" (gray)
+- LSW: "We're 100% clean-room, zero MS binaries ever" (crystal clear)
+
+**This makes LSW MORE legally defensible than Wine.**
+
+---
+
+## What We Will NEVER Do
+
+### Prohibited Forever:
+1. ❌ Ship Microsoft DLLs (even optionally)
+2. ❌ Download Microsoft binaries (no LSW-tricks equivalent)
+3. ❌ Redistribute Microsoft CAB files
+4. ❌ Include Microsoft fonts, icons, or resources
+5. ❌ Package Microsoft redistributables
+6. ❌ Use WINE DLLs that contain Microsoft code
+7. ❌ Accept pull requests with Microsoft binaries
+
+### Our Commitment:
+**Every single line of LSW code is written by BarrerSoftware.**
+
+If a Windows app needs a DLL we don't implement yet:
+- ✅ We implement it ourselves
+- ❌ We DON'T download Microsoft's version
+
+**100% pure, 100% legal, 100% ours.**
+
+---
+
+**Last Updated:** January 1, 2026 - Post-discussion with Daniel on legal purity
+
