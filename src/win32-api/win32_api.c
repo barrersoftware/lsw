@@ -9,6 +9,7 @@
 #include "win32_api.h"
 #include "lsw_log.h"
 #include "shared/lsw_kernel_client.h"
+#include "shared/lsw_filesystem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -473,6 +474,13 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
                                                 void* security, uint32_t creation, uint32_t flags, void* template_file) {
     (void)share_mode; (void)security; (void)flags; (void)template_file;
     
+    // Translate Windows path to Linux path
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(filename, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_WARN("CreateFileA path translation failed: %s", filename);
+        return INVALID_HANDLE_VALUE;
+    }
+    
     int flags_unix = 0;
     if (access & GENERIC_WRITE) {
         if (creation == CREATE_ALWAYS) {
@@ -484,13 +492,13 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         flags_unix = O_RDONLY;
     }
     
-    int fd = open(filename, flags_unix, 0644);
+    int fd = open(linux_path, flags_unix, 0644);
     if (fd < 0) {
-        LSW_LOG_WARN("CreateFileA failed: %s (errno=%d)", filename, errno);
+        LSW_LOG_WARN("CreateFileA failed: %s -> %s (errno=%d)", filename, linux_path, errno);
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA: %s -> fd=%d", filename, fd);
+    LSW_LOG_INFO("CreateFileA: %s -> %s (fd=%d)", filename, linux_path, fd);
     return (void*)(intptr_t)fd;
 }
 
