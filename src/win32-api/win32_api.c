@@ -131,7 +131,7 @@ char** lsw__initenv(void) {
     return lsw_environ;
 }
 
-void* lsw__iob_func(void) {
+void* __attribute__((ms_abi)) lsw__iob_func(void) {
     // Windows CRT expects __iob_func to return pointer to FILE array
     // Array is: [stdin, stdout, stderr, ...]
     // But we need to return actual FILE* pointers, not void*
