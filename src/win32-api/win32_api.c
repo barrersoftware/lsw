@@ -20,6 +20,8 @@
 #include <signal.h>
 #include <wchar.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <errno.h>
 
 // Syscall structure (from kernel module)
@@ -47,31 +49,31 @@ void win32_api_set_kernel_fd(int fd) {
 }
 
 // msvcrt.dll stub implementations - map to libc
-void* lsw_malloc(size_t size) {
+void* __attribute__((ms_abi)) lsw_malloc(size_t size) {
     return malloc(size);
 }
 
-void lsw_free(void* ptr) {
+void __attribute__((ms_abi)) lsw_free(void* ptr) {
     free(ptr);
 }
 
-void* lsw_calloc(size_t num, size_t size) {
+void* __attribute__((ms_abi)) lsw_calloc(size_t num, size_t size) {
     return calloc(num, size);
 }
 
-void* lsw_memcpy(void* dest, const void* src, size_t n) {
+void* __attribute__((ms_abi)) lsw_memcpy(void* dest, const void* src, size_t n) {
     return memcpy(dest, src, n);
 }
 
-void* lsw_memset(void* s, int c, size_t n) {
+void* __attribute__((ms_abi)) lsw_memset(void* s, int c, size_t n) {
     return memset(s, c, n);
 }
 
-size_t lsw_strlen(const char* s) {
+size_t __attribute__((ms_abi)) lsw_strlen(const char* s) {
     return strlen(s);
 }
 
-int lsw_printf(const char* format, ...) {
+int __attribute__((ms_abi)) lsw_printf(const char* format, ...) {
     va_list args;
     va_start(args, format);
     int result = vprintf(format, args);
@@ -79,20 +81,122 @@ int lsw_printf(const char* format, ...) {
     return result;
 }
 
-int lsw_fprintf(FILE* stream, const char* format, ...) {
+// Declare vfprintf first since fprintf uses it
+int __attribute__((ms_abi)) lsw_vfprintf(FILE* stream, const char* format, va_list ap) {
+    // Check if this is our fake FILE structure
+    typedef struct {
+        char* _ptr;
+        int _cnt;
+        char* _base;
+        int _flag;
+        int _file;
+        int _charbuf;
+        int _bufsiz;
+        char* _tmpfname;
+    } fake_FILE;
+    
+    fake_FILE* fake = (fake_FILE*)stream;
+    
+    // Check if it's one of our fake stdio FILE structures (fd 0-2)
+    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+        // Use vdprintf() to write formatted output directly to fd
+        return vdprintf(fake->_file, format, ap);
+    }
+    
+    // Otherwise use real vfprintf
+    return vfprintf(stream, format, ap);
+}
+
+int __attribute__((ms_abi)) lsw_fprintf(FILE* stream, const char* format, ...) {
     va_list args;
     va_start(args, format);
-    int result = vfprintf(stream, format, args);
+    // Use our vfprintf which handles fake FILE structures
+    int result = lsw_vfprintf(stream, format, args);
     va_end(args);
     return result;
 }
 
-void lsw_exit(int status) {
+void __attribute__((ms_abi)) lsw_exit(int status) {
     exit(status);
 }
 
-void lsw_abort(void) {
+void __attribute__((ms_abi)) lsw_abort(void) {
     abort();
+}
+
+// More stdio/string wrappers that need MS ABI
+int __attribute__((ms_abi)) lsw_fputc(int c, FILE* stream) {
+    // Check if this is our fake FILE structure
+    typedef struct {
+        char* _ptr;
+        int _cnt;
+        char* _base;
+        int _flag;
+        int _file;
+        int _charbuf;
+        int _bufsiz;
+        char* _tmpfname;
+    } fake_FILE;
+    
+    fake_FILE* fake = (fake_FILE*)stream;
+    
+    // Check if it's one of our fake stdio FILE structures (fd 0-2)
+    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+        // Use Linux write() directly to the fd
+        char ch = (char)c;
+        ssize_t written = write(fake->_file, &ch, 1);
+        return (written == 1) ? c : EOF;
+    }
+    
+    // Otherwise use real fputc
+    return fputc(c, stream);
+}
+
+size_t __attribute__((ms_abi)) lsw_fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
+    // Check if this is our fake FILE structure
+    typedef struct {
+        char* _ptr;
+        int _cnt;
+        char* _base;
+        int _flag;
+        int _file;
+        int _charbuf;
+        int _bufsiz;
+        char* _tmpfname;
+    } fake_FILE;
+    
+    fake_FILE* fake = (fake_FILE*)stream;
+    
+    // Check if it's one of our fake stdio FILE structures (fd 0-2)
+    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+        // Use Linux write() directly
+        size_t total = size * nmemb;
+        ssize_t written = write(fake->_file, ptr, total);
+        return written > 0 ? (size_t)written / size : 0;
+    }
+    
+    // Otherwise use real fwrite
+    return fwrite(ptr, size, nmemb, stream);
+}
+
+char* __attribute__((ms_abi)) lsw_strerror(int errnum) {
+    return strerror(errnum);
+}
+
+int __attribute__((ms_abi)) lsw_strncmp(const char* s1, const char* s2, size_t n) {
+    return strncmp(s1, s2, n);
+}
+
+size_t __attribute__((ms_abi)) lsw_wcslen(const wchar_t* s) {
+    return wcslen(s);
+}
+
+struct lconv* __attribute__((ms_abi)) lsw_localeconv(void) {
+    return localeconv();
+}
+
+void (*__attribute__((ms_abi)) lsw_signal(int signum, void (*handler)(int)))(int) {
+    return signal(signum, handler);
 }
 
 // CRT initialization stubs - minimal implementations to get past CRT init
@@ -100,7 +204,7 @@ static char** lsw_environ = NULL;
 static int lsw_argc = 0;
 static char** lsw_argv = NULL;
 
-int lsw__getmainargs(int* argc, char*** argv, char*** env, int do_wildcard, void* startinfo) {
+int __attribute__((ms_abi)) lsw__getmainargs(int* argc, char*** argv, char*** env, int do_wildcard, void* startinfo) {
     (void)do_wildcard;
     (void)startinfo;
     
@@ -123,7 +227,7 @@ int lsw__getmainargs(int* argc, char*** argv, char*** env, int do_wildcard, void
     return 0;
 }
 
-char** lsw__initenv(void) {
+char** __attribute__((ms_abi)) lsw__initenv(void) {
     if (!lsw_environ) {
         lsw_environ = malloc(sizeof(char*));
         lsw_environ[0] = NULL;
@@ -133,53 +237,64 @@ char** lsw__initenv(void) {
 
 void* __attribute__((ms_abi)) lsw__iob_func(void) {
     // Windows CRT expects __iob_func to return pointer to FILE array
-    // Array is: [stdin, stdout, stderr, ...]
-    // But we need to return actual FILE* pointers, not void*
-    static FILE* iob[3] = {0};
-    if (!iob[0]) {
-        iob[0] = stdin;
-        iob[1] = stdout;
-        iob[2] = stderr;
-    }
-    return (void*)iob;
+    // Windows FILE structure (_iobuf) is about 48 bytes on x64
+    // We create fake FILE structures with proper size for pointer arithmetic
+    typedef struct {
+        char* _ptr;       // Current position in buffer
+        int _cnt;         // Characters left in buffer  
+        char* _base;      // Base of buffer
+        int _flag;        // File status flags
+        int _file;        // File descriptor
+        int _charbuf;     // Char buffer for ungetch
+        int _bufsiz;      // Buffer size
+        char* _tmpfname;  // Temporary filename
+    } fake_FILE;
+    
+    static fake_FILE fake_files[3] = {
+        {NULL, 0, NULL, 0, 0, 0, 0, NULL},  // stdin
+        {NULL, 0, NULL, 0, 1, 0, 0, NULL},  // stdout  
+        {NULL, 0, NULL, 0, 2, 0, 0, NULL},  // stderr
+    };
+    
+    return (void*)fake_files;
 }
 
-void lsw__set_app_type(int type) {
+void __attribute__((ms_abi)) lsw__set_app_type(int type) {
     (void)type;
     // Stub - do nothing
 }
 
-void lsw__setusermatherr(void* handler) {
+void __attribute__((ms_abi)) lsw__setusermatherr(void* handler) {
     (void)handler;
     // Stub - do nothing
 }
 
-void lsw__amsg_exit(int code) {
+void __attribute__((ms_abi)) lsw__amsg_exit(int code) {
     exit(code);
 }
 
-void lsw__cexit(void) {
+void __attribute__((ms_abi)) lsw__cexit(void) {
     // Stub - CRT cleanup, do nothing
 }
 
-static int lsw_commode = 0;
-int* lsw__commode_ptr(void) {
+int lsw_commode = 0;  // Make non-static for direct access
+int* __attribute__((ms_abi)) lsw__commode_ptr(void) {
     return &lsw_commode;
 }
 
-static int lsw_fmode = 0;
-int* lsw__fmode_ptr(void) {
+int lsw_fmode = 0;  // Make non-static for direct access
+int* __attribute__((ms_abi)) lsw__fmode_ptr(void) {
     return &lsw_fmode;
 }
 
-int* lsw__errno_func(void) {
+int* __attribute__((ms_abi)) lsw__errno_func(void) {
     static __thread int err = 0;
     return &err;
 }
 
 typedef void (*func_ptr)(void);
 
-void lsw__initterm(func_ptr* start, func_ptr* end) {
+void __attribute__((ms_abi)) lsw__initterm(func_ptr* start, func_ptr* end) {
     // Call all initializers in the table
     // Check for NULL pointers - PE may pass NULL if no initializers
     if (!start || !end || start >= end) {
@@ -194,45 +309,45 @@ void lsw__initterm(func_ptr* start, func_ptr* end) {
     }
 }
 
-void lsw__lock(int locknum) {
+void __attribute__((ms_abi)) lsw__lock(int locknum) {
     (void)locknum;
     // Stub - single threaded for now
 }
 
-void lsw__unlock(int locknum) {
+void __attribute__((ms_abi)) lsw__unlock(int locknum) {
     (void)locknum;
     // Stub - single threaded for now
 }
 
-int lsw__onexit(void* func) {
+int __attribute__((ms_abi)) lsw__onexit(void* func) {
     (void)func;
     // Stub - should register exit handler
     return 0;
 }
 
-void* lsw___C_specific_handler(void) {
+void* __attribute__((ms_abi)) lsw___C_specific_handler(void) {
     // Exception handler - stub
     return NULL;
 }
 
-int* lsw___lc_codepage_func(void) {
+int* __attribute__((ms_abi)) lsw___lc_codepage_func(void) {
     static int codepage = 437; // OEM US
     return &codepage;
 }
 
-int* lsw___mb_cur_max_func(void) {
+int* __attribute__((ms_abi)) lsw___mb_cur_max_func(void) {
     static int mb_cur_max = 1;
     return &mb_cur_max;
 }
 
 // KERNEL32 stubs
-int lsw_IsDBCSLeadByteEx(unsigned int codepage, unsigned char testchar) {
+int __attribute__((ms_abi)) lsw_IsDBCSLeadByteEx(unsigned int codepage, unsigned char testchar) {
     (void)codepage;
     (void)testchar;
     return 0; // Not DBCS for now
 }
 
-int lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* src, int srclen, wchar_t* dst, int dstlen) {
+int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* src, int srclen, wchar_t* dst, int dstlen) {
     (void)codepage;
     (void)flags;
     
@@ -251,7 +366,7 @@ int lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const ch
     return len;
 }
 
-int lsw_WideCharToMultiByte(unsigned int codepage, unsigned long flags, const wchar_t* src, int srclen, char* dst, int dstlen, const char* defchar, int* used_default) {
+int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsigned long flags, const wchar_t* src, int srclen, char* dst, int dstlen, const char* defchar, int* used_default) {
     (void)codepage;
     (void)flags;
     (void)defchar;
@@ -272,12 +387,12 @@ int lsw_WideCharToMultiByte(unsigned int codepage, unsigned long flags, const wc
     return len;
 }
 
-void* lsw_TlsGetValue(unsigned long index) {
+void* __attribute__((ms_abi)) lsw_TlsGetValue(unsigned long index) {
     (void)index;
     return NULL; // No TLS for now
 }
 
-int lsw_VirtualQuery(const void* addr, void* buffer, size_t length) {
+int __attribute__((ms_abi)) lsw_VirtualQuery(const void* addr, void* buffer, size_t length) {
     (void)addr;
     (void)buffer;
     (void)length;
@@ -285,44 +400,149 @@ int lsw_VirtualQuery(const void* addr, void* buffer, size_t length) {
 }
 
 // KERNEL32.dll stub implementations
-void lsw_Sleep(uint32_t milliseconds) {
+void __attribute__((ms_abi)) lsw_Sleep(uint32_t milliseconds) {
     usleep(milliseconds * 1000);
 }
 
-uint32_t lsw_GetLastError(void) {
+uint32_t __attribute__((ms_abi)) lsw_GetLastError(void) {
     // Return success for now
     return 0;
 }
 
-void lsw_SetUnhandledExceptionFilter(void* handler) {
+void __attribute__((ms_abi)) lsw_SetUnhandledExceptionFilter(void* handler) {
     (void)handler;
     // Stub - do nothing for now
 }
 
-void lsw_InitializeCriticalSection(void* cs) {
+void __attribute__((ms_abi)) lsw_InitializeCriticalSection(void* cs) {
     pthread_mutex_t* mutex = (pthread_mutex_t*)cs;
     pthread_mutex_init(mutex, NULL);
 }
 
-void lsw_DeleteCriticalSection(void* cs) {
+void __attribute__((ms_abi)) lsw_DeleteCriticalSection(void* cs) {
     pthread_mutex_t* mutex = (pthread_mutex_t*)cs;
     pthread_mutex_destroy(mutex);
 }
 
-void lsw_EnterCriticalSection(void* cs) {
+void __attribute__((ms_abi)) lsw_EnterCriticalSection(void* cs) {
     pthread_mutex_t* mutex = (pthread_mutex_t*)cs;
     pthread_mutex_lock(mutex);
 }
 
-void lsw_LeaveCriticalSection(void* cs) {
+void __attribute__((ms_abi)) lsw_LeaveCriticalSection(void* cs) {
     pthread_mutex_t* mutex = (pthread_mutex_t*)cs;
     pthread_mutex_unlock(mutex);
 }
 
-int lsw_VirtualProtect(void* addr, size_t size, uint32_t new_protect, uint32_t* old_protect) {
+int __attribute__((ms_abi)) lsw_VirtualProtect(void* addr, size_t size, uint32_t new_protect, uint32_t* old_protect) {
     (void)addr; (void)size; (void)new_protect; (void)old_protect;
     // Stub - return success
     return 1;
+}
+
+// Memory management functions
+void* __attribute__((ms_abi)) lsw_VirtualAlloc(void* addr, size_t size, uint32_t alloc_type, uint32_t protect) {
+    (void)addr; (void)alloc_type; (void)protect;
+    // Simple implementation using mmap
+    void* result = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (result == MAP_FAILED) {
+        return NULL;
+    }
+    LSW_LOG_INFO("VirtualAlloc: size=%zu, result=%p", size, result);
+    return result;
+}
+
+int __attribute__((ms_abi)) lsw_VirtualFree(void* addr, size_t size, uint32_t free_type) {
+    (void)size; (void)free_type;
+    // Simple implementation using munmap
+    if (addr) {
+        munmap(addr, size ? size : 4096); // If size is 0, unmap at least a page
+    }
+    LSW_LOG_INFO("VirtualFree: addr=%p", addr);
+    return 1; // Success
+}
+
+// File I/O functions
+#define GENERIC_READ    0x80000000
+#define GENERIC_WRITE   0x40000000
+#define CREATE_ALWAYS   2
+#define OPEN_EXISTING   3
+#define INVALID_HANDLE_VALUE ((void*)(intptr_t)-1)
+
+void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t access, uint32_t share_mode, 
+                                                void* security, uint32_t creation, uint32_t flags, void* template_file) {
+    (void)share_mode; (void)security; (void)flags; (void)template_file;
+    
+    int flags_unix = 0;
+    if (access & GENERIC_WRITE) {
+        if (creation == CREATE_ALWAYS) {
+            flags_unix = O_WRONLY | O_CREAT | O_TRUNC;
+        } else {
+            flags_unix = O_WRONLY;
+        }
+    } else if (access & GENERIC_READ) {
+        flags_unix = O_RDONLY;
+    }
+    
+    int fd = open(filename, flags_unix, 0644);
+    if (fd < 0) {
+        LSW_LOG_WARN("CreateFileA failed: %s (errno=%d)", filename, errno);
+        return INVALID_HANDLE_VALUE;
+    }
+    
+    LSW_LOG_INFO("CreateFileA: %s -> fd=%d", filename, fd);
+    return (void*)(intptr_t)fd;
+}
+
+int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
+    if (handle == INVALID_HANDLE_VALUE || !handle) {
+        return 0;
+    }
+    
+    // Check if it's a file descriptor
+    intptr_t fd = (intptr_t)handle;
+    if (fd >= 0 && fd < 1024) {
+        close((int)fd);
+        LSW_LOG_INFO("CloseHandle: fd=%d", (int)fd);
+        return 1;
+    }
+    
+    // For other handles (events, etc.), just return success for now
+    LSW_LOG_INFO("CloseHandle: handle=%p (non-fd)", handle);
+    return 1;
+}
+
+// Synchronization functions
+void* __attribute__((ms_abi)) lsw_CreateEventA(void* security, int manual_reset, int initial_state, const char* name) {
+    (void)security; (void)manual_reset; (void)initial_state; (void)name;
+    // Simple stub - return a fake handle
+    static int event_counter = 1000;
+    void* handle = (void*)(intptr_t)(event_counter++);
+    LSW_LOG_INFO("CreateEventA: name=%s -> handle=%p", name ? name : "(null)", handle);
+    return handle;
+}
+
+int __attribute__((ms_abi)) lsw_SetEvent(void* handle) {
+    LSW_LOG_INFO("SetEvent: handle=%p", handle);
+    return 1; // Success
+}
+
+// Process functions
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentProcessId(void) {
+    uint32_t pid = (uint32_t)getpid();
+    LSW_LOG_INFO("GetCurrentProcessId: %u", pid);
+    return pid;
+}
+
+void* __attribute__((ms_abi)) lsw_GetModuleHandleA(const char* module_name) {
+    // For kernel32.dll, return a fake handle
+    // For NULL, return the base address (we'll use a fake value)
+    if (!module_name) {
+        LSW_LOG_INFO("GetModuleHandleA: NULL -> 0x140000000 (base)");
+        return (void*)0x140000000;
+    }
+    LSW_LOG_INFO("GetModuleHandleA: %s -> 0x7FF000000", module_name);
+    return (void*)0x7FF000000; // Fake DLL base
 }
 
 // KERNEL32 Console I/O Functions
@@ -422,16 +642,16 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "strlen", (void*)lsw_strlen},
     {"msvcrt.dll", "exit", (void*)lsw_exit},
     {"msvcrt.dll", "abort", (void*)lsw_abort},
-    {"msvcrt.dll", "printf", (void*)printf},
+    {"msvcrt.dll", "printf", (void*)lsw_printf},
     {"msvcrt.dll", "fprintf", (void*)lsw_fprintf},
-    {"msvcrt.dll", "vfprintf", (void*)vfprintf},
-    {"msvcrt.dll", "fwrite", (void*)fwrite},
-    {"msvcrt.dll", "fputc", (void*)fputc},
-    {"msvcrt.dll", "strerror", (void*)strerror},
-    {"msvcrt.dll", "strncmp", (void*)strncmp},
-    {"msvcrt.dll", "wcslen", (void*)wcslen},
-    {"msvcrt.dll", "localeconv", (void*)localeconv},
-    {"msvcrt.dll", "signal", (void*)signal},
+    {"msvcrt.dll", "vfprintf", (void*)lsw_vfprintf},
+    {"msvcrt.dll", "fwrite", (void*)lsw_fwrite},
+    {"msvcrt.dll", "fputc", (void*)lsw_fputc},
+    {"msvcrt.dll", "strerror", (void*)lsw_strerror},
+    {"msvcrt.dll", "strncmp", (void*)lsw_strncmp},
+    {"msvcrt.dll", "wcslen", (void*)lsw_wcslen},
+    {"msvcrt.dll", "localeconv", (void*)lsw_localeconv},
+    {"msvcrt.dll", "signal", (void*)lsw_signal},
     
     // msvcrt.dll - CRT initialization
     {"msvcrt.dll", "__getmainargs", (void*)lsw__getmainargs},
@@ -441,8 +661,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "__setusermatherr", (void*)lsw__setusermatherr},
     {"msvcrt.dll", "_amsg_exit", (void*)lsw__amsg_exit},
     {"msvcrt.dll", "_cexit", (void*)lsw__cexit},
-    {"msvcrt.dll", "_commode", (void*)lsw__commode_ptr},
-    {"msvcrt.dll", "_fmode", (void*)lsw__fmode_ptr},
+    {"msvcrt.dll", "_commode", (void*)&lsw_commode},  // Direct pointer to variable
+    {"msvcrt.dll", "_fmode", (void*)&lsw_fmode},      // Direct pointer to variable
     {"msvcrt.dll", "_errno", (void*)lsw__errno_func},
     {"msvcrt.dll", "_initterm", (void*)lsw__initterm},
     {"msvcrt.dll", "_lock", (void*)lsw__lock},
@@ -461,6 +681,14 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "EnterCriticalSection", (void*)lsw_EnterCriticalSection},
     {"KERNEL32.dll", "LeaveCriticalSection", (void*)lsw_LeaveCriticalSection},
     {"KERNEL32.dll", "VirtualProtect", (void*)lsw_VirtualProtect},
+    {"KERNEL32.dll", "VirtualAlloc", (void*)lsw_VirtualAlloc},
+    {"KERNEL32.dll", "VirtualFree", (void*)lsw_VirtualFree},
+    {"KERNEL32.dll", "CreateFileA", (void*)lsw_CreateFileA},
+    {"KERNEL32.dll", "CloseHandle", (void*)lsw_CloseHandle},
+    {"KERNEL32.dll", "CreateEventA", (void*)lsw_CreateEventA},
+    {"KERNEL32.dll", "SetEvent", (void*)lsw_SetEvent},
+    {"KERNEL32.dll", "GetCurrentProcessId", (void*)lsw_GetCurrentProcessId},
+    {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
     {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
     {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},
