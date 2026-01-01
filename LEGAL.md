@@ -200,6 +200,7 @@ LSW is licensed under **BarrerSoftware License (BFSL) v1.0**
 If you are a Microsoft legal representative or have legal concerns, please contact:
 - **GitHub:** @barrersoftware
 - **Issues:** https://github.com/barrersoftware/lsw/issues
+- **Email** legal@barrersoftware.com
 
 We are committed to:
 - Full legal compliance
