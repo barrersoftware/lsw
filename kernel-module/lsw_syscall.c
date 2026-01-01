@@ -83,28 +83,39 @@ long lsw_handle_syscall(struct lsw_syscall_request *req)
  */
 long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req)
 {
-    const char *path = "/tmp/test.txt";  /* TODO: Get from userspace */
-    __u32 access = req->args[0];
-    __u32 share = req->args[1];
-    __u32 disposition = req->args[2];
+    __u64 path_ptr = req->args[0];       // Userspace path pointer
+    __u32 access = req->args[1];         // Access flags
+    __u32 disposition = req->args[2];    // Creation disposition
+    __u32 flags = req->args[3];          // Flags
+    char path_kernel[256];
     __u64 handle;
     
-    lsw_info("NtCreateFile: path='%s', access=0x%x, share=0x%x, disposition=%u",
-             path, access, share, disposition);
+    // Copy path from userspace
+    if (copy_from_user(path_kernel, (const char __user *)path_ptr, sizeof(path_kernel) - 1)) {
+        lsw_err("Failed to copy path from userspace");
+        req->return_value = (__u64)-1;
+        req->error_code = -EFAULT;
+        return -EFAULT;
+    }
+    path_kernel[sizeof(path_kernel) - 1] = '\0';
+    
+    lsw_info("NtCreateFile: path='%s', access=0x%x, disposition=%u, flags=0x%x",
+             path_kernel, access, disposition, flags);
     
     /* Use current PID */
     __u32 pid = current->pid;
     
     /* Open file via LSW file manager */
-    handle = lsw_file_open(pid, path, access, share, disposition);
+    handle = lsw_file_open(pid, path_kernel, access, 0, disposition);
     
     if (handle == 0) {
-        lsw_err("File open failed");
-        req->return_value = 0;
+        lsw_err("File open failed for: %s", path_kernel);
+        req->return_value = (__u64)-1;
         req->error_code = -ENOENT;
         return -ENOENT;
     }
     
+    lsw_info("NtCreateFile success: handle=0x%llx for path='%s'", handle, path_kernel);
     req->return_value = handle;
     req->error_code = 0;
     

@@ -10,6 +10,7 @@
 #include "lsw_log.h"
 #include "shared/lsw_kernel_client.h"
 #include "shared/lsw_filesystem.h"
+#include "kernel-module/lsw_syscall.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,18 +25,6 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <errno.h>
-
-// Syscall structure (from kernel module)
-struct lsw_syscall_request {
-    uint32_t syscall_number;
-    uint32_t arg_count;
-    uint64_t args[8];
-    uint64_t return_value;
-    int32_t error_code;
-};
-
-// Syscall numbers
-#define LSW_SYSCALL_NtWriteFile 0x0008
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
@@ -472,7 +461,7 @@ int __attribute__((ms_abi)) lsw_VirtualFree(void* addr, size_t size, uint32_t fr
 
 void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t access, uint32_t share_mode, 
                                                 void* security, uint32_t creation, uint32_t flags, void* template_file) {
-    (void)share_mode; (void)security; (void)flags; (void)template_file;
+    (void)share_mode; (void)security; (void)template_file;
     
     // Translate Windows path to Linux path
     char linux_path[LSW_MAX_PATH];
@@ -480,6 +469,41 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         LSW_LOG_WARN("CreateFileA path translation failed: %s", filename);
         return INVALID_HANDLE_VALUE;
     }
+    
+    LSW_LOG_INFO("CreateFileA: %s -> %s", filename, linux_path);
+    
+    // Route through kernel module if available
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing CreateFileA through kernel NtCreateFile!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtCreateFile;
+        req.arg_count = 4;
+        req.args[0] = (uint64_t)(uintptr_t)linux_path;  // Path pointer
+        req.args[1] = access;                            // Access flags
+        req.args[2] = creation;                          // Creation disposition
+        req.args[3] = flags;                             // Flags
+        
+        LSW_LOG_INFO("  Kernel NtCreateFile: path=%s, access=0x%x, creation=%u", 
+                     linux_path, access, creation);
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            uint64_t handle = req.return_value;
+            if (handle == (uint64_t)-1 || handle == 0) {
+                LSW_LOG_WARN("Kernel NtCreateFile failed: error=%d", req.error_code);
+                return INVALID_HANDLE_VALUE;
+            }
+            LSW_LOG_INFO("Kernel NtCreateFile success: handle=0x%llx", handle);
+            return (void*)(uintptr_t)handle;
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for NtCreateFile: %s", strerror(errno));
+            // Fall through to userspace implementation
+        }
+    }
+    
+    // Fallback to userspace implementation
+    LSW_LOG_WARN("Using userspace fallback for CreateFileA");
     
     int flags_unix = 0;
     if (access & GENERIC_WRITE) {
@@ -494,11 +518,11 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
     
     int fd = open(linux_path, flags_unix, 0644);
     if (fd < 0) {
-        LSW_LOG_WARN("CreateFileA failed: %s -> %s (errno=%d)", filename, linux_path, errno);
+        LSW_LOG_WARN("CreateFileA userspace fallback failed: %s (errno=%d)", linux_path, errno);
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA: %s -> %s (fd=%d)", filename, linux_path, fd);
+    LSW_LOG_INFO("CreateFileA userspace fallback: fd=%d", fd);
     return (void*)(intptr_t)fd;
 }
 
