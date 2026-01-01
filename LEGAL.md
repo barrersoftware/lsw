@@ -74,15 +74,20 @@ LSW is a **clean-room implementation** of the Windows NT kernel API. We implemen
 
 **Legal:** Microsoft explicitly permits implementation of these specifications without licensing fees
 
-### 2. MSDN Documentation
-**Source:** https://docs.microsoft.com/en-us/windows/  
+### 2. Microsoft Learn / MSDN Documentation
+**Primary Source:** https://learn.microsoft.com/  
+**Legacy URL:** https://docs.microsoft.com/ (redirects to learn.microsoft.com)  
 **Status:** PUBLIC documentation  
-**Content:** Win32 API reference, system call documentation
+**Content:** Win32 API reference, system call documentation, kernel documentation
 
 **Key Resources:**
-- Win32 API Documentation: https://docs.microsoft.com/en-us/windows/win32/
-- Windows Driver Kit (WDK) Docs: https://docs.microsoft.com/en-us/windows-hardware/drivers/
-- NT Kernel Documentation: https://docs.microsoft.com/en-us/windows-hardware/drivers/kernel/
+- Microsoft Learn Portal: https://learn.microsoft.com/
+- Win32 API Documentation: https://learn.microsoft.com/en-us/windows/win32/
+- Windows Driver Kit (WDK) Docs: https://learn.microsoft.com/en-us/windows-hardware/drivers/
+- NT Kernel Documentation: https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/
+- Windows Internals: https://learn.microsoft.com/en-us/sysinternals/resources/windows-internals
+
+**Usage:** Primary reference for all Windows API implementations. Every function we implement references its learn.microsoft.com documentation page.
 
 ### 3. Microsoft Open Source Projects (GitHub)
 **Source:** https://github.com/microsoft  

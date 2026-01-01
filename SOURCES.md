@@ -8,26 +8,40 @@ This document tracks ALL external sources used in LSW development. Every API we 
 
 ## Microsoft Official Documentation
 
-### Win32 API Documentation
-**Source:** https://docs.microsoft.com/en-us/windows/win32/  
+### Microsoft Learn (Primary Documentation Portal)
+**Source:** https://learn.microsoft.com/  
+**License:** Public documentation, free to use  
+**Usage:** Primary reference hub for all Microsoft technical documentation
+
+**Sub-portals:**
+- Windows API: https://learn.microsoft.com/en-us/windows/win32/
+- Windows Kernel: https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/
+- .NET Documentation: https://learn.microsoft.com/en-us/dotnet/
+- Azure Documentation: https://learn.microsoft.com/en-us/azure/
+
+### Win32 API Documentation  
+**Source:** https://learn.microsoft.com/en-us/windows/win32/  
+**Alternate:** https://docs.microsoft.com/en-us/windows/win32/ (redirects to learn.microsoft.com)  
 **License:** Public documentation, free to use  
 **Usage:** Primary reference for Win32 function signatures and behavior
 
 **Specific Functions Implemented:**
-- CreateFileA: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
-- WriteFile: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
-- VirtualAlloc: https://docs.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
-- VirtualFree: https://docs.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
-- CreateEventA: https://docs.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventa
-- GetModuleHandleA: https://docs.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlea
+- CreateFileA: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+- WriteFile: https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
+- VirtualAlloc: https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
+- VirtualFree: https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
+- CreateEventA: https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventa
+- GetModuleHandleA: https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlea
 
 ### PE Format Documentation
-**Source:** https://docs.microsoft.com/en-us/windows/win32/debug/pe-format  
+**Source:** https://learn.microsoft.com/en-us/windows/win32/debug/pe-format  
+**Alternate:** https://docs.microsoft.com/en-us/windows/win32/debug/pe-format (redirects)  
 **Usage:** Understanding Windows executable file format
 
 ### Windows Data Types
 **Source:** [MS-DTYP] Windows Data Types  
-**URL:** https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/  
+**URL:** https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/  
+**Alternate:** https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/ (redirects)  
 **Usage:** Standard Windows data type definitions
 
 ---
