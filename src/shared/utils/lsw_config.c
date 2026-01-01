@@ -28,17 +28,24 @@ void lsw_config_defaults(lsw_config_t* config) {
     
     memset(config, 0, sizeof(lsw_config_t));
     
-    // Filesystem - C: drive maps to root by default
-    strncpy(config->c_drive_root, "/", sizeof(config->c_drive_root));
+    // Filesystem - C: drive maps to isolated LSW prefix
+    // ~/.lsw/drives/c/ - SAFE, production-ready architecture
+    const char* home = getenv("HOME");
+    if (home) {
+        snprintf(config->c_drive_root, sizeof(config->c_drive_root),
+                "%s/.lsw/drives/c", home);
+    } else {
+        strncpy(config->c_drive_root, "/tmp/lsw/drives/c", 
+               sizeof(config->c_drive_root));
+    }
     
     // D: drive optional (user can configure)
     config->d_drive_root[0] = '\0';
     
-    // Registry in user's home directory
-    const char* home = getenv("HOME");
+    // Registry in LSW prefix
     if (home) {
         snprintf(config->registry_path, sizeof(config->registry_path),
-                "%s/.local/share/lsw/registry", home);
+                "%s/.lsw/registry", home);
     } else {
         strncpy(config->registry_path, "/tmp/lsw/registry", 
                sizeof(config->registry_path));

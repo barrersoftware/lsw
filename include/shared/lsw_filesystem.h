@@ -95,6 +95,26 @@ bool lsw_fs_path_exists(const char* windows_path);
 char lsw_fs_get_drive_letter(const char* windows_path);
 
 // ============================================================================
+// SECTION: Prefix Management
+// ============================================================================
+
+/**
+ * Initialize LSW prefix structure
+ * 
+ * What: Creates ~/.lsw/drives/c/ directory structure
+ * Why: Windows apps need Windows-like filesystem
+ * How: Create standard Windows folders (Windows, Program Files, etc.)
+ * 
+ * Creates:
+ *   ~/.lsw/drives/c/Windows/System32
+ *   ~/.lsw/drives/c/Windows/Temp
+ *   ~/.lsw/drives/c/Program Files
+ *   ~/.lsw/drives/c/Users/<username>
+ *   ~/.lsw/registry
+ */
+lsw_status_t lsw_fs_init_prefix(void);
+
+// ============================================================================
 // SECTION: Special Folders
 // ============================================================================
 

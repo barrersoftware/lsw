@@ -270,6 +270,10 @@ int main(int argc, char* argv[]) {
     LSW_LOG_INFO("LSW starting - Linux Subsystem for Windows");
     LSW_LOG_INFO("Target: %s", executable_path);
     
+    // Initialize LSW prefix (create ~/.lsw/drives/c/ if needed)
+    // TODO: Re-enable after debugging
+    // lsw_fs_init_prefix();
+    
     // Check if file exists
     if (!lsw_fs_path_exists(executable_path)) {
         fprintf(stderr, "\n");

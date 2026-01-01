@@ -266,3 +266,64 @@ lsw_status_t lsw_fs_get_special_folder(
     
     return LSW_SUCCESS;
 }
+
+// ============================================================================
+// SECTION: Prefix Management
+// ============================================================================
+
+/**
+ * Initialize LSW prefix structure
+ * Creates ~/.lsw/drives/c/ with Windows directory structure
+ */
+lsw_status_t lsw_fs_init_prefix(void) {
+    ensure_config();
+    
+    const char* home = getenv("HOME");
+    if (!home) return LSW_ERROR_INVALID_PARAMETER;
+    
+    const char* c_root = g_config.c_drive_root;
+    char path[LSW_MAX_PATH];
+    
+    // Create base: ~/.lsw/
+    snprintf(path, sizeof(path), "%s/.lsw", home);
+    mkdir(path, 0755);
+    
+    // Create: ~/.lsw/drives/
+    snprintf(path, sizeof(path), "%s/.lsw/drives", home);
+    mkdir(path, 0755);
+    
+    // Create: C: drive root
+    mkdir(c_root, 0755);
+    
+    // Create: Windows/
+    snprintf(path, sizeof(path), "%s/Windows", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/System32/
+    snprintf(path, sizeof(path), "%s/Windows/System32", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Temp/
+    snprintf(path, sizeof(path), "%s/Windows/Temp", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Program Files/
+    snprintf(path, sizeof(path), "%s/Program Files", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Users/
+    snprintf(path, sizeof(path), "%s/Users", c_root);
+    mkdir(path, 0755);
+    
+    const char* user = getenv("USER");
+    if (user) {
+        snprintf(path, sizeof(path), "%s/Users/%s", c_root, user);
+        mkdir(path, 0755);
+    }
+    
+    // Create: Registry
+    snprintf(path, sizeof(path), "%s/.lsw/registry", home);
+    mkdir(path, 0755);
+    
+    return LSW_SUCCESS;
+}
