@@ -612,21 +612,32 @@ long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req)
  */
 long lsw_syscall_LdrLoadDll(struct lsw_syscall_request *req)
 {
-    const char *path = "/tmp/test.dll";  /* TODO: Get from userspace */
+    __u64 path_ptr = req->args[0];  // DLL path from userspace
+    char path_kernel[256];
     __u64 base_address = 0;
     int ret;
     
-    lsw_info("LdrLoadDll: path='%s'", path);
+    // Copy path from userspace (like NtCreateFile does)
+    if (copy_from_user(path_kernel, (const char __user *)path_ptr, sizeof(path_kernel) - 1)) {
+        lsw_err("LdrLoadDll: Failed to copy DLL path from userspace");
+        req->return_value = 0;
+        req->error_code = -EFAULT;
+        return -EFAULT;
+    }
+    path_kernel[sizeof(path_kernel) - 1] = '\0';
     
-    ret = lsw_dll_load(current->pid, path, &base_address);
+    lsw_info("LdrLoadDll: path='%s' (from userspace)", path_kernel);
+    
+    ret = lsw_dll_load(current->pid, path_kernel, &base_address);
     
     if (ret != 0) {
-        lsw_err("DLL load failed: %d", ret);
+        lsw_err("DLL load failed for '%s': %d", path_kernel, ret);
         req->return_value = 0;
         req->error_code = ret;
         return ret;
     }
     
+    lsw_info("LdrLoadDll success: base=0x%llx for '%s'", base_address, path_kernel);
     req->return_value = base_address;
     req->error_code = 0;
     

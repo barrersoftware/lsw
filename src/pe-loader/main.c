@@ -54,7 +54,8 @@ void show_help(void) {
     printf("\n");
     printf("Example:\n");
     printf("  lsw --launch notepad.exe\n");
-    printf("  lsw --launch /mnt/c/Games/game.exe\n");
+    printf("  lsw --launch game.exe\n");
+    printf("  lsw --launch C:\\\\Windows\\\\notepad.exe\n");
     printf("\n");
     printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     printf("\n");
@@ -92,9 +93,9 @@ void show_help(void) {
     printf("💡 COMMON QUESTIONS\n");
     printf("\n");
     printf("Q: Where are my Windows files?\n");
-    printf("A: Your C: drive is at /mnt/c\n");
-    printf("   Your D: drive is at /mnt/d\n");
-    printf("   (Same as WSL if you've used that!)\n");
+    printf("A: Windows apps see C:\\ which maps to ~/.lsw/drives/c/\n");
+    printf("   This keeps Windows apps isolated from your Linux system.\n");
+    printf("   You can safely access this directory from Linux too!\n");
     printf("\n");
     printf("Q: My program won't run!\n");
     printf("A: Try adding -debug to see what's wrong:\n");
@@ -281,11 +282,13 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "LSW couldn't find: %s\n\n", executable_path);
         fprintf(stderr, "💡 Tips:\n");
         fprintf(stderr, "  • Make sure you spelled the filename correctly\n");
-        fprintf(stderr, "  • Try using the full path: /mnt/c/path/to/file.exe\n");
-        fprintf(stderr, "  • Your C: drive is at /mnt/c on Linux\n");
+        fprintf(stderr, "  • Make sure the file is in the current directory\n");
+        fprintf(stderr, "  • Try using the full path to the file\n");
         fprintf(stderr, "  • Use 'ls' to see files in current directory\n\n");
-        fprintf(stderr, "Example:\n");
-        fprintf(stderr, "  lsw --launch /mnt/c/Windows/notepad.exe\n\n");
+        fprintf(stderr, "Examples:\n");
+        fprintf(stderr, "  lsw --launch ./app.exe              # Current directory\n");
+        fprintf(stderr, "  lsw --launch ~/Downloads/game.exe   # Full Linux path\n");
+        fprintf(stderr, "  lsw --launch C:\\\\Windows\\\\notepad.exe  # Windows path\n\n");
         fprintf(stderr, "Need help? Run: lsw --help\n\n");
         return 1;
     }
