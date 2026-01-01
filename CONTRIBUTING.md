@@ -6,7 +6,7 @@ Thank you for your interest in contributing to LSW (Linux Subsystem for Windows)
 
 **"If it's free, it's free. Period."**
 
-LSW is licensed under the BarrerSoftware License (BSL) v1.0, which means:
+LSW is licensed under the Barrer Free Software License (BFSL) v1.2, which means:
 - ✅ Free forever, cannot be sold
 - ✅ Open source, community-driven
 - ✅ Welcoming to all contributors
