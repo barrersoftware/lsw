@@ -178,11 +178,12 @@ int lsw_file_write(__u64 handle, const void *buffer, __u64 size, __u64 *bytes_wr
         return -EINVAL;
     }
     
-    // Special case for stdout/stderr (common Windows handles)
-    // STD_OUTPUT_HANDLE = 0xfffffff5 (-11) or similar pseudo-handles
-    // Just write to printk for now as a proof of concept
-    if ((int64_t)handle < 0 || handle < 0x100) {
-        // This looks like a standard handle, write to kernel log
+    // Special case for Windows pseudo-handles (stdout/stderr)
+    // STD_OUTPUT_HANDLE = 0xfffffff5 (-11 as signed)
+    // STD_ERROR_HANDLE = 0xfffffff4 (-12 as signed)
+    // Only handle NEGATIVE values as Windows pseudo-handles
+    if ((int64_t)handle < 0) {
+        // This is a Windows pseudo-handle, write to kernel log
         char log_buffer[512];
         size_t log_size = size > sizeof(log_buffer) - 1 ? sizeof(log_buffer) - 1 : size;
         memcpy(log_buffer, buffer, log_size);
