@@ -388,3 +388,23 @@ Using Microsoft's official documentation ensures:
 ---
 
 **Built with official specifications. Protected by BFSL v1.2. Free forever.** 🏴‍☠️
+
+---
+
+## 📜 Legal Documentation
+
+**LSW is 100% legal and based on Supreme Court precedent.**
+
+- 📖 **[LEGAL.md](LEGAL.md)** - Complete legal foundation, case law, and compliance
+- 📚 **[SOURCES.md](SOURCES.md)** - All references and documentation sources  
+- ⚖️ **Clean-room implementation** - Zero proprietary Microsoft code
+- ✅ **30+ years of precedent** - Same legal basis as Wine, ReactOS, Samba
+
+**Key Legal Facts:**
+- ✅ APIs are not copyrightable (Google v. Oracle, 2021)
+- ✅ We use only Microsoft's published specifications
+- ✅ Clean-room methodology with full attribution
+- ✅ No decompilation, no leaked code, no proprietary sources
+
+**Microsoft Legal Notice:** We respect your intellectual property. LSW implements published specifications only. See [LEGAL.md](LEGAL.md) for full documentation.
+
