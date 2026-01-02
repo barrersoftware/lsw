@@ -892,6 +892,68 @@ void* __attribute__((ms_abi)) lsw_CreateThread(
     return (void*)(uintptr_t)thread;
 }
 
+void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
+{
+    LSW_LOG_INFO("ExitThread called: exit_code=%u", exit_code);
+    
+    // Route through kernel NtTerminateThread
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing ExitThread through kernel NtTerminateThread!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtTerminateThread;
+        req.arg_count = 2;
+        req.args[0] = 0;  // NULL = current thread
+        req.args[1] = exit_code;
+        
+        ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req);
+        // If we get here, syscall failed, fall through to pthread_exit
+    }
+    
+    // Fallback: use pthread_exit
+    LSW_LOG_INFO("ExitThread: using pthread_exit fallback");
+    pthread_exit((void*)(uintptr_t)exit_code);
+}
+
+uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t milliseconds)
+{
+    LSW_LOG_INFO("WaitForSingleObject called: handle=%p, timeout=%u", handle, milliseconds);
+    
+    if (!handle) {
+        LSW_LOG_ERROR("WaitForSingleObject: null handle");
+        return 0xFFFFFFFF; // WAIT_FAILED
+    }
+    
+    // Route through kernel
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing WaitForSingleObject through kernel!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtWaitForSingleObject;
+        req.arg_count = 3;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        req.args[1] = 0;  // Alertable = FALSE
+        req.args[2] = milliseconds;
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            uint32_t result = (uint32_t)req.return_value;
+            LSW_LOG_INFO("WaitForSingleObject: result=%u (0=WAIT_OBJECT_0)", result);
+            return result;
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for WaitForSingleObject: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback: basic sleep (not ideal but works for testing)
+    LSW_LOG_WARN("WaitForSingleObject: using sleep fallback");
+    if (milliseconds != 0xFFFFFFFF) {  // Not INFINITE
+        usleep(milliseconds * 1000);
+    }
+    return 0; // WAIT_OBJECT_0
+}
+
 int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     if (!str) return 0;
     return (int)strlen(str);
@@ -961,6 +1023,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
+    {"KERNEL32.dll", "ExitThread", (void*)lsw_ExitThread},
+    {"KERNEL32.dll", "WaitForSingleObject", (void*)lsw_WaitForSingleObject},
     {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
     {"KERNEL32.dll", "ReadFile", (void*)lsw_ReadFile},
     {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
