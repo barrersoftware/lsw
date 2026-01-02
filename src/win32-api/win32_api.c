@@ -821,6 +821,77 @@ int __attribute__((ms_abi)) lsw_DeleteFileA(const char* filename) {
     return 1; // TRUE
 }
 
+void* __attribute__((ms_abi)) lsw_CreateThread(
+    void* thread_attributes,
+    uint32_t stack_size,
+    void* start_address,
+    void* parameter,
+    uint32_t creation_flags,
+    uint32_t* thread_id)
+{
+    (void)thread_attributes; // Not used yet
+    
+    LSW_LOG_INFO("CreateThread called: start=0x%p, param=0x%p, flags=0x%x",
+                 start_address, parameter, creation_flags);
+    
+    if (!start_address) {
+        LSW_LOG_ERROR("CreateThread: null start address");
+        return NULL; // INVALID_HANDLE_VALUE
+    }
+    
+    // Route through kernel NtCreateThreadEx
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing CreateThread through kernel NtCreateThreadEx!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtCreateThreadEx;
+        req.arg_count = 4;
+        req.args[0] = (uint64_t)(uintptr_t)start_address;  // Thread start function
+        req.args[1] = (uint64_t)(uintptr_t)parameter;      // Thread parameter
+        req.args[2] = stack_size ? stack_size : 0x100000;  // Default 1MB stack
+        req.args[3] = creation_flags;                       // Creation flags
+        
+        LSW_LOG_INFO("  Request: syscall=0x%x, args=[0x%lx, 0x%lx, %lu, 0x%x]",
+                     req.syscall_number, req.args[0], req.args[1], req.args[2], (uint32_t)req.args[3]);
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            void* thread_handle = (void*)(uintptr_t)req.return_value;
+            
+            // Return thread ID if requested
+            if (thread_id) {
+                *thread_id = (uint32_t)(req.return_value & 0xFFFFFFFF);
+            }
+            
+            LSW_LOG_INFO("CreateThread: handle=%p, tid=%u", 
+                        thread_handle, thread_id ? *thread_id : 0);
+            return thread_handle;
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for CreateThread: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback: create pthread
+    LSW_LOG_WARN("Using pthread fallback for CreateThread");
+    
+    pthread_t thread;
+    int ret = pthread_create(&thread, NULL, (void*(*)(void*))start_address, parameter);
+    
+    if (ret != 0) {
+        LSW_LOG_ERROR("pthread_create failed: %s", strerror(ret));
+        return NULL;
+    }
+    
+    if (thread_id) {
+        *thread_id = (uint32_t)(uintptr_t)thread;
+    }
+    
+    LSW_LOG_INFO("CreateThread fallback: pthread=%lu", (unsigned long)thread);
+    
+    // Return pthread handle as Win32 handle
+    return (void*)(uintptr_t)thread;
+}
+
 int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     if (!str) return 0;
     return (int)strlen(str);
@@ -889,6 +960,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetCurrentProcessId", (void*)lsw_GetCurrentProcessId},
     {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
+    {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
     {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
     {"KERNEL32.dll", "ReadFile", (void*)lsw_ReadFile},
     {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
