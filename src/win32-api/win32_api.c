@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
@@ -954,6 +955,87 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
     return 0; // WAIT_OBJECT_0
 }
 
+void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
+{
+    LSW_LOG_INFO("LoadLibraryA called: %s", filename ? filename : "(null)");
+    
+    if (!filename) {
+        LSW_LOG_ERROR("LoadLibraryA: null filename");
+        return NULL;
+    }
+    
+    // Convert Windows DLL name to Linux SO name
+    char linux_path[512];
+    
+    // Check if it's a system DLL we're providing
+    if (strcasecmp(filename, "kernel32.dll") == 0 ||
+        strcasecmp(filename, "user32.dll") == 0 ||
+        strcasecmp(filename, "gdi32.dll") == 0) {
+        // These are provided by LSW itself - return a fake handle
+        // The PE loader will map their functions
+        LSW_LOG_INFO("LoadLibraryA: System DLL %s (returning fake handle)", filename);
+        return (void*)0xDEADBEEF;  // Fake handle for system DLLs
+    }
+    
+    // Try to load as Linux shared library
+    const char* so_name = filename;
+    if (strstr(filename, ".dll") || strstr(filename, ".DLL")) {
+        // Convert foo.dll -> libfoo.so
+        char dll_name[256];
+        strncpy(dll_name, filename, sizeof(dll_name) - 1);
+        char* dot = strrchr(dll_name, '.');
+        if (dot) *dot = '\0';
+        
+        snprintf(linux_path, sizeof(linux_path), "lib%s.so", dll_name);
+        so_name = linux_path;
+    }
+    
+    LSW_LOG_INFO("LoadLibraryA: Attempting to load %s as %s", filename, so_name);
+    
+    void* handle = dlopen(so_name, RTLD_NOW | RTLD_LOCAL);
+    
+    if (!handle) {
+        LSW_LOG_ERROR("LoadLibraryA: dlopen failed: %s", dlerror());
+        return NULL;
+    }
+    
+    LSW_LOG_INFO("LoadLibraryA: Successfully loaded %s at %p", so_name, handle);
+    return handle;
+}
+
+void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_name)
+{
+    LSW_LOG_INFO("GetProcAddress called: module=%p, proc=%s", module, proc_name ? proc_name : "(null)");
+    
+    if (!module) {
+        LSW_LOG_ERROR("GetProcAddress: null module");
+        return NULL;
+    }
+    
+    if (!proc_name) {
+        LSW_LOG_ERROR("GetProcAddress: null proc_name");
+        return NULL;
+    }
+    
+    // Check if it's a system DLL fake handle
+    if (module == (void*)0xDEADBEEF) {
+        // System DLL - return NULL, let PE loader handle it
+        LSW_LOG_INFO("GetProcAddress: System DLL function %s (letting PE loader resolve)", proc_name);
+        return NULL;
+    }
+    
+    // Real dlopen handle - use dlsym
+    void* addr = dlsym(module, proc_name);
+    
+    if (!addr) {
+        LSW_LOG_WARN("GetProcAddress: dlsym failed: %s", dlerror());
+        return NULL;
+    }
+    
+    LSW_LOG_INFO("GetProcAddress: Found %s at %p", proc_name, addr);
+    return addr;
+}
+
 int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     if (!str) return 0;
     return (int)strlen(str);
@@ -1030,6 +1112,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
     {"KERNEL32.dll", "SetFilePointer", (void*)lsw_SetFilePointer},
     {"KERNEL32.dll", "DeleteFileA", (void*)lsw_DeleteFileA},
+    {"KERNEL32.dll", "LoadLibraryA", (void*)lsw_LoadLibraryA},
+    {"KERNEL32.dll", "GetProcAddress", (void*)lsw_GetProcAddress},
     {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},
     {"KERNEL32.dll", "IsDBCSLeadByteEx", (void*)lsw_IsDBCSLeadByteEx},
     {"KERNEL32.dll", "MultiByteToWideChar", (void*)lsw_MultiByteToWideChar},
