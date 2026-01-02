@@ -23,6 +23,7 @@
 #include <wchar.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
 
@@ -654,6 +655,172 @@ int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint
     return 1; // Success
 }
 
+int __attribute__((ms_abi)) lsw_ReadFile(void* handle, void* buffer, uint32_t bytes_to_read, uint32_t* bytes_read, void* overlapped) {
+    (void)overlapped; // Not used yet
+    
+    LSW_LOG_INFO("ReadFile called: handle=%p, buffer=%p, bytes=%u", handle, buffer, bytes_to_read);
+    
+    if (!handle || !buffer) {
+        if (bytes_read) *bytes_read = 0;
+        return 0;
+    }
+    
+    // If kernel fd is available, route through kernel module
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing ReadFile through kernel NtReadFile!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_NtReadFile;
+        req.arg_count = 3;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        req.args[1] = (uint64_t)(uintptr_t)buffer;  // Pass buffer address
+        req.args[2] = bytes_to_read;
+        
+        LSW_LOG_INFO("  Request: syscall=0x%x, args=[0x%lx, 0x%lx, %lu]",
+                     req.syscall_number, req.args[0], req.args[1], req.args[2]);
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            LSW_LOG_INFO("Kernel NtReadFile returned: %lld bytes", req.return_value);
+            if (bytes_read) *bytes_read = (uint32_t)req.return_value;
+            return 1; // Success
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for NtReadFile: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback to userspace implementation
+    LSW_LOG_WARN("Using userspace fallback for ReadFile");
+    
+    int fd = -1;
+    if (handle == STD_INPUT_HANDLE) {
+        fd = STDIN_FILENO;
+    } else {
+        fd = (int)(uintptr_t)handle;
+    }
+    
+    ssize_t result = read(fd, buffer, bytes_to_read);
+    if (result < 0) {
+        if (bytes_read) *bytes_read = 0;
+        return 0; // Failure
+    }
+    
+    if (bytes_read) *bytes_read = (uint32_t)result;
+    return 1; // Success
+}
+
+uint32_t __attribute__((ms_abi)) lsw_GetFileSize(void* handle, uint32_t* file_size_high) {
+    LSW_LOG_INFO("GetFileSize called: handle=%p", handle);
+    
+    if (!handle || handle == (void*)-1) {
+        LSW_LOG_ERROR("GetFileSize: invalid handle");
+        if (file_size_high) *file_size_high = 0;
+        return 0xFFFFFFFF; // INVALID_FILE_SIZE
+    }
+    
+    // Route through kernel
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing GetFileSize through kernel!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_LswGetFileSize;
+        req.arg_count = 1;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            uint64_t size = req.return_value;
+            uint32_t size_low = (uint32_t)(size & 0xFFFFFFFF);
+            uint32_t size_high = (uint32_t)(size >> 32);
+            
+            if (file_size_high) {
+                *file_size_high = size_high;
+            }
+            
+            LSW_LOG_INFO("GetFileSize: %llu bytes (low=0x%x, high=0x%x)", size, size_low, size_high);
+            return size_low;
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for GetFileSize: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback: shouldn't reach here with kernel mode
+    if (file_size_high) *file_size_high = 0;
+    return 0xFFFFFFFF;
+}
+
+uint32_t __attribute__((ms_abi)) lsw_SetFilePointer(void* handle, int32_t distance_to_move, int32_t* distance_to_move_high, uint32_t move_method) {
+    LSW_LOG_INFO("SetFilePointer: handle=%p, distance=%d, method=%u", handle, distance_to_move, move_method);
+    
+    if (!handle || handle == (void*)-1) {
+        LSW_LOG_ERROR("SetFilePointer: invalid handle");
+        return 0xFFFFFFFF;
+    }
+    
+    // Build 64-bit offset
+    int64_t offset = distance_to_move;
+    if (distance_to_move_high) {
+        offset |= ((int64_t)*distance_to_move_high) << 32;
+    }
+    
+    // Route through kernel
+    if (g_kernel_fd >= 0) {
+        LSW_LOG_INFO("Routing SetFilePointer through kernel!");
+        
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_LswSetFilePointer;
+        req.arg_count = 3;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        req.args[1] = (uint64_t)offset;
+        req.args[2] = move_method;
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            uint64_t new_pos = req.return_value;
+            uint32_t pos_low = (uint32_t)(new_pos & 0xFFFFFFFF);
+            uint32_t pos_high = (uint32_t)(new_pos >> 32);
+            
+            if (distance_to_move_high) {
+                *distance_to_move_high = pos_high;
+            }
+            
+            LSW_LOG_INFO("SetFilePointer: new position=%llu (low=0x%x, high=0x%x)", new_pos, pos_low, pos_high);
+            return pos_low;
+        } else {
+            LSW_LOG_ERROR("Kernel ioctl failed for SetFilePointer: %s", strerror(errno));
+        }
+    }
+    
+    // Fallback
+    return 0xFFFFFFFF;
+}
+
+int __attribute__((ms_abi)) lsw_DeleteFileA(const char* filename) {
+    LSW_LOG_INFO("DeleteFileA called: %s", filename ? filename : "(null)");
+    
+    if (!filename) {
+        LSW_LOG_ERROR("DeleteFileA: null filename");
+        return 0; // FALSE
+    }
+    
+    // Translate Windows path to Linux path
+    char linux_path[4096];
+    if (lsw_fs_win_to_linux(filename, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("DeleteFileA: path translation failed for %s", filename);
+        return 0;
+    }
+    
+    LSW_LOG_INFO("DeleteFileA: %s -> %s", filename, linux_path);
+    
+    if (unlink(linux_path) != 0) {
+        LSW_LOG_ERROR("DeleteFileA: unlink failed: %s", strerror(errno));
+        return 0; // FALSE
+    }
+    
+    LSW_LOG_INFO("DeleteFileA: successfully deleted %s", linux_path);
+    return 1; // TRUE
+}
+
 int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     if (!str) return 0;
     return (int)strlen(str);
@@ -723,6 +890,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
     {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
+    {"KERNEL32.dll", "ReadFile", (void*)lsw_ReadFile},
+    {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
+    {"KERNEL32.dll", "SetFilePointer", (void*)lsw_SetFilePointer},
+    {"KERNEL32.dll", "DeleteFileA", (void*)lsw_DeleteFileA},
     {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},
     {"KERNEL32.dll", "IsDBCSLeadByteEx", (void*)lsw_IsDBCSLeadByteEx},
     {"KERNEL32.dll", "MultiByteToWideChar", (void*)lsw_MultiByteToWideChar},

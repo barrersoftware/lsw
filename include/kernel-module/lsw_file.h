@@ -91,6 +91,28 @@ int lsw_file_write(__u64 handle, const void *buffer, __u64 size, __u64 *bytes_wr
 int lsw_file_close(__u64 handle);
 
 /**
+ * lsw_file_get_size - Get file size from handle
+ * 
+ * @handle: File handle
+ * @size_out: Returns file size in bytes
+ * 
+ * Returns: 0 on success, negative on error
+ */
+int lsw_file_get_size(__u64 handle, __u64 *size_out);
+
+/**
+ * lsw_file_seek - Seek to position in file
+ * 
+ * @handle: File handle
+ * @offset: Offset to seek to
+ * @whence: 0=FILE_BEGIN, 1=FILE_CURRENT, 2=FILE_END
+ * @new_pos_out: Returns new file position (optional, can be NULL)
+ * 
+ * Returns: 0 on success, negative on error
+ */
+int lsw_file_seek(__u64 handle, __s64 offset, __u32 whence, __u64 *new_pos_out);
+
+/**
  * lsw_file_cleanup_process - Close all files for a process
  * 
  * @pid: Process ID to cleanup

@@ -37,6 +37,8 @@
 #define LSW_SYSCALL_NtCreateProcess       0x00b3
 #define LSW_SYSCALL_NtCreateThreadEx      0x00bd
 #define LSW_SYSCALL_NtTerminateProcess    0x002c
+#define LSW_SYSCALL_LswGetFileSize        0x1000  /* LSW custom - Get file size */
+#define LSW_SYSCALL_LswSetFilePointer     0x1001  /* LSW custom - Set file pointer */
 
 /* Syscall request structure from userspace */
 struct lsw_syscall_request {

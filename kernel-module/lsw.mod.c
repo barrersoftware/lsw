@@ -43,6 +43,8 @@ __used __section("__versions") =
 	"__check_object_size\0"
 	"\x18\x00\x00\x00\xc2\x9c\xc4\x13"
 	"_copy_from_user\0"
+	"\x14\x00\x00\x00\x2c\xc0\x5c\x03"
+	"vfs_getattr\0"
 	"\x18\x00\x00\x00\x14\x27\x52\x8d"
 	"__rcu_read_lock\0"
 	"\x1c\x00\x00\x00\x8f\x18\x02\x7f"
@@ -75,6 +77,8 @@ __used __section("__versions") =
 	"schedule_timeout\0\0\0\0"
 	"\x1c\x00\x00\x00\xcb\xf6\xfd\xf0"
 	"__stack_chk_fail\0\0\0\0"
+	"\x18\x00\x00\x00\x4e\xba\x82\x76"
+	"__copy_overflow\0"
 	"\x14\x00\x00\x00\x5b\x0f\x4c\xa5"
 	"init_task\0\0\0"
 	"\x14\x00\x00\x00\xab\x6c\xca\x0f"
@@ -129,6 +133,8 @@ __used __section("__versions") =
 	"device_destroy\0\0"
 	"\x1c\x00\x00\x00\x65\x62\xf5\x2c"
 	"__dynamic_pr_debug\0\0"
+	"\x14\x00\x00\x00\x2b\x7c\xc5\x6c"
+	"vfs_llseek\0\0"
 	"\x18\x00\x00\x00\x4c\x48\xc3\xd0"
 	"kmalloc_trace\0\0\0"
 	"\x2c\x00\x00\x00\xc6\xfa\xb1\x54"
@@ -154,4 +160,4 @@ __used __section("__versions") =
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "395FD0851F7C9B66B6B8C8C");
+MODULE_INFO(srcversion, "3407253C9F269DA5E8EFA50");

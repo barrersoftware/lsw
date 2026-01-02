@@ -358,3 +358,109 @@ void lsw_file_exit(void)
     
     lsw_info("File I/O system cleaned up");
 }
+
+/**
+ * lsw_file_get_size - Get file size from handle
+ */
+int lsw_file_get_size(__u64 handle, __u64 *size_out)
+{
+    struct lsw_file_handle *fh;
+    struct kstat stat;
+    int ret;
+    int found = 0;
+    
+    if (!size_out) {
+        return -EINVAL;
+    }
+    
+    mutex_lock(&lsw_file_mutex);
+    
+    /* Find file handle */
+    list_for_each_entry(fh, &lsw_file_list, list) {
+        if (fh->handle == handle) {
+            found = 1;
+            
+            /* Get file stats */
+            ret = vfs_getattr(&fh->linux_file->f_path, &stat, STATX_SIZE, AT_STATX_SYNC_AS_STAT);
+            if (ret != 0) {
+                lsw_err("vfs_getattr failed for handle 0x%llx: %d", handle, ret);
+                mutex_unlock(&lsw_file_mutex);
+                return ret;
+            }
+            
+            *size_out = stat.size;
+            lsw_info("File handle 0x%llx size: %llu bytes", handle, stat.size);
+            
+            mutex_unlock(&lsw_file_mutex);
+            return 0;
+        }
+    }
+    
+    mutex_unlock(&lsw_file_mutex);
+    
+    if (!found) {
+        lsw_err("Invalid file handle: 0x%llx", handle);
+        return -EBADF;
+    }
+    
+    return 0;
+}
+
+/**
+ * lsw_file_seek - Seek to position in file
+ */
+int lsw_file_seek(__u64 handle, __s64 offset, __u32 whence, __u64 *new_pos_out)
+{
+    struct lsw_file_handle *fh;
+    loff_t new_pos;
+    int linux_whence;
+    int found = 0;
+    
+    /* Map Windows to Linux whence */
+    switch (whence) {
+        case 0: linux_whence = SEEK_SET; break;  /* FILE_BEGIN */
+        case 1: linux_whence = SEEK_CUR; break;  /* FILE_CURRENT */
+        case 2: linux_whence = SEEK_END; break;  /* FILE_END */
+        default:
+            lsw_err("Invalid whence: %u", whence);
+            return -EINVAL;
+    }
+    
+    mutex_lock(&lsw_file_mutex);
+    
+    /* Find file handle */
+    list_for_each_entry(fh, &lsw_file_list, list) {
+        if (fh->handle == handle) {
+            found = 1;
+            
+            /* Seek */
+            new_pos = vfs_llseek(fh->linux_file, offset, linux_whence);
+            if (new_pos < 0) {
+                lsw_err("vfs_llseek failed for handle 0x%llx: %lld", handle, new_pos);
+                mutex_unlock(&lsw_file_mutex);
+                return (int)new_pos;
+            }
+            
+            /* Update our tracked position */
+            fh->position = new_pos;
+            
+            if (new_pos_out) {
+                *new_pos_out = (__u64)new_pos;
+            }
+            
+            lsw_info("File handle 0x%llx seeked to: %lld", handle, new_pos);
+            
+            mutex_unlock(&lsw_file_mutex);
+            return 0;
+        }
+    }
+    
+    mutex_unlock(&lsw_file_mutex);
+    
+    if (!found) {
+        lsw_err("Invalid file handle: 0x%llx", handle);
+        return -EBADF;
+    }
+    
+    return 0;
+}

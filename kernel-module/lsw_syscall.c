@@ -19,6 +19,29 @@
 #include "../include/kernel-module/lsw_dll.h"
 #include "../include/kernel-module/lsw_process.h"
 
+/* Forward declarations */
+long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req);
+long lsw_syscall_NtReadFile(struct lsw_syscall_request *req);
+long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req);
+long lsw_syscall_NtClose(struct lsw_syscall_request *req);
+long lsw_syscall_LswGetFileSize(struct lsw_syscall_request *req);
+long lsw_syscall_LswSetFilePointer(struct lsw_syscall_request *req);
+long lsw_syscall_NtAllocateVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtFreeVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtReadVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtProtectVirtualMemory(struct lsw_syscall_request *req);
+long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateEvent(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateMutant(struct lsw_syscall_request *req);
+long lsw_syscall_NtWaitForSingleObject(struct lsw_syscall_request *req);
+long lsw_syscall_NtSetEvent(struct lsw_syscall_request *req);
+long lsw_syscall_NtReleaseMutant(struct lsw_syscall_request *req);
+long lsw_syscall_LdrLoadDll(struct lsw_syscall_request *req);
+long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req);
+long lsw_syscall_NtCreateThreadEx(struct lsw_syscall_request *req);
+long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req);
+
 /* Syscall handler table */
 struct lsw_syscall_entry {
     __u32 syscall_number;
@@ -31,6 +54,8 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtReadFile, lsw_syscall_NtReadFile, "NtReadFile" },
     { LSW_SYSCALL_NtWriteFile, lsw_syscall_NtWriteFile, "NtWriteFile" },
     { LSW_SYSCALL_NtClose, lsw_syscall_NtClose, "NtClose" },
+    { LSW_SYSCALL_LswGetFileSize, lsw_syscall_LswGetFileSize, "LswGetFileSize" },
+    { LSW_SYSCALL_LswSetFilePointer, lsw_syscall_LswSetFilePointer, "LswSetFilePointer" },
     { LSW_SYSCALL_NtAllocateVirtualMemory, lsw_syscall_NtAllocateVirtualMemory, "NtAllocateVirtualMemory" },
     { LSW_SYSCALL_NtFreeVirtualMemory, lsw_syscall_NtFreeVirtualMemory, "NtFreeVirtualMemory" },
     { LSW_SYSCALL_NtReadVirtualMemory, lsw_syscall_NtReadVirtualMemory, "NtReadVirtualMemory" },
@@ -128,12 +153,13 @@ long lsw_syscall_NtCreateFile(struct lsw_syscall_request *req)
 long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
 {
     __u64 handle = req->args[0];
-    __u64 size = req->args[1];
+    __u64 buffer_ptr = req->args[1];  /* Userspace buffer pointer */
+    __u64 size = req->args[2];
     __u64 bytes_read = 0;
     char temp_buffer[4096];
     int ret;
     
-    lsw_info("NtReadFile: handle=0x%llx, size=%llu", handle, size);
+    lsw_info("NtReadFile: handle=0x%llx, buffer=0x%llx, size=%llu", handle, buffer_ptr, size);
     
     /* Limit read size */
     if (size > sizeof(temp_buffer)) {
@@ -151,6 +177,17 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
     }
     
     lsw_info("Read %llu bytes from handle 0x%llx", bytes_read, handle);
+    
+    /* Copy data to userspace buffer */
+    if (bytes_read > 0 && buffer_ptr != 0) {
+        if (copy_to_user((void __user *)buffer_ptr, temp_buffer, bytes_read)) {
+            lsw_err("Failed to copy data to userspace buffer");
+            req->return_value = 0;
+            req->error_code = -EFAULT;
+            return -EFAULT;
+        }
+        lsw_info("Copied %llu bytes to userspace buffer at 0x%llx", bytes_read, buffer_ptr);
+    }
     
     req->return_value = bytes_read;
     req->error_code = 0;
@@ -197,6 +234,56 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
     lsw_info("Wrote %llu bytes to handle 0x%llx", bytes_written, handle);
     
     req->return_value = bytes_written;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LswGetFileSize - Get file size from LSW handle
+ */
+long lsw_syscall_LswGetFileSize(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    __u64 size;
+    int ret;
+    
+    lsw_info("LswGetFileSize: handle=0x%llx", handle);
+    
+    ret = lsw_file_get_size(handle, &size);
+    if (ret != 0) {
+        req->return_value = 0xFFFFFFFFFFFFFFFFULL;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = size;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LswSetFilePointer - Set file pointer position
+ */
+long lsw_syscall_LswSetFilePointer(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    __s64 offset = (__s64)req->args[1];
+    __u32 whence = (__u32)req->args[2];
+    __u64 new_pos;
+    int ret;
+    
+    lsw_info("LswSetFilePointer: handle=0x%llx, offset=%lld, whence=%u", handle, offset, whence);
+    
+    ret = lsw_file_seek(handle, offset, whence, &new_pos);
+    if (ret != 0) {
+        req->return_value = 0xFFFFFFFFFFFFFFFFULL;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = new_pos;
     req->error_code = 0;
     
     return 0;
