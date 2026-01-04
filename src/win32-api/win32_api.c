@@ -26,6 +26,10 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <dlfcn.h>
@@ -1087,6 +1091,247 @@ void __attribute__((ms_abi)) lsw_ExitProcess(DWORD exit_code) {
 }
 
 // ============================================================================
+// SECTION: Winsock (Networking) APIs
+// ============================================================================
+
+// Winsock constants
+#define SOCKET_ERROR            (-1)
+#define INVALID_SOCKET          ((SOCKET)(~0))
+#define SOCK_STREAM_WIN         1
+#define SOCK_DGRAM_WIN          2
+#define AF_INET_WIN             2
+#define IPPROTO_TCP_WIN         6
+#define IPPROTO_UDP_WIN         17
+
+// Winsock error codes
+#define WSAEINTR                10004
+#define WSAEBADF                10009
+#define WSAEACCES               10013
+#define WSAEFAULT               10014
+#define WSAEINVAL               10022
+#define WSAEWOULDBLOCK          10035
+#define WSAEINPROGRESS          10036
+#define WSAECONNREFUSED         10061
+#define WSAEHOSTUNREACH         10065
+
+// Winsock version
+#define MAKEWORD(a,b)           ((WORD)(((BYTE)(a))|(((WORD)((BYTE)(b)))<<8)))
+#define WINSOCK_VERSION         MAKEWORD(2,2)
+
+typedef uintptr_t SOCKET;
+
+// WSADATA structure
+typedef struct {
+    WORD wVersion;
+    WORD wHighVersion;
+    char szDescription[257];
+    char szSystemStatus[129];
+    unsigned short iMaxSockets;
+    unsigned short iMaxUdpDg;
+    char* lpVendorInfo;
+} WSADATA;
+
+// sockaddr_in structure (matches Windows layout)
+struct sockaddr_in_win {
+    short sin_family;
+    unsigned short sin_port;
+    struct {
+        unsigned long s_addr;
+    } sin_addr;
+    char sin_zero[8];
+};
+
+// Last Winsock error (thread-local would be better, but keeping it simple)
+static int g_last_wsa_error = 0;
+
+// Map errno to WSA error code
+static int errno_to_wsa_error(int err) {
+    switch (err) {
+        case EINTR: return WSAEINTR;
+        case EBADF: return WSAEBADF;
+        case EACCES: return WSAEACCES;
+        case EFAULT: return WSAEFAULT;
+        case EINVAL: return WSAEINVAL;
+        case EWOULDBLOCK: return WSAEWOULDBLOCK;
+        case EINPROGRESS: return WSAEINPROGRESS;
+        case ECONNREFUSED: return WSAECONNREFUSED;
+        case EHOSTUNREACH: return WSAEHOSTUNREACH;
+        default: return err + 10000; // Generic mapping
+    }
+}
+
+// ws2_32.dll!WSAStartup - Initialize Winsock
+int __attribute__((ms_abi)) lsw_WSAStartup(WORD version_requested, WSADATA* wsa_data) {
+    LSW_LOG_INFO("WSAStartup: version=0x%04x", version_requested);
+    
+    if (!wsa_data) {
+        return WSAEFAULT;
+    }
+    
+    // Fill in WSADATA
+    memset(wsa_data, 0, sizeof(WSADATA));
+    wsa_data->wVersion = WINSOCK_VERSION;
+    wsa_data->wHighVersion = WINSOCK_VERSION;
+    strncpy(wsa_data->szDescription, "LSW Winsock 2.2", sizeof(wsa_data->szDescription));
+    strncpy(wsa_data->szSystemStatus, "Running", sizeof(wsa_data->szSystemStatus));
+    wsa_data->iMaxSockets = 0; // No limit in modern Winsock
+    wsa_data->iMaxUdpDg = 65467;
+    
+    LSW_LOG_INFO("WSAStartup: success");
+    return 0;
+}
+
+// ws2_32.dll!WSACleanup - Cleanup Winsock
+int __attribute__((ms_abi)) lsw_WSACleanup(void) {
+    LSW_LOG_INFO("WSACleanup");
+    return 0; // Nothing to clean up
+}
+
+// ws2_32.dll!WSAGetLastError - Get last error
+int __attribute__((ms_abi)) lsw_WSAGetLastError(void) {
+    return g_last_wsa_error;
+}
+
+// ws2_32.dll!WSASetLastError - Set last error
+void __attribute__((ms_abi)) lsw_WSASetLastError(int error) {
+    g_last_wsa_error = error;
+}
+
+// ws2_32.dll!socket - Create socket
+SOCKET __attribute__((ms_abi)) lsw_socket(int af, int type, int protocol) {
+    LSW_LOG_INFO("socket: af=%d, type=%d, protocol=%d", af, type, protocol);
+    
+    // Map Windows constants to POSIX
+    int posix_af = (af == AF_INET_WIN) ? AF_INET : af;
+    int posix_type = (type == SOCK_STREAM_WIN) ? SOCK_STREAM : 
+                     (type == SOCK_DGRAM_WIN) ? SOCK_DGRAM : type;
+    int posix_protocol = (protocol == IPPROTO_TCP_WIN) ? IPPROTO_TCP :
+                         (protocol == IPPROTO_UDP_WIN) ? IPPROTO_UDP : protocol;
+    
+    int sock = socket(posix_af, posix_type, posix_protocol);
+    
+    if (sock < 0) {
+        g_last_wsa_error = errno_to_wsa_error(errno);
+        LSW_LOG_ERROR("socket failed: %s", strerror(errno));
+        return INVALID_SOCKET;
+    }
+    
+    LSW_LOG_INFO("socket: created fd=%d", sock);
+    return (SOCKET)sock;
+}
+
+// ws2_32.dll!connect - Connect socket
+int __attribute__((ms_abi)) lsw_connect(SOCKET s, const struct sockaddr_in_win* name, int namelen) {
+    (void)namelen;
+    
+    LSW_LOG_INFO("connect: socket=%lu", (unsigned long)s);
+    
+    if (!name) {
+        g_last_wsa_error = WSAEFAULT;
+        return SOCKET_ERROR;
+    }
+    
+    // Convert Windows sockaddr_in to POSIX
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = name->sin_port;
+    addr.sin_addr.s_addr = name->sin_addr.s_addr;
+    
+    LSW_LOG_INFO("connect: %s:%d", 
+                 inet_ntoa(addr.sin_addr), 
+                 ntohs(addr.sin_port));
+    
+    int result = connect((int)s, (struct sockaddr*)&addr, sizeof(addr));
+    
+    if (result < 0) {
+        g_last_wsa_error = errno_to_wsa_error(errno);
+        LSW_LOG_ERROR("connect failed: %s", strerror(errno));
+        return SOCKET_ERROR;
+    }
+    
+    LSW_LOG_INFO("connect: success");
+    return 0;
+}
+
+// ws2_32.dll!send - Send data
+int __attribute__((ms_abi)) lsw_send(SOCKET s, const char* buf, int len, int flags) {
+    LSW_LOG_INFO("send: socket=%lu, len=%d", (unsigned long)s, len);
+    
+    int result = send((int)s, buf, len, flags);
+    
+    if (result < 0) {
+        g_last_wsa_error = errno_to_wsa_error(errno);
+        LSW_LOG_ERROR("send failed: %s", strerror(errno));
+        return SOCKET_ERROR;
+    }
+    
+    LSW_LOG_INFO("send: sent %d bytes", result);
+    return result;
+}
+
+// ws2_32.dll!recv - Receive data
+int __attribute__((ms_abi)) lsw_recv(SOCKET s, char* buf, int len, int flags) {
+    LSW_LOG_INFO("recv: socket=%lu, len=%d", (unsigned long)s, len);
+    
+    int result = recv((int)s, buf, len, flags);
+    
+    if (result < 0) {
+        g_last_wsa_error = errno_to_wsa_error(errno);
+        LSW_LOG_ERROR("recv failed: %s", strerror(errno));
+        return SOCKET_ERROR;
+    }
+    
+    LSW_LOG_INFO("recv: received %d bytes", result);
+    return result;
+}
+
+// ws2_32.dll!closesocket - Close socket
+int __attribute__((ms_abi)) lsw_closesocket(SOCKET s) {
+    LSW_LOG_INFO("closesocket: socket=%lu", (unsigned long)s);
+    
+    int result = close((int)s);
+    
+    if (result < 0) {
+        g_last_wsa_error = errno_to_wsa_error(errno);
+        LSW_LOG_ERROR("closesocket failed: %s", strerror(errno));
+        return SOCKET_ERROR;
+    }
+    
+    return 0;
+}
+
+// ws2_32.dll!htons - Host to network short
+unsigned short __attribute__((ms_abi)) lsw_htons(unsigned short hostshort) {
+    return htons(hostshort);
+}
+
+// ws2_32.dll!htonl - Host to network long
+unsigned long __attribute__((ms_abi)) lsw_htonl(unsigned long hostlong) {
+    return htonl(hostlong);
+}
+
+// ws2_32.dll!ntohs - Network to host short
+unsigned short __attribute__((ms_abi)) lsw_ntohs(unsigned short netshort) {
+    return ntohs(netshort);
+}
+
+// ws2_32.dll!ntohl - Network to host long
+unsigned long __attribute__((ms_abi)) lsw_ntohl(unsigned long netlong) {
+    return ntohl(netlong);
+}
+
+// ws2_32.dll!inet_addr - Convert IP string to address
+unsigned long __attribute__((ms_abi)) lsw_inet_addr(const char* cp) {
+    if (!cp) return INADDR_NONE;
+    return inet_addr(cp);
+}
+
+// ============================================================================
+// END Winsock APIs
+// ============================================================================
+
+// ============================================================================
 // SECTION: Registry APIs
 // ============================================================================
 
@@ -1406,6 +1651,22 @@ static const win32_api_mapping_t api_mappings[] = {
     {"advapi32.dll", "RegQueryValueExA", (void*)lsw_RegQueryValueExA},
     {"advapi32.dll", "RegSetValueExA", (void*)lsw_RegSetValueExA},
     {"advapi32.dll", "RegCloseKey", (void*)lsw_RegCloseKey},
+    
+    // ws2_32.dll - Winsock APIs
+    {"ws2_32.dll", "WSAStartup", (void*)lsw_WSAStartup},
+    {"ws2_32.dll", "WSACleanup", (void*)lsw_WSACleanup},
+    {"ws2_32.dll", "WSAGetLastError", (void*)lsw_WSAGetLastError},
+    {"ws2_32.dll", "WSASetLastError", (void*)lsw_WSASetLastError},
+    {"ws2_32.dll", "socket", (void*)lsw_socket},
+    {"ws2_32.dll", "connect", (void*)lsw_connect},
+    {"ws2_32.dll", "send", (void*)lsw_send},
+    {"ws2_32.dll", "recv", (void*)lsw_recv},
+    {"ws2_32.dll", "closesocket", (void*)lsw_closesocket},
+    {"ws2_32.dll", "htons", (void*)lsw_htons},
+    {"ws2_32.dll", "htonl", (void*)lsw_htonl},
+    {"ws2_32.dll", "ntohs", (void*)lsw_ntohs},
+    {"ws2_32.dll", "ntohl", (void*)lsw_ntohl},
+    {"ws2_32.dll", "inet_addr", (void*)lsw_inet_addr},
     
     // KERNEL32.dll - continued
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
