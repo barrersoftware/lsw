@@ -227,6 +227,11 @@ lsw_status_t lsw_reg_get_path(
                 config.registry_path, hkey_name);
     }
     
+    // Convert backslashes to forward slashes for Linux paths
+    for (char* p = path_buffer; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    
     return LSW_SUCCESS;
 }
 

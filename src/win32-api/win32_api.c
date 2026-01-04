@@ -11,6 +11,7 @@
 #include "lsw_log.h"
 #include "shared/lsw_kernel_client.h"
 #include "shared/lsw_filesystem.h"
+#include "shared/lsw_registry.h"
 #include "kernel-module/lsw_syscall.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1085,6 +1086,253 @@ void __attribute__((ms_abi)) lsw_ExitProcess(DWORD exit_code) {
     exit(exit_code);
 }
 
+// ============================================================================
+// SECTION: Registry APIs
+// ============================================================================
+
+// Windows error codes
+#define ERROR_SUCCESS               0
+#define ERROR_FILE_NOT_FOUND        2
+#define ERROR_ACCESS_DENIED         5
+#define ERROR_INVALID_HANDLE        6
+#define ERROR_INVALID_PARAMETER     87
+
+// Windows registry key handles - predefined keys
+#define HKEY_CLASSES_ROOT       ((HANDLE)(uintptr_t)0x80000000)
+#define HKEY_CURRENT_USER       ((HANDLE)(uintptr_t)0x80000001)
+#define HKEY_LOCAL_MACHINE      ((HANDLE)(uintptr_t)0x80000002)
+#define HKEY_USERS              ((HANDLE)(uintptr_t)0x80000003)
+#define HKEY_CURRENT_CONFIG     ((HANDLE)(uintptr_t)0x80000005)
+
+// Registry value types
+#define REG_NONE                0
+#define REG_SZ                  1
+#define REG_EXPAND_SZ           2
+#define REG_BINARY              3
+#define REG_DWORD               4
+#define REG_DWORD_BIG_ENDIAN    5
+#define REG_QWORD               11
+
+// Registry access rights
+#define KEY_QUERY_VALUE         0x0001
+#define KEY_SET_VALUE           0x0002
+#define KEY_CREATE_SUB_KEY      0x0004
+#define KEY_READ                0x20019
+#define KEY_WRITE               0x20006
+#define KEY_ALL_ACCESS          0xF003F
+
+// Convert Windows HKEY to LSW hkey enum
+static lsw_hkey_t win_hkey_to_lsw(HANDLE hkey) {
+    uintptr_t val = (uintptr_t)hkey;
+    // Handle both signed and unsigned representations
+    if (val == 0x80000000 || val == 0xffffffff80000000UL) return LSW_HKEY_CLASSES_ROOT;
+    if (val == 0x80000001 || val == 0xffffffff80000001UL) return LSW_HKEY_CURRENT_USER;
+    if (val == 0x80000002 || val == 0xffffffff80000002UL) return LSW_HKEY_LOCAL_MACHINE;
+    if (val == 0x80000003 || val == 0xffffffff80000003UL) return LSW_HKEY_USERS;
+    if (val == 0x80000005 || val == 0xffffffff80000005UL) return LSW_HKEY_CURRENT_CONFIG;
+    return (lsw_hkey_t)0;
+}
+
+// Convert LSW reg type to Windows reg type
+static DWORD lsw_regtype_to_win(lsw_reg_type_t type) {
+    switch (type) {
+        case LSW_REG_NONE: return REG_NONE;
+        case LSW_REG_SZ: return REG_SZ;
+        case LSW_REG_BINARY: return REG_BINARY;
+        case LSW_REG_DWORD: return REG_DWORD;
+        case LSW_REG_QWORD: return REG_QWORD;
+        default: return REG_NONE;
+    }
+}
+
+// Convert Windows reg type to LSW reg type
+static lsw_reg_type_t win_regtype_to_lsw(DWORD type) {
+    switch (type) {
+        case REG_NONE: return LSW_REG_NONE;
+        case REG_SZ: return LSW_REG_SZ;
+        case REG_EXPAND_SZ: return LSW_REG_SZ;  // Treat as regular string
+        case REG_BINARY: return LSW_REG_BINARY;
+        case REG_DWORD: return LSW_REG_DWORD;
+        case REG_DWORD_BIG_ENDIAN: return LSW_REG_DWORD;
+        case REG_QWORD: return LSW_REG_QWORD;
+        default: return LSW_REG_NONE;
+    }
+}
+
+// advapi32.dll!RegOpenKeyExA - Open registry key
+LONG __attribute__((ms_abi)) lsw_RegOpenKeyExA(
+    HANDLE hkey,
+    const char* subkey,
+    DWORD options,
+    DWORD samDesired,
+    HANDLE* phkResult
+) {
+    (void)options;
+    (void)samDesired;
+    
+    LSW_LOG_INFO("RegOpenKeyExA: hkey=0x%p, subkey='%s'", hkey, subkey ? subkey : "(null)");
+    
+    if (!phkResult) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    
+    // Convert Windows HKEY to LSW hkey
+    lsw_hkey_t lsw_hkey = win_hkey_to_lsw(hkey);
+    if (lsw_hkey == 0 && (uintptr_t)hkey >= 0x80000000) {
+        LSW_LOG_ERROR("Unknown predefined key: 0x%p", hkey);
+        return ERROR_INVALID_HANDLE;
+    }
+    
+    // Open the key
+    HANDLE result_handle;
+    lsw_status_t status = lsw_reg_open_key(lsw_hkey, subkey, &result_handle);
+    
+    if (status == LSW_SUCCESS) {
+        *phkResult = result_handle;
+        LSW_LOG_INFO("RegOpenKeyExA: success, handle=0x%p", result_handle);
+        return ERROR_SUCCESS;
+    } else if (status == LSW_ERROR_FILE_NOT_FOUND) {
+        LSW_LOG_DEBUG("RegOpenKeyExA: key not found");
+        return ERROR_FILE_NOT_FOUND;
+    } else {
+        LSW_LOG_ERROR("RegOpenKeyExA: failed with status %d", status);
+        return ERROR_ACCESS_DENIED;
+    }
+}
+
+// advapi32.dll!RegCreateKeyExA - Create or open registry key
+LONG __attribute__((ms_abi)) lsw_RegCreateKeyExA(
+    HANDLE hkey,
+    const char* subkey,
+    DWORD reserved,
+    char* class_name,
+    DWORD options,
+    DWORD samDesired,
+    void* security_attributes,
+    HANDLE* phkResult,
+    DWORD* disposition
+) {
+    (void)reserved;
+    (void)class_name;
+    (void)options;
+    (void)samDesired;
+    (void)security_attributes;
+    
+    LSW_LOG_INFO("RegCreateKeyExA: hkey=0x%p, subkey='%s'", hkey, subkey ? subkey : "(null)");
+    
+    if (!phkResult) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    
+    lsw_hkey_t lsw_hkey = win_hkey_to_lsw(hkey);
+    if (lsw_hkey == 0 && (uintptr_t)hkey >= 0x80000000) {
+        return ERROR_INVALID_HANDLE;
+    }
+    
+    HANDLE result_handle;
+    lsw_status_t status = lsw_reg_create_key(lsw_hkey, subkey, &result_handle);
+    
+    if (status == LSW_SUCCESS) {
+        *phkResult = result_handle;
+        if (disposition) *disposition = 1; // REG_CREATED_NEW_KEY
+        LSW_LOG_INFO("RegCreateKeyExA: success, handle=0x%p", result_handle);
+        return ERROR_SUCCESS;
+    } else {
+        LSW_LOG_ERROR("RegCreateKeyExA: failed with status %d", status);
+        return ERROR_ACCESS_DENIED;
+    }
+}
+
+// advapi32.dll!RegQueryValueExA - Read registry value
+LONG __attribute__((ms_abi)) lsw_RegQueryValueExA(
+    HANDLE hkey,
+    const char* value_name,
+    DWORD* reserved,
+    DWORD* type,
+    BYTE* data,
+    DWORD* data_size
+) {
+    (void)reserved;
+    
+    LSW_LOG_INFO("RegQueryValueExA: hkey=0x%p, value='%s'", hkey, value_name ? value_name : "(null)");
+    
+    if (!data_size) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    
+    lsw_reg_type_t lsw_type;
+    size_t size = *data_size;
+    
+    lsw_status_t status = lsw_reg_query_value(hkey, value_name, &lsw_type, data, &size);
+    
+    if (status == LSW_SUCCESS) {
+        *data_size = (DWORD)size;
+        if (type) *type = lsw_regtype_to_win(lsw_type);
+        LSW_LOG_INFO("RegQueryValueExA: success, type=%u, size=%u", *type, *data_size);
+        return ERROR_SUCCESS;
+    } else if (status == LSW_ERROR_FILE_NOT_FOUND) {
+        LSW_LOG_DEBUG("RegQueryValueExA: value not found");
+        return ERROR_FILE_NOT_FOUND;
+    } else {
+        LSW_LOG_ERROR("RegQueryValueExA: failed with status %d", status);
+        return ERROR_ACCESS_DENIED;
+    }
+}
+
+// advapi32.dll!RegSetValueExA - Write registry value
+LONG __attribute__((ms_abi)) lsw_RegSetValueExA(
+    HANDLE hkey,
+    const char* value_name,
+    DWORD reserved,
+    DWORD type,
+    const BYTE* data,
+    DWORD data_size
+) {
+    (void)reserved;
+    
+    LSW_LOG_INFO("RegSetValueExA: hkey=0x%p, value='%s', type=%u, size=%u", 
+                 hkey, value_name ? value_name : "(null)", type, data_size);
+    
+    if (!data) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    
+    lsw_reg_type_t lsw_type = win_regtype_to_lsw(type);
+    
+    lsw_status_t status = lsw_reg_set_value(hkey, value_name, lsw_type, data, data_size);
+    
+    if (status == LSW_SUCCESS) {
+        LSW_LOG_INFO("RegSetValueExA: success");
+        return ERROR_SUCCESS;
+    } else {
+        LSW_LOG_ERROR("RegSetValueExA: failed with status %d", status);
+        return ERROR_ACCESS_DENIED;
+    }
+}
+
+// advapi32.dll!RegCloseKey - Close registry key
+LONG __attribute__((ms_abi)) lsw_RegCloseKey(HANDLE hkey) {
+    LSW_LOG_INFO("RegCloseKey: hkey=0x%p", hkey);
+    
+    // Don't close predefined keys
+    uintptr_t val = (uintptr_t)hkey;
+    if (val >= 0x80000000 && val <= 0x80000005) {
+        return ERROR_SUCCESS;
+    }
+    
+    lsw_status_t status = lsw_reg_close_key(hkey);
+    
+    if (status == LSW_SUCCESS) {
+        return ERROR_SUCCESS;
+    } else {
+        return ERROR_INVALID_HANDLE;
+    }
+}
+
+// ============================================================================
+// END Registry APIs
+// ============================================================================
+
 // Disable pedantic warnings for function pointer to void* casts
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -1151,6 +1399,15 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "WriteConsoleA", (void*)lsw_WriteConsoleA},
     {"KERNEL32.dll", "GetCommandLineA", (void*)lsw_GetCommandLineA},
     {"KERNEL32.dll", "ExitProcess", (void*)lsw_ExitProcess},
+    
+    // advapi32.dll - Registry APIs
+    {"advapi32.dll", "RegOpenKeyExA", (void*)lsw_RegOpenKeyExA},
+    {"advapi32.dll", "RegCreateKeyExA", (void*)lsw_RegCreateKeyExA},
+    {"advapi32.dll", "RegQueryValueExA", (void*)lsw_RegQueryValueExA},
+    {"advapi32.dll", "RegSetValueExA", (void*)lsw_RegSetValueExA},
+    {"advapi32.dll", "RegCloseKey", (void*)lsw_RegCloseKey},
+    
+    // KERNEL32.dll - continued
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
     {"KERNEL32.dll", "ExitThread", (void*)lsw_ExitThread},
     {"KERNEL32.dll", "WaitForSingleObject", (void*)lsw_WaitForSingleObject},
