@@ -19,6 +19,12 @@
 #include "../include/kernel-module/lsw_dll.h"
 #include "../include/kernel-module/lsw_process.h"
 
+/* Forward declarations for console and env subsystems */
+extern int lsw_console_init(void);
+extern void lsw_console_cleanup(void);
+extern int lsw_env_init(void);
+extern void lsw_env_cleanup(void);
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(LSW_MODULE_AUTHOR);
 MODULE_DESCRIPTION(LSW_MODULE_DESC);
@@ -131,6 +137,33 @@ static int __init lsw_init(void)
         return ret;
     }
     
+    /* Initialize console I/O */
+    ret = lsw_console_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize console I/O: %d", ret);
+        lsw_process_exit();
+        lsw_dll_exit();
+        lsw_sync_exit();
+        lsw_file_exit();
+        lsw_memory_exit();
+        lsw_syscall_exit();
+        return ret;
+    }
+    
+    /* Initialize environment/system info */
+    ret = lsw_env_init();
+    if (ret != 0) {
+        lsw_err("Failed to initialize environment/system info: %d", ret);
+        lsw_console_cleanup();
+        lsw_process_exit();
+        lsw_dll_exit();
+        lsw_sync_exit();
+        lsw_file_exit();
+        lsw_memory_exit();
+        lsw_syscall_exit();
+        return ret;
+    }
+    
     /* Initialize device interface */
     ret = lsw_device_init();
     if (ret != 0) {
@@ -170,6 +203,12 @@ static void __exit lsw_exit(void)
     
     /* Cleanup device interface */
     lsw_device_exit();
+    
+    /* Cleanup environment/system info */
+    lsw_env_cleanup();
+    
+    /* Cleanup console I/O */
+    lsw_console_cleanup();
     
     /* Cleanup process/thread management */
     lsw_process_exit();

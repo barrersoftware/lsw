@@ -594,6 +594,52 @@ void* __attribute__((ms_abi)) lsw_GetStdHandle(uint32_t std_handle) {
     }
 }
 
+int __attribute__((ms_abi)) lsw_WriteConsoleA(void* handle, const void* buffer, uint32_t chars_to_write, uint32_t* chars_written, void* reserved) {
+    (void)reserved;
+    
+    if (!handle || !buffer) {
+        if (chars_written) *chars_written = 0;
+        return 0;
+    }
+    
+    // If kernel fd is available, route through kernel module
+    if (g_kernel_fd >= 0) {
+        struct lsw_syscall_request req;
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = LSW_SYSCALL_LswWriteConsole;
+        req.arg_count = 4;
+        req.args[0] = (uint64_t)(uintptr_t)handle;
+        req.args[1] = (uint64_t)(uintptr_t)buffer;
+        req.args[2] = chars_to_write;
+        req.args[3] = (uint64_t)(uintptr_t)chars_written;
+        
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
+            return (int)req.return_value;
+        }
+        LSW_LOG_ERROR("Kernel ioctl failed for WriteConsole: %s", strerror(errno));
+    }
+    
+    // Fallback to direct userspace implementation
+    int fd = -1;
+    if (handle == STD_OUTPUT_HANDLE) {
+        fd = STDOUT_FILENO;
+    } else if (handle == STD_ERROR_HANDLE) {
+        fd = STDERR_FILENO;
+    } else {
+        if (chars_written) *chars_written = 0;
+        return 0;
+    }
+    
+    ssize_t result = write(fd, buffer, chars_to_write);
+    if (result < 0) {
+        if (chars_written) *chars_written = 0;
+        return 0;
+    }
+    
+    if (chars_written) *chars_written = (uint32_t)result;
+    return 1;
+}
+
 int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uint32_t* bytes_written, void* overlapped) {
     (void)overlapped; // Not used for console I/O
     
@@ -1104,6 +1150,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetCurrentProcessId", (void*)lsw_GetCurrentProcessId},
     {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
+    {"KERNEL32.dll", "WriteConsoleA", (void*)lsw_WriteConsoleA},
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
     {"KERNEL32.dll", "ExitThread", (void*)lsw_ExitThread},
     {"KERNEL32.dll", "WaitForSingleObject", (void*)lsw_WaitForSingleObject},

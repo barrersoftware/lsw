@@ -272,8 +272,10 @@ int main(int argc, char* argv[]) {
     LSW_LOG_INFO("Target: %s", executable_path);
     
     // Initialize LSW prefix (create ~/.lsw/drives/c/ if needed)
-    // TODO: Re-enable after debugging
-    // lsw_fs_init_prefix();
+    lsw_status_t init_result = lsw_fs_init_prefix();
+    if (init_result != LSW_SUCCESS) {
+        LSW_LOG_WARN("Failed to initialize LSW prefix directories");
+    }
     
     // Check if file exists
     if (!lsw_fs_path_exists(executable_path)) {

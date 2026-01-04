@@ -41,6 +41,9 @@ long lsw_syscall_LdrGetProcedureAddress(struct lsw_syscall_request *req);
 long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req);
 long lsw_syscall_NtCreateThreadEx(struct lsw_syscall_request *req);
 long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req);
+long lsw_syscall_LswWriteConsole(struct lsw_syscall_request *req);
+long lsw_syscall_LswReadConsole(struct lsw_syscall_request *req);
+long lsw_syscall_LswGetStdHandle(struct lsw_syscall_request *req);
 
 /* Syscall handler table */
 struct lsw_syscall_entry {
@@ -71,6 +74,9 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_NtCreateProcess, lsw_syscall_NtCreateProcess, "NtCreateProcess" },
     { LSW_SYSCALL_NtCreateThreadEx, lsw_syscall_NtCreateThreadEx, "NtCreateThreadEx" },
     { LSW_SYSCALL_NtTerminateProcess, lsw_syscall_NtTerminateProcess, "NtTerminateProcess" },
+    { LSW_SYSCALL_LswWriteConsole, lsw_syscall_LswWriteConsole, "LswWriteConsole" },
+    { LSW_SYSCALL_LswReadConsole, lsw_syscall_LswReadConsole, "LswReadConsole" },
+    { LSW_SYSCALL_LswGetStdHandle, lsw_syscall_LswGetStdHandle, "LswGetStdHandle" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -156,14 +162,23 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
     __u64 buffer_ptr = req->args[1];  /* Userspace buffer pointer */
     __u64 size = req->args[2];
     __u64 bytes_read = 0;
-    char temp_buffer[4096];
+    char *temp_buffer;
     int ret;
     
     lsw_info("NtReadFile: handle=0x%llx, buffer=0x%llx, size=%llu", handle, buffer_ptr, size);
     
+    /* Allocate temp buffer on heap to avoid stack frame issues */
+    temp_buffer = kmalloc(4096, GFP_KERNEL);
+    if (!temp_buffer) {
+        lsw_err("Failed to allocate temp buffer");
+        req->return_value = 0;
+        req->error_code = -ENOMEM;
+        return -ENOMEM;
+    }
+    
     /* Limit read size */
-    if (size > sizeof(temp_buffer)) {
-        size = sizeof(temp_buffer);
+    if (size > 4096) {
+        size = 4096;
     }
     
     /* Read via LSW file manager */
@@ -171,6 +186,7 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
     
     if (ret != 0) {
         lsw_err("File read failed: %d", ret);
+        kfree(temp_buffer);
         req->return_value = 0;
         req->error_code = ret;
         return ret;
@@ -182,6 +198,7 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
     if (bytes_read > 0 && buffer_ptr != 0) {
         if (copy_to_user((void __user *)buffer_ptr, temp_buffer, bytes_read)) {
             lsw_err("Failed to copy data to userspace buffer");
+            kfree(temp_buffer);
             req->return_value = 0;
             req->error_code = -EFAULT;
             return -EFAULT;
@@ -189,6 +206,7 @@ long lsw_syscall_NtReadFile(struct lsw_syscall_request *req)
         lsw_info("Copied %llu bytes to userspace buffer at 0x%llx", bytes_read, buffer_ptr);
     }
     
+    kfree(temp_buffer);
     req->return_value = bytes_read;
     req->error_code = 0;
     
@@ -204,18 +222,28 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
     __u64 buffer_ptr = req->args[1];  /* Userspace buffer pointer */
     __u64 size = req->args[2];
     __u64 bytes_written = 0;
-    char kernel_buffer[4096];
+    char *kernel_buffer;
     int ret;
     size_t copy_size;
     
     lsw_info("NtWriteFile: handle=0x%llx, buffer=0x%llx, size=%llu", handle, buffer_ptr, size);
     
+    /* Allocate buffer on heap to avoid stack frame issues */
+    kernel_buffer = kmalloc(4096, GFP_KERNEL);
+    if (!kernel_buffer) {
+        lsw_err("Failed to allocate kernel buffer");
+        req->return_value = 0;
+        req->error_code = -ENOMEM;
+        return -ENOMEM;
+    }
+    
     /* Limit size to our buffer */
-    copy_size = size > sizeof(kernel_buffer) ? sizeof(kernel_buffer) : size;
+    copy_size = size > 4096 ? 4096 : size;
     
     /* Copy data from userspace */
     if (copy_from_user(kernel_buffer, (void __user *)buffer_ptr, copy_size)) {
         lsw_err("Failed to copy buffer from userspace");
+        kfree(kernel_buffer);
         req->return_value = 0;
         req->error_code = -EFAULT;
         return -EFAULT;
@@ -223,6 +251,8 @@ long lsw_syscall_NtWriteFile(struct lsw_syscall_request *req)
     
     /* Write via LSW file manager */
     ret = lsw_file_write(handle, kernel_buffer, copy_size, &bytes_written);
+    
+    kfree(kernel_buffer);
     
     if (ret != 0) {
         lsw_err("File write failed: %d", ret);
@@ -524,8 +554,15 @@ long lsw_syscall_NtQuerySystemInformation(struct lsw_syscall_request *req)
         rcu_read_lock();
         for_each_process(task) {
             if (process_count < 10) {  /* Show first 10 for demo */
-                lsw_info("  Process: PID=%d, name=%s, state=%ld",
-                         task->pid, task->comm, task->__state);
+                /* Kernel API compatibility: __state (5.14+) vs state (older) */
+                unsigned int task_state;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,14,0)
+                task_state = (unsigned int)READ_ONCE(task->__state);
+#else
+                task_state = (unsigned int)task->state;
+#endif
+                lsw_info("  Process: PID=%d, name=%s, state=%u",
+                         task->pid, task->comm, task_state);
             }
             process_count++;
         }
@@ -845,6 +882,78 @@ long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req)
     }
     
     req->return_value = 0;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LswGetStdHandle - Get standard console handle
+ */
+long lsw_syscall_LswGetStdHandle(struct lsw_syscall_request *req)
+{
+    __u32 std_handle = req->args[0];
+    __u64 handle;
+    
+    lsw_info("LswGetStdHandle: std_handle=%u", std_handle);
+    
+    handle = lsw_console_GetStdHandle(std_handle);
+    
+    req->return_value = handle;
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LswWriteConsole - Write to console
+ */
+long lsw_syscall_LswWriteConsole(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    const void __user *buffer = (const void __user *)req->args[1];
+    __u32 chars_to_write = req->args[2];
+    __u32 __user *chars_written_ptr = (__u32 __user *)req->args[3];
+    int ret;
+    
+    lsw_info("LswWriteConsole: handle=0x%llx, chars=%u", handle, chars_to_write);
+    
+    ret = lsw_console_WriteConsole(handle, buffer, chars_to_write, chars_written_ptr);
+    
+    if (ret < 0) {
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 1;  /* Success */
+    req->error_code = 0;
+    
+    return 0;
+}
+
+/**
+ * lsw_syscall_LswReadConsole - Read from console
+ */
+long lsw_syscall_LswReadConsole(struct lsw_syscall_request *req)
+{
+    __u64 handle = req->args[0];
+    void __user *buffer = (void __user *)req->args[1];
+    __u32 chars_to_read = req->args[2];
+    __u32 __user *chars_read_ptr = (__u32 __user *)req->args[3];
+    int ret;
+    
+    lsw_info("LswReadConsole: handle=0x%llx, chars=%u", handle, chars_to_read);
+    
+    ret = lsw_console_ReadConsole(handle, buffer, chars_to_read, chars_read_ptr);
+    
+    if (ret < 0) {
+        req->return_value = 0;
+        req->error_code = ret;
+        return ret;
+    }
+    
+    req->return_value = 1;  /* Success */
     req->error_code = 0;
     
     return 0;

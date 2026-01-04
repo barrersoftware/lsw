@@ -39,6 +39,9 @@
 #define LSW_SYSCALL_NtTerminateProcess    0x002c
 #define LSW_SYSCALL_LswGetFileSize        0x1000  /* LSW custom - Get file size */
 #define LSW_SYSCALL_LswSetFilePointer     0x1001  /* LSW custom - Set file pointer */
+#define LSW_SYSCALL_LswWriteConsole       0x1002  /* LSW custom - Write to console */
+#define LSW_SYSCALL_LswReadConsole        0x1003  /* LSW custom - Read from console */
+#define LSW_SYSCALL_LswGetStdHandle       0x1004  /* LSW custom - Get standard handle */
 
 /* Syscall request structure from userspace */
 struct lsw_syscall_request {

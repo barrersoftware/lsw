@@ -6,9 +6,12 @@
 
 #include "lsw_filesystem.h"
 #include "lsw_config.h"
+#include "lsw_log.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <ctype.h>
 
 // Global config (loaded at startup)
@@ -76,6 +79,11 @@ lsw_status_t lsw_fs_win_to_linux(
         const char* path_part = windows_path + 2;
         if (*path_part == '\\' || *path_part == '/') {
             path_part++;  // Skip the leading slash
+        }
+        
+        // Add separator slash between drive root and path
+        if (pos > 0 && linux_path[pos-1] != '/') {
+            linux_path[pos++] = '/';
         }
         
         // Copy rest of path, converting backslashes to forward slashes
@@ -278,22 +286,45 @@ lsw_status_t lsw_fs_get_special_folder(
 lsw_status_t lsw_fs_init_prefix(void) {
     ensure_config();
     
-    const char* home = getenv("HOME");
-    if (!home) return LSW_ERROR_INVALID_PARAMETER;
+    LSW_LOG_INFO("Initializing LSW prefix structure");
     
+    // Config already handles SUDO_USER detection
     const char* c_root = g_config.c_drive_root;
+    
+    LSW_LOG_INFO("C: drive root: %s", c_root);
+    
+    // Extract home from c_root (remove /.lsw/drives/c suffix)
+    char home[LSW_MAX_PATH];
+    strncpy(home, c_root, sizeof(home) - 1);
+    home[sizeof(home) - 1] = '\0';
+    
+    // Find the /.lsw part and truncate there
+    char* lsw_pos = strstr(home, "/.lsw");
+    if (!lsw_pos) {
+        LSW_LOG_WARN("Could not find /.lsw in path: %s", c_root);
+        return LSW_ERROR_INVALID_PARAMETER;
+    }
+    *lsw_pos = '\0';
+    
+    LSW_LOG_INFO("User home: %s", home);
+    
     char path[LSW_MAX_PATH];
     
     // Create base: ~/.lsw/
     snprintf(path, sizeof(path), "%s/.lsw", home);
+    LSW_LOG_INFO("Creating: %s", path);
     mkdir(path, 0755);
     
     // Create: ~/.lsw/drives/
     snprintf(path, sizeof(path), "%s/.lsw/drives", home);
+    LSW_LOG_INFO("Creating: %s", path);
     mkdir(path, 0755);
     
     // Create: C: drive root
+    LSW_LOG_INFO("Creating: %s", c_root);
     mkdir(c_root, 0755);
+    
+    LSW_LOG_INFO("LSW prefix initialized successfully");
     
     // Create: Windows/
     snprintf(path, sizeof(path), "%s/Windows", c_root);

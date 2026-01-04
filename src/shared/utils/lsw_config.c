@@ -30,7 +30,18 @@ void lsw_config_defaults(lsw_config_t* config) {
     
     // Filesystem - C: drive maps to isolated LSW prefix
     // ~/.lsw/drives/c/ - SAFE, production-ready architecture
-    const char* home = getenv("HOME");
+    const char* sudo_user = getenv("SUDO_USER");
+    const char* home;
+    char real_home[LSW_MAX_PATH];
+    
+    if (sudo_user && sudo_user[0] != '\0') {
+        // Running under sudo - use real user's home
+        snprintf(real_home, sizeof(real_home), "/home/%s", sudo_user);
+        home = real_home;
+    } else {
+        home = getenv("HOME");
+    }
+    
     if (home) {
         snprintf(config->c_drive_root, sizeof(config->c_drive_root),
                 "%s/.lsw/drives/c", home);

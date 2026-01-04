@@ -6,3 +6,5 @@
 /home/ssfdre38/lsw-project/kernel-module/lsw_sync.o
 /home/ssfdre38/lsw-project/kernel-module/lsw_dll.o
 /home/ssfdre38/lsw-project/kernel-module/lsw_process.o
+/home/ssfdre38/lsw-project/kernel-module/lsw_console.o
+/home/ssfdre38/lsw-project/kernel-module/lsw_env.o

@@ -52,6 +52,13 @@ struct lsw_state {
 
 extern struct lsw_state lsw_module_state;
 
+/* Console subsystem */
+int lsw_console_init(void);
+void lsw_console_cleanup(void);
+__u64 lsw_console_GetStdHandle(__u32 std_handle);
+int lsw_console_WriteConsole(__u64 handle, const void __user *buffer, __u32 chars_to_write, __u32 __user *chars_written_ptr);
+int lsw_console_ReadConsole(__u64 handle, void __user *buffer, __u32 chars_to_read, __u32 __user *chars_read_ptr);
+
 /* Module initialization/cleanup */
 int lsw_module_init(void);
 void lsw_module_exit(void);
