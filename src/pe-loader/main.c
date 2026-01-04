@@ -7,6 +7,7 @@
 #include "lsw_types.h"
 #include "lsw_log.h"
 #include "lsw_filesystem.h"
+#include "lsw_registry.h"
 #include "pe-loader/pe_loader.h"
 #include "pe-loader/pe_parser.h"
 #include "pe-loader/pe_format.h"
@@ -278,6 +279,9 @@ int main(int argc, char* argv[]) {
     if (init_result != LSW_SUCCESS) {
         LSW_LOG_WARN("Failed to initialize LSW prefix directories");
     }
+    
+    // Populate registry with default environment (first run)
+    lsw_reg_populate_environment();
     
     // Check if file exists
     if (!lsw_fs_path_exists(executable_path)) {

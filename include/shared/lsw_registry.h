@@ -178,4 +178,13 @@ lsw_status_t lsw_reg_get_path(
  */
 lsw_status_t lsw_reg_init(void);
 
+/**
+ * Populate registry with default environment
+ * 
+ * What: Pre-populate Windows system registry keys
+ * Why: Apps expect standard Windows registry structure
+ * How: Create HKLM/HKCU keys with version info, paths, etc.
+ */
+lsw_status_t lsw_reg_populate_environment(void);
+
 #endif // LSW_REGISTRY_H

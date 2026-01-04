@@ -444,3 +444,95 @@ lsw_status_t lsw_reg_query_value(
 }
 
 // TODO: Implement remaining functions (delete, enum) as needed
+
+// ============================================================================
+// SECTION: Registry Environment Population
+// ============================================================================
+
+/**
+ * Populate default registry environment
+ * 
+ * What: Pre-populate registry with Windows system keys
+ * Why: Apps expect these keys to exist
+ * How: Create standard Windows registry structure
+ */
+lsw_status_t lsw_reg_populate_environment(void) {
+    LSW_LOG_INFO("Populating registry with default environment");
+    
+    HANDLE hkey;
+    lsw_status_t status;
+    DWORD dword_value;
+    
+    // HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion
+    status = lsw_reg_create_key(LSW_HKEY_LOCAL_MACHINE, 
+                                 "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", 
+                                 &hkey);
+    if (status == LSW_SUCCESS) {
+        const char* product_name = "Windows 10 Pro";
+        lsw_reg_set_value(hkey, "ProductName", LSW_REG_SZ, 
+                         product_name, strlen(product_name) + 1);
+        
+        const char* version = "10.0";
+        lsw_reg_set_value(hkey, "CurrentVersion", LSW_REG_SZ,
+                         version, strlen(version) + 1);
+        
+        const char* build = "19045";
+        lsw_reg_set_value(hkey, "CurrentBuildNumber", LSW_REG_SZ,
+                         build, strlen(build) + 1);
+        
+        const char* program_files = "C:\\Program Files";
+        lsw_reg_set_value(hkey, "ProgramFilesDir", LSW_REG_SZ,
+                         program_files, strlen(program_files) + 1);
+        
+        lsw_reg_close_key(hkey);
+        LSW_LOG_INFO("Created Windows CurrentVersion keys");
+    }
+    
+    // HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion
+    status = lsw_reg_create_key(LSW_HKEY_LOCAL_MACHINE,
+                                 "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                                 &hkey);
+    if (status == LSW_SUCCESS) {
+        dword_value = 10;
+        lsw_reg_set_value(hkey, "CurrentMajorVersionNumber", LSW_REG_DWORD,
+                         &dword_value, sizeof(dword_value));
+        
+        dword_value = 0;
+        lsw_reg_set_value(hkey, "CurrentMinorVersionNumber", LSW_REG_DWORD,
+                         &dword_value, sizeof(dword_value));
+        
+        const char* build_lab = "19045.lsw.barrersoftware";
+        lsw_reg_set_value(hkey, "BuildLab", LSW_REG_SZ,
+                         build_lab, strlen(build_lab) + 1);
+        
+        lsw_reg_close_key(hkey);
+        LSW_LOG_INFO("Created Windows NT CurrentVersion keys");
+    }
+    
+    // System environment
+    status = lsw_reg_create_key(LSW_HKEY_LOCAL_MACHINE,
+                                 "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                                 &hkey);
+    if (status == LSW_SUCCESS) {
+        const char* arch = "AMD64";
+        lsw_reg_set_value(hkey, "PROCESSOR_ARCHITECTURE", LSW_REG_SZ,
+                         arch, strlen(arch) + 1);
+        
+        char num_proc[16];
+        snprintf(num_proc, sizeof(num_proc), "%ld", sysconf(_SC_NPROCESSORS_ONLN));
+        lsw_reg_set_value(hkey, "NUMBER_OF_PROCESSORS", LSW_REG_SZ,
+                         num_proc, strlen(num_proc) + 1);
+        
+        const char* windir = "C:\\Windows";
+        lsw_reg_set_value(hkey, "windir", LSW_REG_SZ,
+                         windir, strlen(windir) + 1);
+        lsw_reg_set_value(hkey, "SystemRoot", LSW_REG_SZ,
+                         windir, strlen(windir) + 1);
+        
+        lsw_reg_close_key(hkey);
+        LSW_LOG_INFO("Created system environment variables");
+    }
+    
+    LSW_LOG_INFO("Registry environment population complete");
+    return LSW_SUCCESS;
+}
