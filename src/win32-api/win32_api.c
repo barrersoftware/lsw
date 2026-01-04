@@ -603,24 +603,8 @@ int __attribute__((ms_abi)) lsw_WriteConsoleA(void* handle, const void* buffer, 
         return 0;
     }
     
-    // If kernel fd is available, route through kernel module
-    if (g_kernel_fd >= 0) {
-        struct lsw_syscall_request req;
-        memset(&req, 0, sizeof(req));
-        req.syscall_number = LSW_SYSCALL_LswWriteConsole;
-        req.arg_count = 4;
-        req.args[0] = (uint64_t)(uintptr_t)handle;
-        req.args[1] = (uint64_t)(uintptr_t)buffer;
-        req.args[2] = chars_to_write;
-        req.args[3] = (uint64_t)(uintptr_t)chars_written;
-        
-        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
-            return (int)req.return_value;
-        }
-        LSW_LOG_ERROR("Kernel ioctl failed for WriteConsole: %s", strerror(errno));
-    }
-    
-    // Fallback to direct userspace implementation
+    // Console I/O always handled in userspace
+    // kernel_write() to stdout/stderr fails with -EPIPE in kernel context
     int fd = -1;
     if (handle == STD_OUTPUT_HANDLE) {
         fd = STDOUT_FILENO;
