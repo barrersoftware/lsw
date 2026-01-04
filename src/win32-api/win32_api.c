@@ -7,6 +7,7 @@
  */
 
 #include "win32_api.h"
+#include "win32_teb.h"
 #include "lsw_log.h"
 #include "shared/lsw_kernel_client.h"
 #include "shared/lsw_filesystem.h"
@@ -1087,6 +1088,19 @@ int __attribute__((ms_abi)) lsw_lstrlenA(const char* str) {
     return (int)strlen(str);
 }
 
+// kernel32.dll!GetCommandLineA - Get command line string
+LPSTR __attribute__((ms_abi)) lsw_GetCommandLineA(void) {
+    const char* cmdline = win32_get_command_line();
+    LSW_LOG_DEBUG("GetCommandLineA() -> '%s'", cmdline);
+    return (LPSTR)cmdline;
+}
+
+// kernel32.dll!ExitProcess - Terminate process
+void __attribute__((ms_abi)) lsw_ExitProcess(DWORD exit_code) {
+    LSW_LOG_INFO("ExitProcess(%u)", exit_code);
+    exit(exit_code);
+}
+
 // Disable pedantic warnings for function pointer to void* casts
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -1151,6 +1165,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetModuleHandleA", (void*)lsw_GetModuleHandleA},
     {"KERNEL32.dll", "GetStdHandle", (void*)lsw_GetStdHandle},
     {"KERNEL32.dll", "WriteConsoleA", (void*)lsw_WriteConsoleA},
+    {"KERNEL32.dll", "GetCommandLineA", (void*)lsw_GetCommandLineA},
+    {"KERNEL32.dll", "ExitProcess", (void*)lsw_ExitProcess},
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
     {"KERNEL32.dll", "ExitThread", (void*)lsw_ExitThread},
     {"KERNEL32.dll", "WaitForSingleObject", (void*)lsw_WaitForSingleObject},

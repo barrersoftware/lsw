@@ -165,6 +165,7 @@ int main(int argc, char* argv[]) {
     lsw_windows_version_t win_version = LSW_WIN_AUTO;
     uint32_t cpu_speed_mhz = 0;  // 0 = native
     char* executable_path = NULL;
+    int executable_index = -1; // Track where in argv the .exe is
     
     // Check for help requests (forgiving!)
     for (int i = 1; i < argc; i++) {
@@ -191,7 +192,8 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--launch") == 0) {
             if (i + 1 < argc) {
-                executable_path = argv[++i];
+                executable_index = ++i;
+                executable_path = argv[i];
             } else {
                 fprintf(stderr, "❌ Error: --launch requires a file path\n\n");
                 fprintf(stderr, "Example: lsw --launch yourapp.exe\n");
@@ -318,8 +320,22 @@ int main(int argc, char* argv[]) {
     printf("Sections: %u\n", image.pe.num_sections);
     printf("\n");
     
+    // Build PE-specific argc/argv (starting from executable, including all args after)
+    int pe_argc = 0;
+    char** pe_argv = NULL;
+    
+    if (executable_index >= 0) {
+        // Count remaining args after executable
+        pe_argc = argc - executable_index;
+        pe_argv = &argv[executable_index];
+    } else {
+        // No arguments - just executable
+        pe_argc = 1;
+        pe_argv = &executable_path;
+    }
+    
     // Execute
-    int exit_code = pe_execute(&image, argc, argv);
+    int exit_code = pe_execute(&image, pe_argc, pe_argv);
     
     // Clean up
     pe_unload_image(&image);

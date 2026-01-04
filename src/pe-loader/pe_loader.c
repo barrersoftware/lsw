@@ -366,6 +366,10 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
         return -1;
     }
     
+    // Set command line from argc/argv
+    win32_set_command_line(argc, argv);
+    LSW_LOG_INFO("Command line arguments: %d args", argc);
+    
     // Set PEB image base
     win32_teb_t* teb = win32_teb_get();
     if (teb && teb->ProcessEnvironmentBlock) {

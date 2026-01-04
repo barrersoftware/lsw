@@ -82,10 +82,43 @@ typedef struct {
     uint32_t NtGlobalFlag;             // 0xBC
 } win32_peb_t;
 
+// RTL_USER_PROCESS_PARAMETERS structure (simplified)
+typedef struct {
+    uint32_t MaximumLength;
+    uint32_t Length;
+    uint32_t Flags;
+    uint32_t DebugFlags;
+    void* ConsoleHandle;
+    uint32_t ConsoleFlags;
+    void* StandardInput;
+    void* StandardOutput;
+    void* StandardError;
+    char* CurrentDirectory;          // Simplified - should be UNICODE_STRING
+    char* DllPath;
+    char* ImagePathName;
+    char* CommandLine;               // Full command line string
+    void* Environment;
+    uint32_t StartingX;
+    uint32_t StartingY;
+    uint32_t CountX;
+    uint32_t CountY;
+    uint32_t CountCharsX;
+    uint32_t CountCharsY;
+    uint32_t FillAttribute;
+    uint32_t WindowFlags;
+    uint32_t ShowWindowFlags;
+} win32_process_params_t;
+
 // Initialize TEB/PEB for current thread
 int win32_teb_init(void);
 
 // Get current TEB
 win32_teb_t* win32_teb_get(void);
+
+// Set command line (called by PE loader)
+void win32_set_command_line(int argc, char** argv);
+
+// Get command line (for GetCommandLineA/W)
+const char* win32_get_command_line(void);
 
 #endif // LSW_WIN32_TEB_H
