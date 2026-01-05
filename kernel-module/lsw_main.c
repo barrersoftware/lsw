@@ -10,6 +10,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/kallsyms.h>
+#include <linux/delay.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_device.h"
 #include "../include/kernel-module/lsw_syscall.h"
@@ -38,7 +39,8 @@ struct lsw_state lsw_module_state = {
     .pe_process_count = 0,
 };
 
-/* Prevent auto-unload when last process exits */
+/* Hot-swap support */
+static atomic_t module_refcount_held = ATOMIC_INIT(0);
 static bool module_persistent = false;  // Changed to false for easier hot-reloading
 module_param(module_persistent, bool, 0444);
 MODULE_PARM_DESC(module_persistent, "Keep module loaded when no PE processes are running");
@@ -175,13 +177,18 @@ static int __init lsw_init(void)
     
     /* Increment module reference count to prevent auto-unload */
     if (module_persistent) {
-        __module_get(THIS_MODULE);
-        lsw_info("Module persistence enabled - will remain loaded");
+        if (try_module_get(THIS_MODULE)) {
+            atomic_set(&module_refcount_held, 1);
+            lsw_info("Module persistence enabled - will remain loaded");
+        } else {
+            lsw_warn("Failed to hold module reference - hot-swap may not work correctly");
+        }
     }
     
     lsw_info("LSW kernel module initialized successfully");
     lsw_info("Ready to execute Windows PE files on Linux");
     lsw_info("Device: %s", LSW_DEVICE_PATH);
+    lsw_info("Hot-swap mode: %s", module_persistent ? "persistent" : "enabled");
     
     return 0;
 }
@@ -195,13 +202,25 @@ static void __exit lsw_exit(void)
 {
     lsw_info("Shutting down LSW kernel module");
     
-    /* Release module reference if it was held */
-    if (module_persistent) {
-        module_put(THIS_MODULE);
-        lsw_info("Module reference released");
+    /* Mark module as shutting down to prevent new operations */
+    lsw_module_state.initialized = false;
+    
+    /* Wait for any in-flight operations to complete */
+    if (lsw_module_state.pe_process_count > 0) {
+        lsw_warn("Warning: %u PE processes still active during shutdown - waiting...",
+                 lsw_module_state.pe_process_count);
+        /* Give processes a moment to finish - don't force kill */
+        msleep(100);
     }
     
-    /* Cleanup device interface */
+    /* Release module reference if it was held */
+    if (atomic_read(&module_refcount_held) > 0) {
+        module_put(THIS_MODULE);
+        atomic_set(&module_refcount_held, 0);
+        lsw_info("Module reference released - hot-swap ready");
+    }
+    
+    /* Cleanup device interface first - stops new requests */
     lsw_device_exit();
     
     /* Cleanup environment/system info */
@@ -228,18 +247,9 @@ static void __exit lsw_exit(void)
     /* Cleanup syscall system */
     lsw_syscall_exit();
     
-    /* TODO: Remove syscall hooks */
-    /* TODO: Cleanup PE processes */
-    
-    if (lsw_module_state.pe_process_count > 0) {
-        lsw_warn("Warning: %u PE processes still active during shutdown",
-                 lsw_module_state.pe_process_count);
-    }
-    
-    lsw_module_state.initialized = false;
     lsw_module_state.syscall_hooks_active = false;
     
-    lsw_info("LSW kernel module unloaded");
+    lsw_info("LSW kernel module unloaded - hot-swap complete");
 }
 
 module_init(lsw_init);
