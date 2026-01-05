@@ -38,6 +38,20 @@
 #define LSW_IOCTL_MAGIC 'L'
 #define LSW_IOCTL_SYSCALL _IOWR(LSW_IOCTL_MAGIC, 5, struct lsw_syscall_request)
 
+// Code page constants
+#define CP_ACP 0        // ANSI code page
+#define CP_UTF8 65001   // UTF-8 code page
+
+// Windows File Attributes
+#define FILE_ATTRIBUTE_READONLY             0x00000001
+#define FILE_ATTRIBUTE_HIDDEN               0x00000002
+#define FILE_ATTRIBUTE_SYSTEM               0x00000004
+#define FILE_ATTRIBUTE_DIRECTORY            0x00000010
+#define FILE_ATTRIBUTE_ARCHIVE              0x00000020
+#define FILE_ATTRIBUTE_NORMAL               0x00000080
+#define FILE_ATTRIBUTE_TEMPORARY            0x00000100
+#define INVALID_FILE_ATTRIBUTES             0xFFFFFFFF
+
 // Global kernel fd for syscalls
 static int g_kernel_fd = -1;
 
@@ -368,21 +382,51 @@ int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsig
     (void)codepage;
     (void)flags;
     (void)defchar;
-    (void)used_default;
+    
+    if (!src) {
+        return 0;
+    }
+    
+    // Calculate source length if not provided
+    size_t actual_srclen;
+    if (srclen == -1) {
+        actual_srclen = wcslen(src);
+    } else {
+        actual_srclen = (size_t)srclen;
+    }
     
     if (!dst) {
-        // Return required size
-        return srclen >= 0 ? srclen : (int)wcslen(src);
+        // Return required size (pessimistic: assume each wchar needs 4 bytes in UTF-8)
+        return (int)(actual_srclen * 4 + 1);
     }
     
-    int len = srclen >= 0 ? srclen : (int)wcslen(src);
-    if (len > dstlen) len = dstlen;
-    
-    for (int i = 0; i < len; i++) {
-        dst[i] = (char)(src[i] & 0xFF);
+    // Simple conversion: assume ASCII/Latin-1 range for now
+    // TODO: Implement proper UTF-16 to UTF-8 conversion
+    size_t i;
+    for (i = 0; i < actual_srclen && i < (size_t)(dstlen - 1); i++) {
+        if (src[i] < 0x80) {
+            // ASCII range - direct copy
+            dst[i] = (char)src[i];
+        } else if (src[i] < 0x800) {
+            // 2-byte UTF-8 sequence
+            if (i + 1 >= (size_t)dstlen) break;
+            dst[i++] = (char)(0xC0 | ((src[i] >> 6) & 0x1F));
+            dst[i] = (char)(0x80 | (src[i] & 0x3F));
+        } else {
+            // For now, replace non-ASCII with '?'
+            dst[i] = '?';
+        }
+        
+        if (src[i] == 0) break;  // Null terminator
     }
     
-    return len;
+    dst[i] = '\0';
+    
+    if (used_default) {
+        *used_default = 0;
+    }
+    
+    return (int)i;
 }
 
 void* __attribute__((ms_abi)) lsw_TlsGetValue(unsigned long index) {
@@ -498,15 +542,15 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         
         if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
             uint64_t handle = req.return_value;
-            if (handle == (uint64_t)-1 || handle == 0) {
-                LSW_LOG_WARN("Kernel NtCreateFile failed: error=%d", req.error_code);
-                return INVALID_HANDLE_VALUE;
+            if (handle != (uint64_t)-1 && handle != 0) {
+                // Success! Return the kernel handle
+                LSW_LOG_INFO("Kernel NtCreateFile success: handle=0x%llx", handle);
+                return (void*)(uintptr_t)handle;
             }
-            LSW_LOG_INFO("Kernel NtCreateFile success: handle=0x%llx", handle);
-            return (void*)(uintptr_t)handle;
+            // Kernel call succeeded but returned error - fall through to userspace
+            LSW_LOG_WARN("Kernel NtCreateFile failed: error=%d, falling back to userspace", req.error_code);
         } else {
-            LSW_LOG_ERROR("Kernel ioctl failed for NtCreateFile: %s", strerror(errno));
-            // Fall through to userspace implementation
+            LSW_LOG_ERROR("Kernel ioctl failed for NtCreateFile: %s, falling back to userspace", strerror(errno));
         }
     }
     
@@ -855,6 +899,346 @@ int __attribute__((ms_abi)) lsw_DeleteFileA(const char* filename) {
     }
     
     LSW_LOG_INFO("DeleteFileA: successfully deleted %s", linux_path);
+    return 1; // TRUE
+}
+
+// Wide-char file operations
+void* __attribute__((ms_abi)) lsw_CreateFileW(const wchar_t* filename, uint32_t access, uint32_t share_mode,
+                                                void* security, uint32_t creation, uint32_t flags, void* template_file) {
+    LSW_LOG_INFO("CreateFileW called");
+    
+    if (!filename) {
+        LSW_LOG_ERROR("CreateFileW: null filename");
+        return INVALID_HANDLE_VALUE;
+    }
+    
+    // Convert wide-char to multi-byte
+    char filename_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, filename, -1, filename_mb, sizeof(filename_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("CreateFileW: WideCharToMultiByte failed");
+        return INVALID_HANDLE_VALUE;
+    }
+    
+    LSW_LOG_INFO("CreateFileW: %s", filename_mb);
+    
+    // Call CreateFileA with converted path
+    return lsw_CreateFileA(filename_mb, access, share_mode, security, creation, flags, template_file);
+}
+
+int __attribute__((ms_abi)) lsw_DeleteFileW(const wchar_t* filename) {
+    LSW_LOG_INFO("DeleteFileW called");
+    
+    if (!filename) {
+        LSW_LOG_ERROR("DeleteFileW: null filename");
+        return 0; // FALSE
+    }
+    
+    // Convert wide-char to multi-byte
+    char filename_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, filename, -1, filename_mb, sizeof(filename_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("DeleteFileW: WideCharToMultiByte failed");
+        return 0;
+    }
+    
+    LSW_LOG_INFO("DeleteFileW: %s", filename_mb);
+    
+    // Call DeleteFileA with converted path
+    return lsw_DeleteFileA(filename_mb);
+}
+
+int __attribute__((ms_abi)) lsw_CopyFileW(const wchar_t* existing_file, const wchar_t* new_file, int fail_if_exists) {
+    LSW_LOG_INFO("CopyFileW called");
+    
+    if (!existing_file || !new_file) {
+        LSW_LOG_ERROR("CopyFileW: null filename");
+        return 0; // FALSE
+    }
+    
+    // Convert wide-char paths to multi-byte
+    char existing_mb[LSW_MAX_PATH];
+    char new_mb[LSW_MAX_PATH];
+    
+    if (lsw_WideCharToMultiByte(CP_UTF8, 0, existing_file, -1, existing_mb, sizeof(existing_mb), NULL, NULL) == 0) {
+        LSW_LOG_ERROR("CopyFileW: WideCharToMultiByte failed for source");
+        return 0;
+    }
+    
+    if (lsw_WideCharToMultiByte(CP_UTF8, 0, new_file, -1, new_mb, sizeof(new_mb), NULL, NULL) == 0) {
+        LSW_LOG_ERROR("CopyFileW: WideCharToMultiByte failed for dest");
+        return 0;
+    }
+    
+    // Translate Windows paths to Linux paths
+    char existing_linux[LSW_MAX_PATH];
+    char new_linux[LSW_MAX_PATH];
+    
+    if (lsw_fs_win_to_linux(existing_mb, existing_linux, sizeof(existing_linux)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("CopyFileW: path translation failed for source");
+        return 0;
+    }
+    
+    if (lsw_fs_win_to_linux(new_mb, new_linux, sizeof(new_linux)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("CopyFileW: path translation failed for dest");
+        return 0;
+    }
+    
+    LSW_LOG_INFO("CopyFileW: %s -> %s (fail_if_exists=%d)", existing_linux, new_linux, fail_if_exists);
+    
+    // Check if destination exists and fail_if_exists is set
+    if (fail_if_exists) {
+        struct stat st;
+        if (stat(new_linux, &st) == 0) {
+            LSW_LOG_WARN("CopyFileW: destination exists and fail_if_exists=TRUE");
+            return 0;
+        }
+    }
+    
+    // Open source file
+    int src_fd = open(existing_linux, O_RDONLY);
+    if (src_fd < 0) {
+        LSW_LOG_ERROR("CopyFileW: failed to open source: %s", strerror(errno));
+        return 0;
+    }
+    
+    // Get source file permissions
+    struct stat src_stat;
+    if (fstat(src_fd, &src_stat) != 0) {
+        LSW_LOG_ERROR("CopyFileW: fstat failed: %s", strerror(errno));
+        close(src_fd);
+        return 0;
+    }
+    
+    // Open/create destination file
+    int dst_fd = open(new_linux, O_WRONLY | O_CREAT | O_TRUNC, src_stat.st_mode);
+    if (dst_fd < 0) {
+        LSW_LOG_ERROR("CopyFileW: failed to create destination: %s", strerror(errno));
+        close(src_fd);
+        return 0;
+    }
+    
+    // Copy file contents
+    char buffer[8192];
+    ssize_t bytes_read;
+    int success = 1;
+    
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        ssize_t bytes_written = write(dst_fd, buffer, bytes_read);
+        if (bytes_written != bytes_read) {
+            LSW_LOG_ERROR("CopyFileW: write failed: %s", strerror(errno));
+            success = 0;
+            break;
+        }
+    }
+    
+    if (bytes_read < 0) {
+        LSW_LOG_ERROR("CopyFileW: read failed: %s", strerror(errno));
+        success = 0;
+    }
+    
+    close(src_fd);
+    close(dst_fd);
+    
+    if (!success) {
+        // Clean up failed copy
+        unlink(new_linux);
+        return 0;
+    }
+    
+    LSW_LOG_INFO("CopyFileW: successfully copied file");
+    return 1; // TRUE
+}
+
+// Directory operations
+int __attribute__((ms_abi)) lsw_CreateDirectoryW(const wchar_t* pathname, void* security_attributes) {
+    LSW_LOG_INFO("CreateDirectoryW called");
+    
+    (void)security_attributes;  // Not used
+    
+    if (!pathname) {
+        LSW_LOG_ERROR("CreateDirectoryW: null pathname");
+        return 0; // FALSE
+    }
+    
+    // Convert wide-char to multi-byte
+    char pathname_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, pathname, -1, pathname_mb, sizeof(pathname_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("CreateDirectoryW: WideCharToMultiByte failed");
+        return 0;
+    }
+    
+    // Translate Windows path to Linux path
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(pathname_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("CreateDirectoryW: path translation failed");
+        return 0;
+    }
+    
+    LSW_LOG_INFO("CreateDirectoryW: %s -> %s", pathname_mb, linux_path);
+    
+    // Create directory with standard permissions
+    if (mkdir(linux_path, 0755) != 0) {
+        if (errno == EEXIST) {
+            LSW_LOG_WARN("CreateDirectoryW: directory already exists: %s", linux_path);
+            // Windows returns FALSE if directory exists
+            return 0;
+        }
+        LSW_LOG_ERROR("CreateDirectoryW: mkdir failed: %s", strerror(errno));
+        return 0;
+    }
+    
+    LSW_LOG_INFO("CreateDirectoryW: successfully created directory");
+    return 1; // TRUE
+}
+
+int __attribute__((ms_abi)) lsw_RemoveDirectoryW(const wchar_t* pathname) {
+    LSW_LOG_INFO("RemoveDirectoryW called");
+    
+    if (!pathname) {
+        LSW_LOG_ERROR("RemoveDirectoryW: null pathname");
+        return 0; // FALSE
+    }
+    
+    // Convert wide-char to multi-byte
+    char pathname_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, pathname, -1, pathname_mb, sizeof(pathname_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("RemoveDirectoryW: WideCharToMultiByte failed");
+        return 0;
+    }
+    
+    // Translate Windows path to Linux path
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(pathname_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("RemoveDirectoryW: path translation failed");
+        return 0;
+    }
+    
+    LSW_LOG_INFO("RemoveDirectoryW: %s -> %s", pathname_mb, linux_path);
+    
+    // Remove directory (must be empty)
+    if (rmdir(linux_path) != 0) {
+        LSW_LOG_ERROR("RemoveDirectoryW: rmdir failed: %s", strerror(errno));
+        return 0;
+    }
+    
+    LSW_LOG_INFO("RemoveDirectoryW: successfully removed directory");
+    return 1; // TRUE
+}
+
+// File attribute operations
+uint32_t __attribute__((ms_abi)) lsw_GetFileAttributesW(const wchar_t* filename) {
+    LSW_LOG_INFO("GetFileAttributesW called");
+    
+    if (!filename) {
+        LSW_LOG_ERROR("GetFileAttributesW: null filename");
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    
+    // Convert wide-char to multi-byte
+    char filename_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, filename, -1, filename_mb, sizeof(filename_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("GetFileAttributesW: WideCharToMultiByte failed");
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    
+    // Translate Windows path to Linux path
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("GetFileAttributesW: path translation failed");
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    
+    LSW_LOG_INFO("GetFileAttributesW: %s -> %s", filename_mb, linux_path);
+    
+    // Get file stats
+    struct stat st;
+    if (stat(linux_path, &st) != 0) {
+        LSW_LOG_WARN("GetFileAttributesW: stat failed: %s", strerror(errno));
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    
+    // Translate Linux file mode to Windows attributes
+    uint32_t attrs = 0;
+    
+    // Check if directory
+    if (S_ISDIR(st.st_mode)) {
+        attrs |= FILE_ATTRIBUTE_DIRECTORY;
+    }
+    
+    // Check if read-only (write permission for owner)
+    if (!(st.st_mode & S_IWUSR)) {
+        attrs |= FILE_ATTRIBUTE_READONLY;
+    }
+    
+    // Check if hidden (Unix convention: starts with .)
+    const char* basename = strrchr(linux_path, '/');
+    if (basename && basename[1] == '.') {
+        attrs |= FILE_ATTRIBUTE_HIDDEN;
+    }
+    
+    // Default to NORMAL if no special attributes
+    if (attrs == 0) {
+        attrs = FILE_ATTRIBUTE_NORMAL;
+    }
+    
+    LSW_LOG_INFO("GetFileAttributesW: attributes=0x%x", attrs);
+    return attrs;
+}
+
+int __attribute__((ms_abi)) lsw_SetFileAttributesW(const wchar_t* filename, uint32_t attributes) {
+    LSW_LOG_INFO("SetFileAttributesW called: attributes=0x%x", attributes);
+    
+    if (!filename) {
+        LSW_LOG_ERROR("SetFileAttributesW: null filename");
+        return 0; // FALSE
+    }
+    
+    // Convert wide-char to multi-byte
+    char filename_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, filename, -1, filename_mb, sizeof(filename_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("SetFileAttributesW: WideCharToMultiByte failed");
+        return 0;
+    }
+    
+    // Translate Windows path to Linux path
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("SetFileAttributesW: path translation failed");
+        return 0;
+    }
+    
+    LSW_LOG_INFO("SetFileAttributesW: %s -> %s", filename_mb, linux_path);
+    
+    // Get current file mode
+    struct stat st;
+    if (stat(linux_path, &st) != 0) {
+        LSW_LOG_ERROR("SetFileAttributesW: stat failed: %s", strerror(errno));
+        return 0;
+    }
+    
+    mode_t new_mode = st.st_mode;
+    
+    // Handle READONLY attribute
+    if (attributes & FILE_ATTRIBUTE_READONLY) {
+        // Remove write permissions
+        new_mode &= ~(S_IWUSR | S_IWGRP | S_IWOTH);
+    } else {
+        // Add write permission for owner
+        new_mode |= S_IWUSR;
+    }
+    
+    // Apply new permissions
+    if (chmod(linux_path, new_mode) != 0) {
+        LSW_LOG_ERROR("SetFileAttributesW: chmod failed: %s", strerror(errno));
+        return 0;
+    }
+    
+    LSW_LOG_INFO("SetFileAttributesW: successfully set attributes");
     return 1; // TRUE
 }
 
@@ -1677,6 +2061,13 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
     {"KERNEL32.dll", "SetFilePointer", (void*)lsw_SetFilePointer},
     {"KERNEL32.dll", "DeleteFileA", (void*)lsw_DeleteFileA},
+    {"KERNEL32.dll", "CreateFileW", (void*)lsw_CreateFileW},
+    {"KERNEL32.dll", "DeleteFileW", (void*)lsw_DeleteFileW},
+    {"KERNEL32.dll", "CopyFileW", (void*)lsw_CopyFileW},
+    {"KERNEL32.dll", "CreateDirectoryW", (void*)lsw_CreateDirectoryW},
+    {"KERNEL32.dll", "RemoveDirectoryW", (void*)lsw_RemoveDirectoryW},
+    {"KERNEL32.dll", "GetFileAttributesW", (void*)lsw_GetFileAttributesW},
+    {"KERNEL32.dll", "SetFileAttributesW", (void*)lsw_SetFileAttributesW},
     {"KERNEL32.dll", "LoadLibraryA", (void*)lsw_LoadLibraryA},
     {"KERNEL32.dll", "GetProcAddress", (void*)lsw_GetProcAddress},
     {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},

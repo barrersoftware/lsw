@@ -326,31 +326,118 @@ lsw_status_t lsw_fs_init_prefix(void) {
     
     LSW_LOG_INFO("LSW prefix initialized successfully");
     
-    // Create: Windows/
-    snprintf(path, sizeof(path), "%s/Windows", c_root);
-    mkdir(path, 0755);
+    // Create standard Windows directory structure
     
-    // Create: Windows/System32/
-    snprintf(path, sizeof(path), "%s/Windows/System32", c_root);
-    mkdir(path, 0755);
-    
-    // Create: Windows/Temp/
-    snprintf(path, sizeof(path), "%s/Windows/Temp", c_root);
+    // Create: PerfLogs/
+    snprintf(path, sizeof(path), "%s/PerfLogs", c_root);
     mkdir(path, 0755);
     
     // Create: Program Files/
     snprintf(path, sizeof(path), "%s/Program Files", c_root);
     mkdir(path, 0755);
     
+    // Create: Program Files (x86)/
+    snprintf(path, sizeof(path), "%s/Program Files (x86)", c_root);
+    mkdir(path, 0755);
+    
+    // Create: ProgramData/
+    snprintf(path, sizeof(path), "%s/ProgramData", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/
+    snprintf(path, sizeof(path), "%s/Windows", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/System32/ (CRITICAL - system DLLs)
+    snprintf(path, sizeof(path), "%s/Windows/System32", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/SysWOW64/ (CRITICAL - 32-bit DLLs on 64-bit)
+    snprintf(path, sizeof(path), "%s/Windows/SysWOW64", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Temp/
+    snprintf(path, sizeof(path), "%s/Windows/Temp", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Fonts/
+    snprintf(path, sizeof(path), "%s/Windows/Fonts", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/system/ (legacy 16-bit support)
+    snprintf(path, sizeof(path), "%s/Windows/system", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/INF/
+    snprintf(path, sizeof(path), "%s/Windows/INF", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Media/
+    snprintf(path, sizeof(path), "%s/Windows/Media", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Cursors/
+    snprintf(path, sizeof(path), "%s/Windows/Cursors", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/assembly/ (.NET GAC)
+    snprintf(path, sizeof(path), "%s/Windows/assembly", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Microsoft.NET/
+    snprintf(path, sizeof(path), "%s/Windows/Microsoft.NET", c_root);
+    mkdir(path, 0755);
+    
+    // Create: Windows/Help/
+    snprintf(path, sizeof(path), "%s/Windows/Help", c_root);
+    mkdir(path, 0755);
+    
     // Create: Users/
     snprintf(path, sizeof(path), "%s/Users", c_root);
     mkdir(path, 0755);
     
+    // Create: Users/Public/
+    snprintf(path, sizeof(path), "%s/Users/Public", c_root);
+    mkdir(path, 0755);
+    
     const char* user = getenv("USER");
     if (user) {
+        // Create user profile directory
         snprintf(path, sizeof(path), "%s/Users/%s", c_root, user);
         mkdir(path, 0755);
+        
+        // Create: Users/[username]/Desktop
+        snprintf(path, sizeof(path), "%s/Users/%s/Desktop", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/Documents
+        snprintf(path, sizeof(path), "%s/Users/%s/Documents", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/Downloads
+        snprintf(path, sizeof(path), "%s/Users/%s/Downloads", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/AppData
+        snprintf(path, sizeof(path), "%s/Users/%s/AppData", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/AppData/Local
+        snprintf(path, sizeof(path), "%s/Users/%s/AppData/Local", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/AppData/Roaming
+        snprintf(path, sizeof(path), "%s/Users/%s/AppData/Roaming", c_root, user);
+        mkdir(path, 0755);
+        
+        // Create: Users/[username]/AppData/LocalLow
+        snprintf(path, sizeof(path), "%s/Users/%s/AppData/LocalLow", c_root, user);
+        mkdir(path, 0755);
     }
+    
+    // Create: Temp/ (system temp folder - uppercase to match Windows)
+    snprintf(path, sizeof(path), "%s/Temp", c_root);
+    mkdir(path, 0755);
     
     // Create: Registry
     snprintf(path, sizeof(path), "%s/.lsw/registry", home);
