@@ -32,6 +32,7 @@
 #include <netdb.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
 #include <dlfcn.h>
 
 // ioctl command  
@@ -51,6 +52,20 @@
 #define FILE_ATTRIBUTE_NORMAL               0x00000080
 #define FILE_ATTRIBUTE_TEMPORARY            0x00000100
 #define INVALID_FILE_ATTRIBUTES             0xFFFFFFFF
+
+// WIN32_FIND_DATAW structure
+typedef struct {
+    uint32_t dwFileAttributes;
+    uint64_t ftCreationTime;
+    uint64_t ftLastAccessTime;
+    uint64_t ftLastWriteTime;
+    uint32_t nFileSizeHigh;
+    uint32_t nFileSizeLow;
+    uint32_t dwReserved0;
+    uint32_t dwReserved1;
+    wchar_t cFileName[260];
+    wchar_t cAlternateFileName[14];
+} WIN32_FIND_DATAW;
 
 // Global kernel fd for syscalls
 static int g_kernel_fd = -1;
@@ -195,8 +210,16 @@ char* __attribute__((ms_abi)) lsw_strerror(int errnum) {
     return strerror(errnum);
 }
 
+int __attribute__((ms_abi)) lsw_strcmp(const char* s1, const char* s2) {
+    return strcmp(s1, s2);
+}
+
 int __attribute__((ms_abi)) lsw_strncmp(const char* s1, const char* s2, size_t n) {
     return strncmp(s1, s2, n);
+}
+
+char* __attribute__((ms_abi)) lsw_strstr(const char* haystack, const char* needle) {
+    return strstr(haystack, needle);
 }
 
 size_t __attribute__((ms_abi)) lsw_wcslen(const wchar_t* s) {
@@ -387,46 +410,69 @@ int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsig
         return 0;
     }
     
+    // Windows wchar_t is UTF-16 (2 bytes), Linux wchar_t is UTF-32 (4 bytes)
+    // We need to treat the input as uint16_t* (UTF-16)
+    const uint16_t* src16 = (const uint16_t*)src;
+    
     // Calculate source length if not provided
     size_t actual_srclen;
     if (srclen == -1) {
-        actual_srclen = wcslen(src);
+        // Count UTF-16 characters until null terminator
+        actual_srclen = 0;
+        while (src16[actual_srclen] != 0) {
+            actual_srclen++;
+        }
     } else {
         actual_srclen = (size_t)srclen;
     }
     
     if (!dst) {
-        // Return required size (pessimistic: assume each wchar needs 4 bytes in UTF-8)
-        return (int)(actual_srclen * 4 + 1);
+        // Return required size (pessimistic: assume each char needs 3 bytes in UTF-8)
+        return (int)(actual_srclen * 3 + 1);
     }
     
-    // Simple conversion: assume ASCII/Latin-1 range for now
-    // TODO: Implement proper UTF-16 to UTF-8 conversion
-    size_t i;
-    for (i = 0; i < actual_srclen && i < (size_t)(dstlen - 1); i++) {
-        if (src[i] < 0x80) {
-            // ASCII range - direct copy
-            dst[i] = (char)src[i];
-        } else if (src[i] < 0x800) {
-            // 2-byte UTF-8 sequence
-            if (i + 1 >= (size_t)dstlen) break;
-            dst[i++] = (char)(0xC0 | ((src[i] >> 6) & 0x1F));
-            dst[i] = (char)(0x80 | (src[i] & 0x3F));
-        } else {
-            // For now, replace non-ASCII with '?'
-            dst[i] = '?';
+    // UTF-16 to UTF-8 conversion
+    size_t src_idx = 0;
+    size_t dst_idx = 0;
+    
+    while (src_idx < actual_srclen && dst_idx < (size_t)(dstlen - 1)) {
+        uint16_t wc = src16[src_idx];
+        
+        // Check for null terminator
+        if (wc == 0) {
+            break;
         }
         
-        if (src[i] == 0) break;  // Null terminator
+        if (wc < 0x80) {
+            // ASCII range (0x00-0x7F) - 1 byte
+            dst[dst_idx++] = (char)wc;
+        } else if (wc < 0x800) {
+            // 2-byte UTF-8 sequence (0x80-0x7FF)
+            if (dst_idx + 2 > (size_t)dstlen) break;
+            dst[dst_idx++] = (char)(0xC0 | ((wc >> 6) & 0x1F));
+            dst[dst_idx++] = (char)(0x80 | (wc & 0x3F));
+        } else if (wc < 0xD800 || wc >= 0xE000) {
+            // 3-byte UTF-8 sequence (0x800-0xFFFF, excluding surrogates)
+            if (dst_idx + 3 > (size_t)dstlen) break;
+            dst[dst_idx++] = (char)(0xE0 | ((wc >> 12) & 0x0F));
+            dst[dst_idx++] = (char)(0x80 | ((wc >> 6) & 0x3F));
+            dst[dst_idx++] = (char)(0x80 | (wc & 0x3F));
+        } else {
+            // Surrogate pair handling (for characters > 0xFFFF)
+            // For now, replace with '?'
+            dst[dst_idx++] = '?';
+        }
+        
+        src_idx++;
     }
     
-    dst[i] = '\0';
+    dst[dst_idx] = '\0';
     
     if (used_default) {
         *used_default = 0;
     }
     
-    return (int)i;
+    return (int)dst_idx;
 }
 
 void* __attribute__((ms_abi)) lsw_TlsGetValue(unsigned long index) {
@@ -1242,6 +1288,785 @@ int __attribute__((ms_abi)) lsw_SetFileAttributesW(const wchar_t* filename, uint
     return 1; // TRUE
 }
 
+// ============================================================================
+// Path/Environment APIs (KERNEL32)
+// ============================================================================
+
+// KERNEL32.dll!GetWindowsDirectoryA - Get Windows directory path
+DWORD __attribute__((ms_abi)) lsw_GetWindowsDirectoryA(char* buffer, DWORD size) {
+    LSW_LOG_INFO("GetWindowsDirectoryA called: buffer=%p, size=%u", buffer, size);
+    
+    // Windows directory is C:\Windows -> ~/.lsw/drives/c/Windows
+    const char* win_dir = "C:\\Windows";
+    size_t len = strlen(win_dir);
+    
+    if (!buffer || size == 0) {
+        // Return required size including null terminator
+        return (DWORD)(len + 1);
+    }
+    
+    if (size <= len) {
+        // Buffer too small - return required size
+        return (DWORD)(len + 1);
+    }
+    
+    strcpy(buffer, win_dir);
+    LSW_LOG_INFO("GetWindowsDirectoryA: returning '%s'", buffer);
+    return (DWORD)len;
+}
+
+// KERNEL32.dll!GetWindowsDirectoryW - Get Windows directory path (wide-char)
+DWORD __attribute__((ms_abi)) lsw_GetWindowsDirectoryW(wchar_t* buffer, DWORD size) {
+    LSW_LOG_INFO("GetWindowsDirectoryW called: buffer=%p, size=%u", buffer, size);
+    
+    const wchar_t* win_dir = L"C:\\Windows";
+    size_t len = wcslen(win_dir);
+    
+    if (!buffer || size == 0) {
+        return (DWORD)(len + 1);
+    }
+    
+    if (size <= len) {
+        return (DWORD)(len + 1);
+    }
+    
+    wcscpy(buffer, win_dir);
+    LSW_LOG_INFO("GetWindowsDirectoryW: returning wide-char path");
+    return (DWORD)len;
+}
+
+// KERNEL32.dll!GetSystemDirectoryA - Get System32 directory path
+DWORD __attribute__((ms_abi)) lsw_GetSystemDirectoryA(char* buffer, DWORD size) {
+    LSW_LOG_INFO("GetSystemDirectoryA called: buffer=%p, size=%u", buffer, size);
+    
+    const char* sys_dir = "C:\\Windows\\System32";
+    size_t len = strlen(sys_dir);
+    
+    if (!buffer || size == 0) {
+        return (DWORD)(len + 1);
+    }
+    
+    if (size <= len) {
+        return (DWORD)(len + 1);
+    }
+    
+    strcpy(buffer, sys_dir);
+    LSW_LOG_INFO("GetSystemDirectoryA: returning '%s'", buffer);
+    return (DWORD)len;
+}
+
+// KERNEL32.dll!GetSystemDirectoryW - Get System32 directory path (wide-char)
+DWORD __attribute__((ms_abi)) lsw_GetSystemDirectoryW(wchar_t* buffer, DWORD size) {
+    LSW_LOG_INFO("GetSystemDirectoryW called: buffer=%p, size=%u", buffer, size);
+    
+    const wchar_t* sys_dir = L"C:\\Windows\\System32";
+    size_t len = wcslen(sys_dir);
+    
+    if (!buffer || size == 0) {
+        return (DWORD)(len + 1);
+    }
+    
+    if (size <= len) {
+        return (DWORD)(len + 1);
+    }
+    
+    wcscpy(buffer, sys_dir);
+    LSW_LOG_INFO("GetSystemDirectoryW: returning wide-char path");
+    return (DWORD)len;
+}
+
+// KERNEL32.dll!GetTempPathA - Get temporary directory path
+DWORD __attribute__((ms_abi)) lsw_GetTempPathA(DWORD size, char* buffer) {
+    LSW_LOG_INFO("GetTempPathA called: size=%u, buffer=%p", size, buffer);
+    
+    // Check TEMP/TMP environment variables, fallback to C:\Temp
+    const char* temp_path = getenv("TEMP");
+    if (!temp_path) temp_path = getenv("TMP");
+    if (!temp_path) temp_path = "C:\\Temp";
+    
+    size_t len = strlen(temp_path);
+    
+    // Ensure path ends with backslash
+    int needs_slash = (temp_path[len-1] != '\\');
+    size_t total_len = len + (needs_slash ? 1 : 0);
+    
+    if (!buffer || size == 0) {
+        return (DWORD)(total_len + 1);
+    }
+    
+    if (size <= total_len) {
+        return (DWORD)(total_len + 1);
+    }
+    
+    strcpy(buffer, temp_path);
+    if (needs_slash) {
+        buffer[len] = '\\';
+        buffer[len+1] = '\0';
+    }
+    
+    LSW_LOG_INFO("GetTempPathA: returning '%s'", buffer);
+    return (DWORD)total_len;
+}
+
+// KERNEL32.dll!GetTempPathW - Get temporary directory path (wide-char)
+DWORD __attribute__((ms_abi)) lsw_GetTempPathW(DWORD size, wchar_t* buffer) {
+    LSW_LOG_INFO("GetTempPathW called: size=%u, buffer=%p", size, buffer);
+    
+    // Get ANSI version first
+    char temp_ansi[LSW_MAX_PATH];
+    DWORD ansi_len = lsw_GetTempPathA(sizeof(temp_ansi), temp_ansi);
+    
+    if (ansi_len == 0) {
+        return 0;
+    }
+    
+    // Convert to wide-char
+    int wide_len = lsw_MultiByteToWideChar(CP_UTF8, 0, temp_ansi, -1, NULL, 0);
+    if (wide_len == 0) {
+        return 0;
+    }
+    
+    if (!buffer || size == 0) {
+        return (DWORD)wide_len;
+    }
+    
+    if (size < (DWORD)wide_len) {
+        return (DWORD)wide_len;
+    }
+    
+    lsw_MultiByteToWideChar(CP_UTF8, 0, temp_ansi, -1, buffer, size);
+    LSW_LOG_INFO("GetTempPathW: returning wide-char path");
+    return (DWORD)(wide_len - 1); // Don't count null terminator
+}
+
+// KERNEL32.dll!GetEnvironmentVariableA - Get environment variable
+DWORD __attribute__((ms_abi)) lsw_GetEnvironmentVariableA(const char* name, char* buffer, DWORD size) {
+    LSW_LOG_INFO("GetEnvironmentVariableA called: name='%s', size=%u", name ? name : "(null)", size);
+    
+    if (!name) {
+        return 0;
+    }
+    
+    const char* value = getenv(name);
+    if (!value) {
+        LSW_LOG_INFO("GetEnvironmentVariableA: variable '%s' not found", name);
+        return 0; // Variable not found
+    }
+    
+    size_t len = strlen(value);
+    
+    if (!buffer || size == 0) {
+        return (DWORD)(len + 1);
+    }
+    
+    if (size <= len) {
+        return (DWORD)(len + 1);
+    }
+    
+    strcpy(buffer, value);
+    LSW_LOG_INFO("GetEnvironmentVariableA: '%s' = '%s'", name, value);
+    return (DWORD)len;
+}
+
+// KERNEL32.dll!GetEnvironmentVariableW - Get environment variable (wide-char)
+DWORD __attribute__((ms_abi)) lsw_GetEnvironmentVariableW(const wchar_t* name, wchar_t* buffer, DWORD size) {
+    LSW_LOG_INFO("GetEnvironmentVariableW called");
+    
+    if (!name) {
+        return 0;
+    }
+    
+    // Convert name to multi-byte
+    char name_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, name, -1, name_mb, sizeof(name_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("GetEnvironmentVariableW: name conversion failed");
+        return 0;
+    }
+    
+    // Get ANSI value
+    char value_ansi[LSW_MAX_PATH];
+    DWORD ansi_len = lsw_GetEnvironmentVariableA(name_mb, value_ansi, sizeof(value_ansi));
+    
+    if (ansi_len == 0) {
+        return 0; // Not found
+    }
+    
+    // Convert to wide-char
+    int wide_len = lsw_MultiByteToWideChar(CP_UTF8, 0, value_ansi, -1, NULL, 0);
+    if (wide_len == 0) {
+        return 0;
+    }
+    
+    if (!buffer || size == 0) {
+        return (DWORD)wide_len;
+    }
+    
+    if (size < (DWORD)wide_len) {
+        return (DWORD)wide_len;
+    }
+    
+    lsw_MultiByteToWideChar(CP_UTF8, 0, value_ansi, -1, buffer, size);
+    LSW_LOG_INFO("GetEnvironmentVariableW: successfully converted");
+    return (DWORD)(wide_len - 1);
+}
+
+// KERNEL32.dll!SetEnvironmentVariableA - Set environment variable
+int __attribute__((ms_abi)) lsw_SetEnvironmentVariableA(const char* name, const char* value) {
+    LSW_LOG_INFO("SetEnvironmentVariableA called: name='%s', value='%s'", 
+                 name ? name : "(null)", value ? value : "(null)");
+    
+    if (!name) {
+        return 0; // FALSE
+    }
+    
+    int result;
+    if (value) {
+        // Set the variable
+        result = setenv(name, value, 1); // 1 = overwrite
+    } else {
+        // Delete the variable
+        result = unsetenv(name);
+    }
+    
+    if (result == 0) {
+        LSW_LOG_INFO("SetEnvironmentVariableA: success");
+        return 1; // TRUE
+    } else {
+        LSW_LOG_ERROR("SetEnvironmentVariableA: failed: %s", strerror(errno));
+        return 0; // FALSE
+    }
+}
+
+// KERNEL32.dll!SetEnvironmentVariableW - Set environment variable (wide-char)
+int __attribute__((ms_abi)) lsw_SetEnvironmentVariableW(const wchar_t* name, const wchar_t* value) {
+    LSW_LOG_INFO("SetEnvironmentVariableW called");
+    
+    if (!name) {
+        return 0;
+    }
+    
+    // Convert name to multi-byte
+    char name_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, name, -1, name_mb, sizeof(name_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("SetEnvironmentVariableW: name conversion failed");
+        return 0;
+    }
+    
+    char* value_mb = NULL;
+    char value_buf[LSW_MAX_PATH];
+    if (value) {
+        result = lsw_WideCharToMultiByte(CP_UTF8, 0, value, -1, value_buf, sizeof(value_buf), NULL, NULL);
+        if (result == 0) {
+            LSW_LOG_ERROR("SetEnvironmentVariableW: value conversion failed");
+            return 0;
+        }
+        value_mb = value_buf;
+    }
+    
+    return lsw_SetEnvironmentVariableA(name_mb, value_mb);
+}
+
+// KERNEL32.dll!ExpandEnvironmentStringsA - Expand environment variable references
+DWORD __attribute__((ms_abi)) lsw_ExpandEnvironmentStringsA(const char* src, char* dst, DWORD size) {
+    LSW_LOG_INFO("ExpandEnvironmentStringsA called: src='%s', size=%u", src ? src : "(null)", size);
+    
+    if (!src) {
+        return 0;
+    }
+    
+    // Simple implementation: expand %VAR% patterns
+    char temp[LSW_MAX_PATH * 2];
+    size_t dst_pos = 0;
+    const char* p = src;
+    
+    while (*p && dst_pos < sizeof(temp) - 1) {
+        if (*p == '%') {
+            // Find closing %
+            const char* end = strchr(p + 1, '%');
+            if (end) {
+                // Extract variable name
+                size_t var_len = end - p - 1;
+                char var_name[256];
+                if (var_len < sizeof(var_name)) {
+                    strncpy(var_name, p + 1, var_len);
+                    var_name[var_len] = '\0';
+                    
+                    // Get variable value
+                    const char* var_value = getenv(var_name);
+                    if (var_value) {
+                        // Copy value
+                        size_t value_len = strlen(var_value);
+                        if (dst_pos + value_len < sizeof(temp)) {
+                            strcpy(temp + dst_pos, var_value);
+                            dst_pos += value_len;
+                            p = end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Copy character as-is
+        temp[dst_pos++] = *p++;
+    }
+    temp[dst_pos] = '\0';
+    
+    size_t result_len = strlen(temp);
+    
+    if (!dst || size == 0) {
+        return (DWORD)(result_len + 1);
+    }
+    
+    if (size <= result_len) {
+        return (DWORD)(result_len + 1);
+    }
+    
+    strcpy(dst, temp);
+    LSW_LOG_INFO("ExpandEnvironmentStringsA: '%s' -> '%s'", src, dst);
+    return (DWORD)(result_len + 1); // Windows returns length including null terminator
+}
+
+// KERNEL32.dll!ExpandEnvironmentStringsW - Expand environment variable references (wide-char)
+DWORD __attribute__((ms_abi)) lsw_ExpandEnvironmentStringsW(const wchar_t* src, wchar_t* dst, DWORD size) {
+    LSW_LOG_INFO("ExpandEnvironmentStringsW called");
+    
+    if (!src) {
+        return 0;
+    }
+    
+    // Convert source to multi-byte
+    char src_mb[LSW_MAX_PATH * 2];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, src, -1, src_mb, sizeof(src_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("ExpandEnvironmentStringsW: source conversion failed");
+        return 0;
+    }
+    
+    // Expand in ANSI
+    char expanded_ansi[LSW_MAX_PATH * 2];
+    DWORD ansi_len = lsw_ExpandEnvironmentStringsA(src_mb, expanded_ansi, sizeof(expanded_ansi));
+    if (ansi_len == 0) {
+        return 0;
+    }
+    
+    // Convert back to wide-char
+    int wide_len = lsw_MultiByteToWideChar(CP_UTF8, 0, expanded_ansi, -1, NULL, 0);
+    if (wide_len == 0) {
+        return 0;
+    }
+    
+    if (!dst || size == 0) {
+        return (DWORD)wide_len;
+    }
+    
+    if (size < (DWORD)wide_len) {
+        return (DWORD)wide_len;
+    }
+    
+    lsw_MultiByteToWideChar(CP_UTF8, 0, expanded_ansi, -1, dst, size);
+    LSW_LOG_INFO("ExpandEnvironmentStringsW: successfully expanded");
+    return (DWORD)wide_len;
+}
+
+// ============================================================================
+// END Path/Environment APIs
+// ============================================================================
+
+// ============================================================================
+// COMDLG32 APIs (Common Dialogs)
+// ============================================================================
+
+// COMDLG32.dll!PrintDlgW - Display Print dialog
+int __attribute__((ms_abi)) lsw_PrintDlgW(void* lppd) {
+    LSW_LOG_INFO("PrintDlgW called: lppd=%p", lppd);
+    LSW_LOG_WARN("PrintDlgW: stub implementation - returning FALSE (user cancelled)");
+    
+    // TODO: Implement print dialog
+    // For now, return FALSE to indicate user cancelled
+    return 0;
+}
+
+// COMDLG32.dll!ChooseColorW - Display Color picker dialog
+int __attribute__((ms_abi)) lsw_ChooseColorW(void* lpcc) {
+    LSW_LOG_INFO("ChooseColorW called: lpcc=%p", lpcc);
+    LSW_LOG_WARN("ChooseColorW: stub implementation - returning FALSE (user cancelled)");
+    
+    // TODO: Implement color picker dialog
+    // For now, return FALSE to indicate user cancelled
+    return 0;
+}
+
+// ============================================================================
+// END COMDLG32 APIs
+// ============================================================================
+
+// ============================================================================
+// File Enumeration APIs (KERNEL32)
+// ============================================================================
+
+// Internal structure for directory search handle
+typedef struct {
+    DIR* dir;
+    char pattern[LSW_MAX_PATH];
+    char dir_path[LSW_MAX_PATH];
+    struct dirent* current_entry;
+    int first_call;
+} lsw_find_data_t;
+
+// Helper: Convert Linux dirent to WIN32_FIND_DATAW
+static void dirent_to_find_data(struct dirent* entry, const char* dir_path, WIN32_FIND_DATAW* find_data) {
+    memset(find_data, 0, sizeof(WIN32_FIND_DATAW));
+    
+    // Convert filename to wide-char
+    lsw_MultiByteToWideChar(CP_UTF8, 0, entry->d_name, -1, 
+                            find_data->cFileName, sizeof(find_data->cFileName)/sizeof(wchar_t));
+    
+    // Get file stats
+    char full_path[LSW_MAX_PATH];
+    snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
+    
+    struct stat st;
+    if (stat(full_path, &st) == 0) {
+        // Set attributes
+        find_data->dwFileAttributes = 0;
+        if (S_ISDIR(st.st_mode)) {
+            find_data->dwFileAttributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        if (entry->d_name[0] == '.') {
+            find_data->dwFileAttributes |= FILE_ATTRIBUTE_HIDDEN;
+        }
+        if (!(st.st_mode & S_IWUSR)) {
+            find_data->dwFileAttributes |= FILE_ATTRIBUTE_READONLY;
+        }
+        if (find_data->dwFileAttributes == 0) {
+            find_data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        }
+        
+        // Set file size
+        find_data->nFileSizeLow = (uint32_t)(st.st_size & 0xFFFFFFFF);
+        find_data->nFileSizeHigh = (uint32_t)(st.st_size >> 32);
+        
+        // TODO: Convert timestamps properly
+    } else {
+        find_data->dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    }
+}
+
+// Helper: Simple wildcard matching (* and ? supported)
+static int match_pattern(const char* str, const char* pattern) {
+    if (*pattern == '\0') return (*str == '\0');
+    if (*pattern == '*') {
+        if (match_pattern(str, pattern + 1)) return 1;
+        if (*str && match_pattern(str + 1, pattern)) return 1;
+        return 0;
+    }
+    if (*pattern == '?' || *pattern == *str) {
+        return match_pattern(str + 1, pattern + 1);
+    }
+    return 0;
+}
+
+// KERNEL32.dll!FindFirstFileW - Start file search
+void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_FIND_DATAW* find_data) {
+    LSW_LOG_INFO("FindFirstFileW called");
+    
+    if (!filename || !find_data) {
+        LSW_LOG_ERROR("FindFirstFileW: null parameters");
+        return (void*)-1; // INVALID_HANDLE_VALUE
+    }
+    
+    // Convert filename to multi-byte
+    char filename_mb[LSW_MAX_PATH];
+    int result = lsw_WideCharToMultiByte(CP_UTF8, 0, filename, -1, filename_mb, sizeof(filename_mb), NULL, NULL);
+    if (result == 0) {
+        LSW_LOG_ERROR("FindFirstFileW: filename conversion failed");
+        return (void*)-1;
+    }
+    
+    LSW_LOG_INFO("FindFirstFileW: searching for '%s' (len=%d)", filename_mb, result);
+    
+    // Debug: show first few bytes as hex
+    LSW_LOG_INFO("FindFirstFileW: hex dump: %02x %02x %02x %02x", 
+                 (unsigned char)filename_mb[0], (unsigned char)filename_mb[1], 
+                 (unsigned char)filename_mb[2], (unsigned char)filename_mb[3]);
+    
+    // Translate Windows path to Linux
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+        LSW_LOG_ERROR("FindFirstFileW: path translation failed");
+        return (void*)-1;
+    }
+    
+    // Extract directory and pattern
+    char dir_path[LSW_MAX_PATH];
+    char pattern[LSW_MAX_PATH];
+    char* last_slash = strrchr(linux_path, '/');
+    
+    if (last_slash) {
+        size_t dir_len = last_slash - linux_path;
+        strncpy(dir_path, linux_path, dir_len);
+        dir_path[dir_len] = '\0';
+        strcpy(pattern, last_slash + 1);
+    } else {
+        strcpy(dir_path, ".");
+        strcpy(pattern, linux_path);
+    }
+    
+    LSW_LOG_INFO("FindFirstFileW: dir='%s', pattern='%s'", dir_path, pattern);
+    
+    // Open directory
+    DIR* dir = opendir(dir_path);
+    if (!dir) {
+        LSW_LOG_ERROR("FindFirstFileW: opendir failed: %s", strerror(errno));
+        return (void*)-1;
+    }
+    
+    // Allocate find handle
+    lsw_find_data_t* find_handle = malloc(sizeof(lsw_find_data_t));
+    if (!find_handle) {
+        closedir(dir);
+        return (void*)-1;
+    }
+    
+    find_handle->dir = dir;
+    strcpy(find_handle->pattern, pattern);
+    strcpy(find_handle->dir_path, dir_path);
+    find_handle->first_call = 1;
+    
+    // Find first matching entry
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (match_pattern(entry->d_name, pattern)) {
+            dirent_to_find_data(entry, dir_path, find_data);
+            LSW_LOG_INFO("FindFirstFileW: found '%s'", entry->d_name);
+            return (void*)find_handle;
+        }
+    }
+    
+    // No match found
+    LSW_LOG_INFO("FindFirstFileW: no matches found");
+    closedir(dir);
+    free(find_handle);
+    return (void*)-1;
+}
+
+// KERNEL32.dll!FindNextFileW - Get next file in search
+int __attribute__((ms_abi)) lsw_FindNextFileW(void* find_handle, WIN32_FIND_DATAW* find_data) {
+    LSW_LOG_INFO("FindNextFileW called: handle=%p", find_handle);
+    
+    if (!find_handle || find_handle == (void*)-1 || !find_data) {
+        LSW_LOG_ERROR("FindNextFileW: invalid parameters");
+        return 0; // FALSE
+    }
+    
+    lsw_find_data_t* handle = (lsw_find_data_t*)find_handle;
+    
+    // Continue searching
+    struct dirent* entry;
+    while ((entry = readdir(handle->dir)) != NULL) {
+        if (match_pattern(entry->d_name, handle->pattern)) {
+            dirent_to_find_data(entry, handle->dir_path, find_data);
+            LSW_LOG_INFO("FindNextFileW: found '%s'", entry->d_name);
+            return 1; // TRUE
+        }
+    }
+    
+    LSW_LOG_INFO("FindNextFileW: no more files");
+    return 0; // FALSE - no more files
+}
+
+// KERNEL32.dll!FindClose - Close search handle
+int __attribute__((ms_abi)) lsw_FindClose(void* find_handle) {
+    LSW_LOG_INFO("FindClose called: handle=%p", find_handle);
+    
+    if (!find_handle || find_handle == (void*)-1) {
+        LSW_LOG_ERROR("FindClose: invalid handle");
+        return 0; // FALSE
+    }
+    
+    lsw_find_data_t* handle = (lsw_find_data_t*)find_handle;
+    
+    if (handle->dir) {
+        closedir(handle->dir);
+    }
+    
+    free(handle);
+    LSW_LOG_INFO("FindClose: handle closed successfully");
+    return 1; // TRUE
+}
+
+// KERNEL32.dll!FindFirstFileExW - Advanced file search
+void* __attribute__((ms_abi)) lsw_FindFirstFileExW(
+    const wchar_t* filename,
+    int info_level,
+    void* find_data,
+    int search_op,
+    void* search_filter,
+    uint32_t flags)
+{
+    (void)info_level;
+    (void)search_op;
+    (void)search_filter;
+    (void)flags;
+    
+    LSW_LOG_INFO("FindFirstFileExW called (using standard FindFirstFileW)");
+    
+    // For now, just delegate to FindFirstFileW
+    return lsw_FindFirstFileW(filename, (WIN32_FIND_DATAW*)find_data);
+}
+
+// ============================================================================
+// END File Enumeration APIs
+// ============================================================================
+
+// ============================================================================
+// Memory Management APIs (KERNEL32)
+// ============================================================================
+
+// KERNEL32.dll!GetProcessHeap - Get default process heap
+void* __attribute__((ms_abi)) lsw_GetProcessHeap(void) {
+    LSW_LOG_INFO("GetProcessHeap called - returning dummy heap handle");
+    // Return a dummy heap handle (we'll use malloc/free underneath)
+    return (void*)0x1; // Non-null heap handle
+}
+
+// KERNEL32.dll!HeapAlloc - Allocate memory from heap
+void* __attribute__((ms_abi)) lsw_HeapAlloc(void* heap, uint32_t flags, size_t size) {
+    (void)heap; // Ignore heap parameter, use malloc
+    
+    LSW_LOG_INFO("HeapAlloc called: size=%zu, flags=0x%x", size, flags);
+    
+    void* ptr = malloc(size);
+    
+    // HEAP_ZERO_MEMORY flag
+    if (ptr && (flags & 0x00000008)) {
+        memset(ptr, 0, size);
+    }
+    
+    LSW_LOG_INFO("HeapAlloc: allocated %p", ptr);
+    return ptr;
+}
+
+// KERNEL32.dll!HeapFree - Free heap memory
+int __attribute__((ms_abi)) lsw_HeapFree(void* heap, uint32_t flags, void* mem) {
+    (void)heap;
+    (void)flags;
+    
+    LSW_LOG_INFO("HeapFree called: mem=%p", mem);
+    
+    if (mem) {
+        free(mem);
+        return 1; // TRUE
+    }
+    
+    return 0; // FALSE
+}
+
+// KERNEL32.dll!HeapReAlloc - Reallocate heap memory
+void* __attribute__((ms_abi)) lsw_HeapReAlloc(void* heap, uint32_t flags, void* mem, size_t size) {
+    (void)heap;
+    (void)flags;
+    
+    LSW_LOG_INFO("HeapReAlloc called: mem=%p, new_size=%zu", mem, size);
+    
+    void* new_ptr = realloc(mem, size);
+    LSW_LOG_INFO("HeapReAlloc: reallocated to %p", new_ptr);
+    return new_ptr;
+}
+
+// KERNEL32.dll!HeapSize - Get size of heap block
+size_t __attribute__((ms_abi)) lsw_HeapSize(void* heap, uint32_t flags, void* mem) {
+    (void)heap;
+    (void)flags;
+    (void)mem;
+    
+    LSW_LOG_WARN("HeapSize called: not fully implemented, returning 0");
+    // TODO: Track allocation sizes
+    return 0;
+}
+
+// KERNEL32.dll!LocalAlloc - Allocate local memory
+void* __attribute__((ms_abi)) lsw_LocalAlloc(uint32_t flags, size_t size) {
+    LSW_LOG_INFO("LocalAlloc called: size=%zu, flags=0x%x", size, flags);
+    
+    void* ptr = malloc(size);
+    
+    // LMEM_ZEROINIT flag
+    if (ptr && (flags & 0x0040)) {
+        memset(ptr, 0, size);
+    }
+    
+    LSW_LOG_INFO("LocalAlloc: allocated %p", ptr);
+    return ptr;
+}
+
+// KERNEL32.dll!LocalFree - Free local memory
+void* __attribute__((ms_abi)) lsw_LocalFree(void* mem) {
+    LSW_LOG_INFO("LocalFree called: mem=%p", mem);
+    
+    if (mem) {
+        free(mem);
+    }
+    
+    return NULL; // Success returns NULL
+}
+
+// KERNEL32.dll!GlobalAlloc - Allocate global memory
+void* __attribute__((ms_abi)) lsw_GlobalAlloc(uint32_t flags, size_t size) {
+    LSW_LOG_INFO("GlobalAlloc called: size=%zu, flags=0x%x", size, flags);
+    
+    void* ptr = malloc(size);
+    
+    // GMEM_ZEROINIT flag
+    if (ptr && (flags & 0x0040)) {
+        memset(ptr, 0, size);
+    }
+    
+    LSW_LOG_INFO("GlobalAlloc: allocated %p", ptr);
+    return ptr;
+}
+
+// KERNEL32.dll!GlobalFree - Free global memory
+void* __attribute__((ms_abi)) lsw_GlobalFree(void* mem) {
+    LSW_LOG_INFO("GlobalFree called: mem=%p", mem);
+    
+    if (mem) {
+        free(mem);
+    }
+    
+    return NULL; // Success returns NULL
+}
+
+// KERNEL32.dll!GlobalLock - Lock global memory
+void* __attribute__((ms_abi)) lsw_GlobalLock(void* mem) {
+    LSW_LOG_INFO("GlobalLock called: mem=%p", mem);
+    // In our implementation, memory is already accessible
+    return mem;
+}
+
+// KERNEL32.dll!GlobalUnlock - Unlock global memory
+int __attribute__((ms_abi)) lsw_GlobalUnlock(void* mem) {
+    LSW_LOG_INFO("GlobalUnlock called: mem=%p", mem);
+    // In our implementation, no-op
+    (void)mem;
+    return 1; // TRUE
+}
+
+// KERNEL32.dll!GlobalSize - Get size of global memory block
+size_t __attribute__((ms_abi)) lsw_GlobalSize(void* mem) {
+    LSW_LOG_WARN("GlobalSize called: mem=%p, not fully implemented", mem);
+    (void)mem;
+    // TODO: Track allocation sizes
+    return 0;
+}
+
+// ============================================================================
+// END Memory Management APIs
+// ============================================================================
+
 void* __attribute__((ms_abi)) lsw_CreateThread(
     void* thread_attributes,
     uint32_t stack_size,
@@ -1983,7 +2808,9 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "fwrite", (void*)lsw_fwrite},
     {"msvcrt.dll", "fputc", (void*)lsw_fputc},
     {"msvcrt.dll", "strerror", (void*)lsw_strerror},
+    {"msvcrt.dll", "strcmp", (void*)lsw_strcmp},
     {"msvcrt.dll", "strncmp", (void*)lsw_strncmp},
+    {"msvcrt.dll", "strstr", (void*)lsw_strstr},
     {"msvcrt.dll", "wcslen", (void*)lsw_wcslen},
     {"msvcrt.dll", "localeconv", (void*)lsw_localeconv},
     {"msvcrt.dll", "signal", (void*)lsw_signal},
@@ -2036,6 +2863,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"advapi32.dll", "RegSetValueExA", (void*)lsw_RegSetValueExA},
     {"advapi32.dll", "RegCloseKey", (void*)lsw_RegCloseKey},
     
+    // COMDLG32.dll - Common Dialogs
+    {"COMDLG32.dll", "PrintDlgW", (void*)lsw_PrintDlgW},
+    {"COMDLG32.dll", "ChooseColorW", (void*)lsw_ChooseColorW},
+    
     // ws2_32.dll - Winsock APIs
     {"ws2_32.dll", "WSAStartup", (void*)lsw_WSAStartup},
     {"ws2_32.dll", "WSACleanup", (void*)lsw_WSACleanup},
@@ -2068,6 +2899,34 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "RemoveDirectoryW", (void*)lsw_RemoveDirectoryW},
     {"KERNEL32.dll", "GetFileAttributesW", (void*)lsw_GetFileAttributesW},
     {"KERNEL32.dll", "SetFileAttributesW", (void*)lsw_SetFileAttributesW},
+    {"KERNEL32.dll", "GetWindowsDirectoryA", (void*)lsw_GetWindowsDirectoryA},
+    {"KERNEL32.dll", "GetWindowsDirectoryW", (void*)lsw_GetWindowsDirectoryW},
+    {"KERNEL32.dll", "GetSystemDirectoryA", (void*)lsw_GetSystemDirectoryA},
+    {"KERNEL32.dll", "GetSystemDirectoryW", (void*)lsw_GetSystemDirectoryW},
+    {"KERNEL32.dll", "GetTempPathA", (void*)lsw_GetTempPathA},
+    {"KERNEL32.dll", "GetTempPathW", (void*)lsw_GetTempPathW},
+    {"KERNEL32.dll", "GetEnvironmentVariableA", (void*)lsw_GetEnvironmentVariableA},
+    {"KERNEL32.dll", "GetEnvironmentVariableW", (void*)lsw_GetEnvironmentVariableW},
+    {"KERNEL32.dll", "SetEnvironmentVariableA", (void*)lsw_SetEnvironmentVariableA},
+    {"KERNEL32.dll", "SetEnvironmentVariableW", (void*)lsw_SetEnvironmentVariableW},
+    {"KERNEL32.dll", "ExpandEnvironmentStringsA", (void*)lsw_ExpandEnvironmentStringsA},
+    {"KERNEL32.dll", "ExpandEnvironmentStringsW", (void*)lsw_ExpandEnvironmentStringsW},
+    {"KERNEL32.dll", "FindFirstFileW", (void*)lsw_FindFirstFileW},
+    {"KERNEL32.dll", "FindNextFileW", (void*)lsw_FindNextFileW},
+    {"KERNEL32.dll", "FindClose", (void*)lsw_FindClose},
+    {"KERNEL32.dll", "FindFirstFileExW", (void*)lsw_FindFirstFileExW},
+    {"KERNEL32.dll", "GetProcessHeap", (void*)lsw_GetProcessHeap},
+    {"KERNEL32.dll", "HeapAlloc", (void*)lsw_HeapAlloc},
+    {"KERNEL32.dll", "HeapFree", (void*)lsw_HeapFree},
+    {"KERNEL32.dll", "HeapReAlloc", (void*)lsw_HeapReAlloc},
+    {"KERNEL32.dll", "HeapSize", (void*)lsw_HeapSize},
+    {"KERNEL32.dll", "LocalAlloc", (void*)lsw_LocalAlloc},
+    {"KERNEL32.dll", "LocalFree", (void*)lsw_LocalFree},
+    {"KERNEL32.dll", "GlobalAlloc", (void*)lsw_GlobalAlloc},
+    {"KERNEL32.dll", "GlobalFree", (void*)lsw_GlobalFree},
+    {"KERNEL32.dll", "GlobalLock", (void*)lsw_GlobalLock},
+    {"KERNEL32.dll", "GlobalUnlock", (void*)lsw_GlobalUnlock},
+    {"KERNEL32.dll", "GlobalSize", (void*)lsw_GlobalSize},
     {"KERNEL32.dll", "LoadLibraryA", (void*)lsw_LoadLibraryA},
     {"KERNEL32.dll", "GetProcAddress", (void*)lsw_GetProcAddress},
     {"KERNEL32.dll", "lstrlenA", (void*)lsw_lstrlenA},
