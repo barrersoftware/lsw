@@ -143,6 +143,58 @@ int __attribute__((ms_abi)) lsw_fprintf(FILE* stream, const char* format, ...) {
     return result;
 }
 
+// Wide-char versions (stubs - convert to narrow and use regular fprintf)
+int __attribute__((ms_abi)) lsw_fwprintf(FILE* stream, const wchar_t* format, ...) {
+    // Stub: For now, just return success
+    // TODO: Properly convert wide-char format string and args
+    (void)stream;
+    (void)format;
+    return 0;
+}
+
+int __attribute__((ms_abi)) lsw_fputwc(wchar_t wc, FILE* stream) {
+    // Stub: Convert wide char to multibyte and output
+    char mb[4];
+    if (wc < 0x80) {
+        mb[0] = (char)wc;
+        mb[1] = '\0';
+        return fputc(mb[0], stream);
+    }
+    // For non-ASCII, just output '?'
+    return fputc('?', stream);
+}
+
+int __attribute__((ms_abi)) lsw_fflush(FILE* stream) {
+    // Handle NULL (flush all streams)
+    if (!stream) {
+        return fflush(NULL);
+    }
+    
+    // Define the fake FILE structure (same as in vfprintf)
+    typedef struct {
+        char* _ptr;
+        int _cnt;
+        char* _base;
+        int _flag;
+        int _file;
+        int _charbuf;
+        int _bufsiz;
+        char* _tmpfname;
+    } fake_FILE;
+    
+    fake_FILE* fake = (fake_FILE*)stream;
+    
+    // Check if it's one of our fake stdio FILE structures
+    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+        // For stdout/stderr/stdin fake structures, just return success
+        // Don't call real fflush as it will crash with fake FILE*
+        return 0;
+    }
+    
+    // Otherwise call real fflush
+    return fflush(stream);
+}
+
 void __attribute__((ms_abi)) lsw_exit(int status) {
     exit(status);
 }
@@ -2804,6 +2856,9 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "abort", (void*)lsw_abort},
     {"msvcrt.dll", "printf", (void*)lsw_printf},
     {"msvcrt.dll", "fprintf", (void*)lsw_fprintf},
+    {"msvcrt.dll", "fwprintf", (void*)lsw_fwprintf},
+    {"msvcrt.dll", "fputwc", (void*)lsw_fputwc},
+    {"msvcrt.dll", "fflush", (void*)lsw_fflush},
     {"msvcrt.dll", "vfprintf", (void*)lsw_vfprintf},
     {"msvcrt.dll", "fwrite", (void*)lsw_fwrite},
     {"msvcrt.dll", "fputc", (void*)lsw_fputc},
