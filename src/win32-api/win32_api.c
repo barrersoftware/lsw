@@ -6700,6 +6700,8 @@ extern const win32_api_mapping_t win32_api_misc_mappings[];
 extern const size_t               win32_api_misc_mappings_count;
 extern win32_api_mapping_t        win32_api_advapi32_mappings[];
 extern size_t                     win32_api_advapi32_mappings_count;
+extern const win32_api_mapping_t  win32_api_game_mappings[];
+extern const size_t               win32_api_game_mappings_count;
 
 void* win32_api_resolve(const char* dll_name, const char* function_name) {
     /* Primary table */
@@ -6782,6 +6784,14 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
             return win32_api_advapi32_mappings[i].implementation;
         }
     }
+    /* game API table */
+    for (size_t i = 0; i < win32_api_game_mappings_count; i++) {
+        if (strcasecmp(win32_api_game_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_game_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(game) %s!%s -> %p", dll_name, function_name, win32_api_game_mappings[i].implementation);
+            return win32_api_game_mappings[i].implementation;
+        }
+    }
 
     LSW_LOG_WARN("Could not resolve %s!%s - returning stub", dll_name, function_name);
     return (void*)(uintptr_t)generic_stub;
@@ -6821,6 +6831,7 @@ void* win32_api_resolve_any(const char* function_name) {
     SEARCH_TABLE(win32_api_comctl32_mappings,win32_api_comctl32_mappings_count)
     SEARCH_TABLE(win32_api_misc_mappings,    win32_api_misc_mappings_count)
     SEARCH_TABLE(win32_api_advapi32_mappings,win32_api_advapi32_mappings_count)
+    SEARCH_TABLE(win32_api_game_mappings,    win32_api_game_mappings_count)
     #undef SEARCH_TABLE
     return NULL;
 }
