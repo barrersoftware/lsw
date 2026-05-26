@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <sys/time.h>
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
@@ -53,22 +54,33 @@
 #define FILE_ATTRIBUTE_TEMPORARY            0x00000100
 #define INVALID_FILE_ATTRIBUTES             0xFFFFFFFF
 
-// WIN32_FIND_DATAW structure
+// WIN32_FIND_DATAW structure — must match Windows memory layout exactly.
+// On Windows: wchar_t = 2 bytes, FILETIME = two DWORDs at 4-byte alignment.
+// On Linux:   wchar_t = 4 bytes, uint64_t has 8-byte alignment padding.
+// We use uint32_t pairs for FILETIME and uint16_t for WCHAR arrays so the
+// struct is 592 bytes on both platforms, matching what a Windows-compiled PE
+// expects on its stack.
 typedef struct {
-    uint32_t dwFileAttributes;
-    uint64_t ftCreationTime;
-    uint64_t ftLastAccessTime;
-    uint64_t ftLastWriteTime;
-    uint32_t nFileSizeHigh;
-    uint32_t nFileSizeLow;
-    uint32_t dwReserved0;
-    uint32_t dwReserved1;
-    wchar_t cFileName[260];
-    wchar_t cAlternateFileName[14];
-} WIN32_FIND_DATAW;
+    uint32_t dwFileAttributes;      // offset   0
+    uint32_t ftCreationTimeLow;     // offset   4
+    uint32_t ftCreationTimeHigh;    // offset   8
+    uint32_t ftLastAccessTimeLow;   // offset  12
+    uint32_t ftLastAccessTimeHigh;  // offset  16
+    uint32_t ftLastWriteTimeLow;    // offset  20
+    uint32_t ftLastWriteTimeHigh;   // offset  24
+    uint32_t nFileSizeHigh;         // offset  28
+    uint32_t nFileSizeLow;          // offset  32
+    uint32_t dwReserved0;           // offset  36
+    uint32_t dwReserved1;           // offset  40
+    uint16_t cFileName[260];        // offset  44 (520 bytes)
+    uint16_t cAlternateFileName[14];// offset 564 (28 bytes)
+} WIN32_FIND_DATAW;                 // total: 592 bytes
 
 // Global kernel fd for syscalls
 static int g_kernel_fd = -1;
+
+// Thread-local last Win32 error code (set by SetLastError, read by GetLastError)
+static __thread DWORD g_last_error = 0;
 
 void win32_api_set_kernel_fd(int fd) {
     g_kernel_fd = fd;
@@ -545,8 +557,8 @@ void __attribute__((ms_abi)) lsw_Sleep(uint32_t milliseconds) {
 }
 
 uint32_t __attribute__((ms_abi)) lsw_GetLastError(void) {
-    // Return success for now
-    return 0;
+    LSW_LOG_DEBUG("GetLastError() -> %u", g_last_error);
+    return g_last_error;
 }
 
 void __attribute__((ms_abi)) lsw_SetUnhandledExceptionFilter(void* handler) {
@@ -1768,13 +1780,41 @@ typedef struct {
     int first_call;
 } lsw_find_data_t;
 
+// Helper: convert UTF-8 string to UTF-16LE into a uint16_t buffer.
+// Handles BMP characters (U+0000..U+FFFF) including basic multi-byte UTF-8.
+// Returns the number of uint16_t code units written (excluding null terminator).
+static int utf8_to_utf16le(const char* src, uint16_t* dst, int dst_capacity) {
+    int out = 0;
+    unsigned char* s = (unsigned char*)src;
+    while (*s && out < dst_capacity - 1) {
+        uint32_t cp;
+        if (*s < 0x80) {
+            cp = *s++;
+        } else if ((*s & 0xE0) == 0xC0) {
+            cp = (*s++ & 0x1F) << 6;
+            cp |= (*s++ & 0x3F);
+        } else if ((*s & 0xF0) == 0xE0) {
+            cp = (*s++ & 0x0F) << 12;
+            cp |= (*s++ & 0x3F) << 6;
+            cp |= (*s++ & 0x3F);
+        } else {
+            // Skip 4-byte (surrogate pair needed) — emit replacement char
+            s += 4;
+            cp = 0xFFFD;
+        }
+        dst[out++] = (uint16_t)cp;
+    }
+    dst[out] = 0;
+    return out;
+}
+
 // Helper: Convert Linux dirent to WIN32_FIND_DATAW
 static void dirent_to_find_data(struct dirent* entry, const char* dir_path, WIN32_FIND_DATAW* find_data) {
     memset(find_data, 0, sizeof(WIN32_FIND_DATAW));
     
-    // Convert filename to wide-char
-    lsw_MultiByteToWideChar(CP_UTF8, 0, entry->d_name, -1, 
-                            find_data->cFileName, sizeof(find_data->cFileName)/sizeof(wchar_t));
+    // Convert filename to UTF-16LE (uint16_t, matching Windows WCHAR)
+    utf8_to_utf16le(entry->d_name, find_data->cFileName,
+                    (int)(sizeof(find_data->cFileName) / sizeof(find_data->cFileName[0])));
     
     // Get file stats
     char full_path[LSW_MAX_PATH];
@@ -2839,6 +2879,322 @@ LONG __attribute__((ms_abi)) lsw_RegCloseKey(HANDLE hkey) {
 // END Registry APIs
 // ============================================================================
 
+// ============================================================================
+// SECTION: Missing high-priority KERNEL32 APIs
+// ============================================================================
+
+// KERNEL32.dll!SetLastError
+void __attribute__((ms_abi)) lsw_SetLastError(DWORD code) {
+    g_last_error = code;
+    LSW_LOG_DEBUG("SetLastError(%u)", code);
+}
+
+// KERNEL32.dll!GetTickCount - milliseconds since boot (wraps at ~49.7 days)
+uint32_t __attribute__((ms_abi)) lsw_GetTickCount(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t ms = (uint32_t)(tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL);
+    LSW_LOG_DEBUG("GetTickCount() -> %u", ms);
+    return ms;
+}
+
+// KERNEL32.dll!GetTickCount64
+uint64_t __attribute__((ms_abi)) lsw_GetTickCount64(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t ms = (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
+    LSW_LOG_DEBUG("GetTickCount64() -> %llu", (unsigned long long)ms);
+    return ms;
+}
+
+// SYSTEM_INFO structure (Windows layout)
+typedef struct {
+    union {
+        uint32_t dwOemId;
+        struct {
+            uint16_t wProcessorArchitecture;
+            uint16_t wReserved;
+        };
+    };
+    uint32_t dwPageSize;
+    void*    lpMinimumApplicationAddress;
+    void*    lpMaximumApplicationAddress;
+    uintptr_t dwActiveProcessorMask;
+    uint32_t dwNumberOfProcessors;
+    uint32_t dwProcessorType;
+    uint32_t dwAllocationGranularity;
+    uint16_t wProcessorLevel;
+    uint16_t wProcessorRevision;
+} SYSTEM_INFO_WIN;
+
+// KERNEL32.dll!GetSystemInfo
+void __attribute__((ms_abi)) lsw_GetSystemInfo(SYSTEM_INFO_WIN* info) {
+    LSW_LOG_INFO("GetSystemInfo called");
+    if (!info) return;
+    memset(info, 0, sizeof(*info));
+    info->wProcessorArchitecture = 9;  // PROCESSOR_ARCHITECTURE_AMD64
+    info->dwPageSize = (uint32_t)sysconf(_SC_PAGESIZE);
+    info->lpMinimumApplicationAddress = (void*)0x10000;
+    info->lpMaximumApplicationAddress = (void*)0x7FFFFFFEFFFF;
+    info->dwNumberOfProcessors = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
+    info->dwProcessorType = 8664;      // PROCESSOR_AMD_X8664
+    info->dwAllocationGranularity = 65536;
+}
+
+// OSVERSIONINFOEXW structure (Windows layout, Unicode)
+typedef struct {
+    uint32_t dwOSVersionInfoSize;
+    uint32_t dwMajorVersion;
+    uint32_t dwMinorVersion;
+    uint32_t dwBuildNumber;
+    uint32_t dwPlatformId;
+    uint16_t szCSDVersion[128];
+    uint16_t wServicePackMajor;
+    uint16_t wServicePackMinor;
+    uint16_t wSuiteMask;
+    uint8_t  wProductType;
+    uint8_t  wReserved;
+} OSVERSIONINFOEXW_WIN;
+
+// KERNEL32.dll!GetVersionExW
+int __attribute__((ms_abi)) lsw_GetVersionExW(OSVERSIONINFOEXW_WIN* info) {
+    LSW_LOG_INFO("GetVersionExW called");
+    if (!info || info->dwOSVersionInfoSize < 148) return 0;  // FALSE
+    info->dwMajorVersion = 10;
+    info->dwMinorVersion = 0;
+    info->dwBuildNumber  = 19041;    // Windows 10 2004
+    info->dwPlatformId   = 2;        // VER_PLATFORM_WIN32_NT
+    return 1;  // TRUE
+}
+
+// KERNEL32.dll!IsDebuggerPresent
+int __attribute__((ms_abi)) lsw_IsDebuggerPresent(void) {
+    LSW_LOG_DEBUG("IsDebuggerPresent() -> FALSE");
+    return 0;  // FALSE
+}
+
+// KERNEL32.dll!DecodePointer — no-op on non-encoded pointers
+void* __attribute__((ms_abi)) lsw_DecodePointer(void* ptr) {
+    return ptr;
+}
+
+// KERNEL32.dll!EncodePointer — no-op
+void* __attribute__((ms_abi)) lsw_EncodePointer(void* ptr) {
+    return ptr;
+}
+
+// KERNEL32.dll!FormatMessageA — minimal stub returning empty string
+uint32_t __attribute__((ms_abi)) lsw_FormatMessageA(
+    uint32_t flags, const void* source, uint32_t message_id,
+    uint32_t language_id, char* buffer, uint32_t size, void* args)
+{
+    (void)flags; (void)source; (void)language_id; (void)args;
+    LSW_LOG_WARN("FormatMessageA(0x%x, msg=0x%x) stub", flags, message_id);
+    if (buffer && size > 0) {
+        snprintf(buffer, size, "Error 0x%x", message_id);
+        return (uint32_t)strlen(buffer);
+    }
+    return 0;
+}
+
+// KERNEL32.dll!FormatMessageW — minimal stub
+uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
+    uint32_t flags, const void* source, uint32_t message_id,
+    uint32_t language_id, uint16_t* buffer, uint32_t size, void* args)
+{
+    (void)flags; (void)source; (void)language_id; (void)args;
+    LSW_LOG_WARN("FormatMessageW(0x%x, msg=0x%x) stub", flags, message_id);
+    if (buffer && size > 0) {
+        buffer[0] = 0;
+    }
+    return 0;
+}
+
+// ---- SRW Locks (use pthread_mutex_t as a simple approximation) ----
+// Windows SRW locks have separate shared/exclusive modes; we approximate both
+// modes with a single mutex since most LSW workloads don't need true read parallelism.
+void __attribute__((ms_abi)) lsw_InitializeSRWLock(void** lock) {
+    if (!lock) return;
+    *lock = malloc(sizeof(pthread_mutex_t));
+    if (*lock) pthread_mutex_init((pthread_mutex_t*)*lock, NULL);
+}
+void __attribute__((ms_abi)) lsw_AcquireSRWLockExclusive(void** lock) {
+    if (lock && *lock) pthread_mutex_lock((pthread_mutex_t*)*lock);
+}
+void __attribute__((ms_abi)) lsw_ReleaseSRWLockExclusive(void** lock) {
+    if (lock && *lock) pthread_mutex_unlock((pthread_mutex_t*)*lock);
+}
+void __attribute__((ms_abi)) lsw_AcquireSRWLockShared(void** lock) {
+    if (lock && *lock) pthread_mutex_lock((pthread_mutex_t*)*lock);
+}
+void __attribute__((ms_abi)) lsw_ReleaseSRWLockShared(void** lock) {
+    if (lock && *lock) pthread_mutex_unlock((pthread_mutex_t*)*lock);
+}
+
+// KERNEL32.dll!TryEnterCriticalSection
+int __attribute__((ms_abi)) lsw_TryEnterCriticalSection(pthread_mutex_t** cs) {
+    if (!cs || !*cs) return 0;
+    return (pthread_mutex_trylock(*cs) == 0) ? 1 : 0;
+}
+
+// ---- FLS (Fiber-Local Storage, backed by TLS on Linux) ----
+#define FLS_SLOTS_MAX 128
+static pthread_key_t g_fls_keys[FLS_SLOTS_MAX];
+static int           g_fls_used[FLS_SLOTS_MAX];
+static void        (*g_fls_callbacks[FLS_SLOTS_MAX])(void*);
+
+uint32_t __attribute__((ms_abi)) lsw_FlsAlloc(void* callback) {
+    for (int i = 0; i < FLS_SLOTS_MAX; i++) {
+        if (!g_fls_used[i]) {
+            g_fls_used[i] = 1;
+            g_fls_callbacks[i] = (void(*)(void*))callback;
+            pthread_key_create(&g_fls_keys[i], (void(*)(void*))callback);
+            LSW_LOG_DEBUG("FlsAlloc -> slot %d", i);
+            return (uint32_t)i;
+        }
+    }
+    LSW_LOG_ERROR("FlsAlloc: no free FLS slots");
+    return 0xFFFFFFFF;  // FLS_OUT_OF_INDEXES
+}
+int __attribute__((ms_abi)) lsw_FlsFree(uint32_t index) {
+    if (index >= FLS_SLOTS_MAX || !g_fls_used[index]) return 0;
+    pthread_key_delete(g_fls_keys[index]);
+    g_fls_used[index] = 0;
+    return 1;
+}
+void* __attribute__((ms_abi)) lsw_FlsGetValue(uint32_t index) {
+    if (index >= FLS_SLOTS_MAX || !g_fls_used[index]) return NULL;
+    return pthread_getspecific(g_fls_keys[index]);
+}
+int __attribute__((ms_abi)) lsw_FlsSetValue(uint32_t index, void* value) {
+    if (index >= FLS_SLOTS_MAX || !g_fls_used[index]) return 0;
+    return (pthread_setspecific(g_fls_keys[index], value) == 0) ? 1 : 0;
+}
+
+// ---- CreateMutexW ----
+void* __attribute__((ms_abi)) lsw_CreateMutexW(void* attrs, int initial_owner, const uint16_t* name) {
+    (void)attrs; (void)name;
+    pthread_mutex_t* m = malloc(sizeof(pthread_mutex_t));
+    if (!m) return NULL;
+    pthread_mutex_init(m, NULL);
+    if (initial_owner) pthread_mutex_lock(m);
+    LSW_LOG_INFO("CreateMutexW -> %p", (void*)m);
+    return (void*)m;
+}
+
+// ---- CreateEventW ----
+// Implemented as a pthread condvar + mutex pair
+typedef struct {
+    pthread_mutex_t mtx;
+    pthread_cond_t  cond;
+    int             signaled;
+    int             manual_reset;
+} lsw_event_t;
+
+void* __attribute__((ms_abi)) lsw_CreateEventW(void* attrs, int manual_reset, int initial_state, const uint16_t* name) {
+    (void)attrs; (void)name;
+    lsw_event_t* ev = malloc(sizeof(lsw_event_t));
+    if (!ev) return NULL;
+    pthread_mutex_init(&ev->mtx, NULL);
+    pthread_cond_init(&ev->cond, NULL);
+    ev->signaled = initial_state;
+    ev->manual_reset = manual_reset;
+    LSW_LOG_INFO("CreateEventW(manual=%d, init=%d) -> %p", manual_reset, initial_state, (void*)ev);
+    return (void*)ev;
+}
+
+// ---- File Mapping (backed by anonymous mmap) ----
+typedef struct {
+    void*  base;
+    size_t size;
+} lsw_file_mapping_t;
+
+void* __attribute__((ms_abi)) lsw_CreateFileMappingW(
+    void* hfile, void* attrs, uint32_t protect,
+    uint32_t size_high, uint32_t size_low, const uint16_t* name)
+{
+    (void)hfile; (void)attrs; (void)protect; (void)name;
+    size_t size = ((size_t)size_high << 32) | (size_t)size_low;
+    if (size == 0) {
+        LSW_LOG_WARN("CreateFileMappingW: size 0 not supported");
+        return NULL;
+    }
+    lsw_file_mapping_t* fm = malloc(sizeof(lsw_file_mapping_t));
+    if (!fm) return NULL;
+    fm->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (fm->base == MAP_FAILED) {
+        LSW_LOG_ERROR("CreateFileMappingW: mmap failed: %s", strerror(errno));
+        free(fm);
+        return NULL;
+    }
+    fm->size = size;
+    LSW_LOG_INFO("CreateFileMappingW: size=%zu -> %p", size, fm->base);
+    return (void*)fm;
+}
+
+void* __attribute__((ms_abi)) lsw_MapViewOfFile(
+    void* hmap, uint32_t access, uint32_t offset_high, uint32_t offset_low, size_t bytes)
+{
+    (void)access;
+    lsw_file_mapping_t* fm = (lsw_file_mapping_t*)hmap;
+    if (!fm) return NULL;
+    size_t offset = ((size_t)offset_high << 32) | (size_t)offset_low;
+    void* view = (uint8_t*)fm->base + offset;
+    LSW_LOG_INFO("MapViewOfFile: map=%p offset=%zu bytes=%zu -> %p", fm->base, offset, bytes, view);
+    return view;
+}
+
+int __attribute__((ms_abi)) lsw_UnmapViewOfFile(void* base) {
+    LSW_LOG_INFO("UnmapViewOfFile: base=%p (no-op — unmapped on CloseHandle)", base);
+    return 1;  // TRUE
+}
+
+// ---- LoadLibraryW / GetModuleHandleW / GetModuleFileNameW ----
+void* __attribute__((ms_abi)) lsw_LoadLibraryW(const uint16_t* filename) {
+    if (!filename) return NULL;
+    // Convert UTF-16 to UTF-8 for LoadLibraryA
+    char buf[512];
+    int i = 0;
+    while (filename[i] && i < 510) {
+        buf[i] = (char)(filename[i] & 0xFF);  // ASCII range only for DLL names
+        i++;
+    }
+    buf[i] = '\0';
+    return lsw_LoadLibraryA(buf);
+}
+
+void* __attribute__((ms_abi)) lsw_GetModuleHandleW(const uint16_t* name) {
+    if (!name) {
+        // NULL = handle of calling module (main PE)
+        LSW_LOG_INFO("GetModuleHandleW(NULL) -> returning NULL (no self handle)");
+        return NULL;
+    }
+    char buf[256];
+    int i = 0;
+    while (name[i] && i < 254) { buf[i] = (char)(name[i] & 0xFF); i++; }
+    buf[i] = '\0';
+    LSW_LOG_INFO("GetModuleHandleW(%s) -> using GetModuleHandleA", buf);
+    return lsw_GetModuleHandleA(buf);
+}
+
+uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameW(void* module, uint16_t* buf, uint32_t size) {
+    (void)module;
+    LSW_LOG_WARN("GetModuleFileNameW stub");
+    if (buf && size > 0) buf[0] = 0;
+    return 0;
+}
+
+uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameA(void* module, char* buf, uint32_t size) {
+    (void)module;
+    LSW_LOG_WARN("GetModuleFileNameA stub");
+    if (buf && size > 0) buf[0] = 0;
+    return 0;
+}
+
+// ============================================================================
+// END Missing high-priority KERNEL32 APIs
+// ============================================================================
+
 // Disable pedantic warnings for function pointer to void* casts
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -2990,6 +3346,37 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "WideCharToMultiByte", (void*)lsw_WideCharToMultiByte},
     {"KERNEL32.dll", "TlsGetValue", (void*)lsw_TlsGetValue},
     {"KERNEL32.dll", "VirtualQuery", (void*)lsw_VirtualQuery},
+
+    // KERNEL32.dll - newly added APIs
+    {"KERNEL32.dll", "SetLastError", (void*)lsw_SetLastError},
+    {"KERNEL32.dll", "GetTickCount", (void*)lsw_GetTickCount},
+    {"KERNEL32.dll", "GetTickCount64", (void*)lsw_GetTickCount64},
+    {"KERNEL32.dll", "GetSystemInfo", (void*)lsw_GetSystemInfo},
+    {"KERNEL32.dll", "GetVersionExW", (void*)lsw_GetVersionExW},
+    {"KERNEL32.dll", "IsDebuggerPresent", (void*)lsw_IsDebuggerPresent},
+    {"KERNEL32.dll", "DecodePointer", (void*)lsw_DecodePointer},
+    {"KERNEL32.dll", "EncodePointer", (void*)lsw_EncodePointer},
+    {"KERNEL32.dll", "FormatMessageA", (void*)lsw_FormatMessageA},
+    {"KERNEL32.dll", "FormatMessageW", (void*)lsw_FormatMessageW},
+    {"KERNEL32.dll", "InitializeSRWLock", (void*)lsw_InitializeSRWLock},
+    {"KERNEL32.dll", "AcquireSRWLockExclusive", (void*)lsw_AcquireSRWLockExclusive},
+    {"KERNEL32.dll", "ReleaseSRWLockExclusive", (void*)lsw_ReleaseSRWLockExclusive},
+    {"KERNEL32.dll", "AcquireSRWLockShared", (void*)lsw_AcquireSRWLockShared},
+    {"KERNEL32.dll", "ReleaseSRWLockShared", (void*)lsw_ReleaseSRWLockShared},
+    {"KERNEL32.dll", "TryEnterCriticalSection", (void*)lsw_TryEnterCriticalSection},
+    {"KERNEL32.dll", "FlsAlloc", (void*)lsw_FlsAlloc},
+    {"KERNEL32.dll", "FlsFree", (void*)lsw_FlsFree},
+    {"KERNEL32.dll", "FlsGetValue", (void*)lsw_FlsGetValue},
+    {"KERNEL32.dll", "FlsSetValue", (void*)lsw_FlsSetValue},
+    {"KERNEL32.dll", "CreateMutexW", (void*)lsw_CreateMutexW},
+    {"KERNEL32.dll", "CreateEventW", (void*)lsw_CreateEventW},
+    {"KERNEL32.dll", "CreateFileMappingW", (void*)lsw_CreateFileMappingW},
+    {"KERNEL32.dll", "MapViewOfFile", (void*)lsw_MapViewOfFile},
+    {"KERNEL32.dll", "UnmapViewOfFile", (void*)lsw_UnmapViewOfFile},
+    {"KERNEL32.dll", "LoadLibraryW", (void*)lsw_LoadLibraryW},
+    {"KERNEL32.dll", "GetModuleHandleW", (void*)lsw_GetModuleHandleW},
+    {"KERNEL32.dll", "GetModuleFileNameW", (void*)lsw_GetModuleFileNameW},
+    {"KERNEL32.dll", "GetModuleFileNameA", (void*)lsw_GetModuleFileNameA},
 };
 
 #pragma GCC diagnostic pop

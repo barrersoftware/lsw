@@ -3,27 +3,40 @@
 **Windows binary support for Linux kernels - WSL2 in reverse**
 
 [![License](https://img.shields.io/badge/License-BFSL_v1.2-blue.svg)](https://barrersoftware.com/foss-license.html)
-[![Status](https://img.shields.io/badge/Status-50%25_Complete-yellow.svg)]()
+[![Status](https://img.shields.io/badge/Status-70%25_Complete-yellow.svg)]()
 [![Build](https://img.shields.io/badge/Build-Passing-success.svg)]()
 
-## 🚀 Current Status: 50% Complete
+## 🚀 Current Status: ~70% Complete
 
 **What Works NOW:**
 - ✅ **PE Loader** - Parses and loads Windows executables (32-bit & 64-bit)
 - ✅ **Kernel Module** - `/dev/lsw` device interface for kernel-userspace communication
 - ✅ **Memory Mapping** - Sections loaded with proper RWX permissions
 - ✅ **Process Registration** - PE processes tracked in kernel space
+- ✅ **Import Resolution** - DLL imports parsed and resolved against Win32 API stubs
+- ✅ **Base Relocations** - PE `.reloc` section applied when loaded at non-preferred base
+- ✅ **Win32 API Stubs** - 175+ functions across KERNEL32, msvcrt, advapi32, ws2_32
+  - File I/O: CreateFileW/A, ReadFile, WriteFile, FindFirstFileW, FindNextFileW
+  - Memory: VirtualAlloc/Free, HeapAlloc/Free, LocalAlloc/Free, CreateFileMappingW, MapViewOfFile
+  - Threading: CreateThread, WaitForSingleObject, Critical Sections, SRW Locks, FLS
+  - Registry: RegOpenKeyExA/W, RegQueryValueExA, RegSetValueExA, RegCloseKey
+  - Filesystem: GetTempPath, GetWindowsDirectory, GetEnvironmentVariable, ExpandEnvironmentStrings
+  - Networking: WSAStartup, socket, connect, send, recv (via Winsock → POSIX)
+  - Misc: GetTickCount64, GetSystemInfo, GetVersionExW, IsDebuggerPresent, FormatMessageA/W
+- ✅ **Filesystem Translation** - Windows paths (`C:\`) → Linux paths (`/mnt/c/`)
+- ✅ **Registry Emulation** - Backed by `/etc/lsw/registry/`
 
-**What's Next:**
-- 🔨 Import Resolution - Parse DLL imports and resolve function addresses
-- 🔨 Win32 API Stubs - kernel32.dll basic functions
-- 🔨 Syscall Hooks - Intercept and translate Windows syscalls
-- 🔨 Execution - Actually run Windows binaries
+**What's Still Needed (~30% remaining):**
+- 🔨 Ordinal imports (some DLLs export by ordinal — currently skipped)
+- 🔨 Thread-local storage (TLS directory processing)
+- 🔨 GDI / USER32 windowing stubs for GUI apps
+- 🔨 MSI installer full support
+- 🔨 DirectX → Vulkan/OpenGL translation
 
 **Progress Roadmap:**
-- 50% → 85%: Full PE execution (import resolution + syscall translation)
-- 85% → 95%: MSI installer support
-- 95% → 100%: UWP modern app support
+- **70% → 85%**: Full console app compatibility (ordinal imports, TLS, more APIs)
+- **85% → 95%**: GUI app support (USER32/GDI surface)
+- **95% → 100%**: MSI installer + UWP modern app support
 
 ---
 

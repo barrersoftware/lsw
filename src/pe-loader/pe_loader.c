@@ -275,9 +275,83 @@ bool pe_resolve_imports(pe_image_t* image) {
 }
 
 bool pe_apply_relocations(pe_image_t* image) {
-    LSW_LOG_INFO("Relocation not yet implemented");
-    // TODO: Implement base relocations
-    // This is needed if image isn't loaded at preferred base address
+    uint64_t preferred_base = pe_get_image_base(&image->pe);
+    uint64_t actual_base    = (uint64_t)(uintptr_t)image->image_base;
+    int64_t  delta          = (int64_t)(actual_base - preferred_base);
+
+    if (delta == 0) {
+        LSW_LOG_INFO("Relocations: loaded at preferred base 0x%llx — no fixup needed",
+                     (unsigned long long)preferred_base);
+        return true;
+    }
+
+    LSW_LOG_INFO("Relocations: base delta = 0x%llx (preferred=0x%llx actual=0x%llx)",
+                 (unsigned long long)(uint64_t)delta,
+                 (unsigned long long)preferred_base,
+                 (unsigned long long)actual_base);
+
+    pe_data_directory_t* reloc_dir = pe_get_data_directory(&image->pe, PE_DIR_BASERELOC);
+    if (!reloc_dir || reloc_dir->VirtualAddress == 0 || reloc_dir->Size == 0) {
+        LSW_LOG_WARN("Relocations: no .reloc section present — ASLR may cause crashes");
+        return true;
+    }
+
+    // Relocation block header layout (8 bytes per block):
+    //   uint32_t VirtualAddress   -- RVA of the 4 KB page
+    //   uint32_t SizeOfBlock      -- total bytes including this header
+    //   uint16_t Entries[]        -- (SizeOfBlock-8)/2 entries follow
+    // Each entry: upper 4 bits = type, lower 12 bits = offset within page.
+    //   0  = IMAGE_REL_BASED_ABSOLUTE  (padding, skip)
+    //   3  = IMAGE_REL_BASED_HIGHLOW   (32-bit fixup)
+    //   10 = IMAGE_REL_BASED_DIR64     (64-bit fixup)
+
+    uint8_t* reloc_base = (uint8_t*)image->image_base + reloc_dir->VirtualAddress;
+    uint32_t remaining  = reloc_dir->Size;
+    int total_fixups    = 0;
+
+    while (remaining >= 8) {
+        uint32_t page_rva      = *(uint32_t*)(reloc_base);
+        uint32_t block_size    = *(uint32_t*)(reloc_base + 4);
+
+        if (block_size < 8 || block_size > remaining) {
+            LSW_LOG_ERROR("Relocations: malformed block at RVA 0x%x (size=%u)", page_rva, block_size);
+            break;
+        }
+
+        uint16_t* entries    = (uint16_t*)(reloc_base + 8);
+        int       num_entries = (int)((block_size - 8) / 2);
+
+        for (int i = 0; i < num_entries; i++) {
+            int      type   = entries[i] >> 12;
+            uint32_t offset = entries[i] & 0x0FFF;
+            uint8_t* target = (uint8_t*)image->image_base + page_rva + offset;
+
+            if (type == 0) {
+                // IMAGE_REL_BASED_ABSOLUTE — padding, skip
+            } else if (type == 3) {
+                // IMAGE_REL_BASED_HIGHLOW — add 32-bit delta
+                uint32_t val;
+                memcpy(&val, target, 4);
+                val = (uint32_t)(val + (int32_t)delta);
+                memcpy(target, &val, 4);
+                total_fixups++;
+            } else if (type == 10) {
+                // IMAGE_REL_BASED_DIR64 — add 64-bit delta
+                uint64_t val;
+                memcpy(&val, target, 8);
+                val = (uint64_t)((int64_t)val + delta);
+                memcpy(target, &val, 8);
+                total_fixups++;
+            } else {
+                LSW_LOG_WARN("Relocations: unsupported type %d at RVA 0x%x+0x%x", type, page_rva, offset);
+            }
+        }
+
+        reloc_base += block_size;
+        remaining  -= block_size;
+    }
+
+    LSW_LOG_INFO("Relocations: applied %d fixups", total_fixups);
     return true;
 }
 
