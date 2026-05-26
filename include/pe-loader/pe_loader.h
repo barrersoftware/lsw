@@ -30,6 +30,9 @@ bool pe_map_sections(pe_image_t* image);
 // Resolve imports
 bool pe_resolve_imports(pe_image_t* image);
 
+// Resolve delay-load imports (eager)
+bool pe_resolve_delay_imports(pe_image_t* image);
+
 // Apply relocations
 bool pe_apply_relocations(pe_image_t* image);
 

@@ -32,6 +32,9 @@
 // DLL chain loader — real DLL search & export resolution
 // ============================================================================
 
+/* Forward declaration — implementation after pe_resolve_imports */
+static const char* apiset_resolve(const char* dll_name);
+
 /*
  * Search paths for real Windows DLL files, in priority order.
  * Users can place DLL files (from a Windows installation, Wine, or the
@@ -472,7 +475,12 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
         munmap(file_data, file_size);
         return false;
     }
-    
+
+    // Resolve delay-load imports (eager resolution)
+    if (!pe_resolve_delay_imports(image)) {
+        LSW_LOG_WARN("Delay-load import resolution had errors (non-fatal)");
+    }
+
     // Apply relocations if needed
     if (!pe_apply_relocations(image)) {
         LSW_LOG_ERROR("Failed to apply relocations");
@@ -615,8 +623,12 @@ bool pe_resolve_imports(pe_image_t* image) {
     
     // Iterate through each DLL
     while (import_desc->NameRVA != 0) {
-        const char* dll_name = (const char*)((uint8_t*)image->image_base + import_desc->NameRVA);
-        LSW_LOG_INFO("  DLL: %s", dll_name);
+        const char* raw_dll  = (const char*)((uint8_t*)image->image_base + import_desc->NameRVA);
+        const char* dll_name = apiset_resolve(raw_dll);
+        if (strcmp(raw_dll, dll_name) != 0)
+            LSW_LOG_INFO("  DLL: %s → %s", raw_dll, dll_name);
+        else
+            LSW_LOG_INFO("  DLL: %s", dll_name);
         dll_count++;
         
         // Get the Import Address Table (IAT)
@@ -664,6 +676,153 @@ bool pe_resolve_imports(pe_image_t* image) {
     }
     
     LSW_LOG_INFO("Import resolution complete: %d DLLs, %d functions", dll_count, func_count);
+    return true;
+}
+
+// ============================================================================
+// API-set (api-ms-win-*) → host DLL name mapping
+// ============================================================================
+
+/*
+ * Windows API sets are virtual DLL names (api-ms-win-crt-runtime-l1-1-0.dll)
+ * that map to real host DLLs (ucrtbase.dll, ntdll.dll, etc.).
+ * Our Win32 stub tables are registered under the real DLL names, so we need to
+ * map api-ms-win-* names before attempting resolution.
+ *
+ * Table covers the most common API sets used by MSVC-linked binaries.
+ */
+typedef struct { const char* prefix; const char* host; } apiset_entry_t;
+
+static const apiset_entry_t g_apiset_map[] = {
+    /* CRT */
+    { "api-ms-win-crt-runtime",    "ucrtbase.dll"  },
+    { "api-ms-win-crt-string",     "ucrtbase.dll"  },
+    { "api-ms-win-crt-stdio",      "ucrtbase.dll"  },
+    { "api-ms-win-crt-math",       "ucrtbase.dll"  },
+    { "api-ms-win-crt-convert",    "ucrtbase.dll"  },
+    { "api-ms-win-crt-locale",     "ucrtbase.dll"  },
+    { "api-ms-win-crt-heap",       "ucrtbase.dll"  },
+    { "api-ms-win-crt-environment","ucrtbase.dll"  },
+    { "api-ms-win-crt-filesystem", "ucrtbase.dll"  },
+    { "api-ms-win-crt-time",       "ucrtbase.dll"  },
+    { "api-ms-win-crt-multibyte",  "ucrtbase.dll"  },
+    { "api-ms-win-crt-private",    "ucrtbase.dll"  },
+    /* Core */
+    { "api-ms-win-core-processthreads", "KERNEL32.dll" },
+    { "api-ms-win-core-synch",          "KERNEL32.dll" },
+    { "api-ms-win-core-file",           "KERNEL32.dll" },
+    { "api-ms-win-core-heap",           "KERNEL32.dll" },
+    { "api-ms-win-core-memory",         "KERNEL32.dll" },
+    { "api-ms-win-core-string",         "KERNEL32.dll" },
+    { "api-ms-win-core-sysinfo",        "KERNEL32.dll" },
+    { "api-ms-win-core-localization",   "KERNEL32.dll" },
+    { "api-ms-win-core-errorhandling",  "KERNEL32.dll" },
+    { "api-ms-win-core-console",        "KERNEL32.dll" },
+    { "api-ms-win-core-debug",          "KERNEL32.dll" },
+    { "api-ms-win-core-handle",         "KERNEL32.dll" },
+    { "api-ms-win-core-libraryloader",  "KERNEL32.dll" },
+    { "api-ms-win-core-namedpipe",      "KERNEL32.dll" },
+    { "api-ms-win-core-io",             "KERNEL32.dll" },
+    { "api-ms-win-core-com",            "ole32.dll"    },
+    { "api-ms-win-core-registry",       "ADVAPI32.dll" },
+    { "api-ms-win-security",            "ADVAPI32.dll" },
+    { "api-ms-win-eventing",            "ADVAPI32.dll" },
+    { "api-ms-win-ntuser",              "USER32.dll"   },
+    { "api-ms-win-dx",                  "GDI32.dll"    },
+    { NULL, NULL }
+};
+
+static const char* apiset_resolve(const char* dll_name) {
+    char lower[128];
+    size_t len = strlen(dll_name);
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (size_t i = 0; i < len; i++) lower[i] = (char)tolower((unsigned char)dll_name[i]);
+    lower[len] = '\0';
+    if (strncmp(lower, "api-ms-win-", 11) != 0 &&
+        strncmp(lower, "ext-ms-win-", 11) != 0) return dll_name;
+    for (const apiset_entry_t* e = g_apiset_map; e->prefix; e++) {
+        if (strncmp(lower, e->prefix, strlen(e->prefix)) == 0) return e->host;
+    }
+    /* Unknown api-ms-win- → fall back to KERNEL32 as best-effort */
+    return "KERNEL32.dll";
+}
+
+// ============================================================================
+// Delay-load import resolution
+// ============================================================================
+
+/*
+ * Delay-load imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) are normally resolved
+ * on first call via a small thunk generated by the linker.  Since we don't run
+ * those thunks, we resolve them eagerly at load time using the same
+ * resolve_import_with_dll_chain() logic as regular imports.
+ *
+ * Each entry in the delay-load IAT is patched to the real address.  If the
+ * function can't be resolved, the IAT slot is left pointing at the generic stub
+ * so the program doesn't hard-crash on a NULL call.
+ */
+bool pe_resolve_delay_imports(pe_image_t* image) {
+    pe_data_directory_t* delay_dir = pe_get_data_directory(&image->pe, PE_DIR_DELAY_IMPORT);
+    if (!delay_dir || !delay_dir->VirtualAddress) {
+        LSW_LOG_INFO("No delay-load import directory");
+        return true;
+    }
+
+    LSW_LOG_INFO("Resolving delay-load imports...");
+    uint8_t* base = (uint8_t*)image->image_base;
+    pe_delay_load_descriptor_t* desc =
+        (pe_delay_load_descriptor_t*)(base + delay_dir->VirtualAddress);
+
+    int total_funcs = 0, resolved = 0;
+    while (desc->DllNameRVA) {
+        const char* raw_name = (const char*)(base + desc->DllNameRVA);
+        const char* dll_name = apiset_resolve(raw_name);
+        if (strcmp(raw_name, dll_name) != 0)
+            LSW_LOG_INFO("  Delay-load DLL: %s → %s", raw_name, dll_name);
+        else
+            LSW_LOG_INFO("  Delay-load DLL: %s", raw_name);
+
+        if (!desc->ImportAddressTableRVA || !desc->ImportNameTableRVA) {
+            desc++;
+            continue;
+        }
+
+        uint64_t* iat = (uint64_t*)(base + desc->ImportAddressTableRVA);
+        uint64_t* int_tbl = (uint64_t*)(base + desc->ImportNameTableRVA);
+
+        for (int i = 0; int_tbl[i] != 0; i++) {
+            total_funcs++;
+            void* addr = NULL;
+            if (int_tbl[i] & PE_ORDINAL_FLAG64) {
+                uint16_t ord = (uint16_t)(int_tbl[i] & 0xFFFF);
+                addr = win32_api_resolve_ordinal(dll_name, ord);
+                if (!addr) addr = resolve_import_with_dll_chain(dll_name, NULL);
+                if (addr) {
+                    iat[i] = (uint64_t)addr;
+                    resolved++;
+                    LSW_LOG_DEBUG("    ✓ %s!#%u (delay) -> %p", dll_name, ord, addr);
+                } else {
+                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                    LSW_LOG_WARN("    ✗ %s!#%u (delay-ord) - stub", dll_name, ord);
+                }
+            } else {
+                pe_import_by_name_t* ibn =
+                    (pe_import_by_name_t*)(base + (uint32_t)int_tbl[i]);
+                const char* fn = (const char*)ibn->Name;
+                addr = resolve_import_with_dll_chain(dll_name, fn);
+                if (addr) {
+                    iat[i] = (uint64_t)addr;
+                    resolved++;
+                    LSW_LOG_DEBUG("    ✓ %s!%s (delay) -> %p", dll_name, fn, addr);
+                } else {
+                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                    LSW_LOG_WARN("    ✗ %s!%s (delay) - stub", dll_name, fn);
+                }
+            }
+        }
+        desc++;
+    }
+    LSW_LOG_INFO("Delay-load resolution: %d/%d resolved", resolved, total_funcs);
     return true;
 }
 
