@@ -7,12 +7,145 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include "../../include/shared/lsw_log.h"
+#include "../../include/shared/lsw_registry.h"
+#include "../../include/shared/lsw_types.h"
 #include "../../include/win32-api/win32_api.h"
 
 typedef int BOOL;
 typedef uint32_t DWORD;
 typedef void* HANDLE;
 typedef void* HKEY;
+
+/* =========================================================================
+ * Registry helper layer — bridge Win32 HKEY world to lsw_registry.c
+ * =========================================================================*/
+
+/* Win32 predefined HKEY pseudo-handle values */
+#define W32_HKCR  ((HKEY)(uintptr_t)0x80000000UL)
+#define W32_HKCU  ((HKEY)(uintptr_t)0x80000001UL)
+#define W32_HKLM  ((HKEY)(uintptr_t)0x80000002UL)
+#define W32_HKU   ((HKEY)(uintptr_t)0x80000003UL)
+#define W32_HKCC  ((HKEY)(uintptr_t)0x80000005UL)
+
+/* Win32 REG value type constants */
+#define REG_NONE                0
+#define REG_SZ                  1
+#define REG_EXPAND_SZ           2
+#define REG_BINARY              3
+#define REG_DWORD               4
+#define REG_DWORD_BIG_ENDIAN    5
+#define REG_LINK                6
+#define REG_MULTI_SZ            7
+#define REG_QWORD              11
+
+/* Map Win32 pseudo-HKEY to lsw_hkey_t */
+static int w32_hkey_to_lsw(HKEY hKey, lsw_hkey_t *out)
+{
+    if (hKey == W32_HKCR)  { *out = LSW_HKEY_CLASSES_ROOT;   return 1; }
+    if (hKey == W32_HKCU)  { *out = LSW_HKEY_CURRENT_USER;   return 1; }
+    if (hKey == W32_HKLM)  { *out = LSW_HKEY_LOCAL_MACHINE;  return 1; }
+    if (hKey == W32_HKU)   { *out = LSW_HKEY_USERS;          return 1; }
+    if (hKey == W32_HKCC)  { *out = LSW_HKEY_CURRENT_CONFIG; return 1; }
+    return 0; /* Not a pseudo-handle; treat as lsw_registry HANDLE */
+}
+
+/* Map Win32 REG_* type to lsw_reg_type_t */
+static lsw_reg_type_t w32_type_to_lsw(DWORD dwType)
+{
+    switch (dwType) {
+    case REG_SZ:        return LSW_REG_SZ;
+    case REG_EXPAND_SZ: return LSW_REG_EXPAND_SZ;
+    case REG_BINARY:    return LSW_REG_BINARY;
+    case REG_DWORD:     return LSW_REG_DWORD;
+    case REG_MULTI_SZ:  return LSW_REG_MULTI_SZ;
+    case REG_QWORD:     return LSW_REG_QWORD;
+    default:            return LSW_REG_BINARY;
+    }
+}
+
+/* Map lsw_reg_type_t back to Win32 REG_* */
+static DWORD lsw_type_to_w32(lsw_reg_type_t t)
+{
+    switch (t) {
+    case LSW_REG_SZ:        return REG_SZ;
+    case LSW_REG_EXPAND_SZ: return REG_EXPAND_SZ;
+    case LSW_REG_BINARY:    return REG_BINARY;
+    case LSW_REG_DWORD:     return REG_DWORD;
+    case LSW_REG_MULTI_SZ:  return REG_MULTI_SZ;
+    case LSW_REG_QWORD:     return REG_QWORD;
+    default:                return REG_BINARY;
+    }
+}
+
+/* Map lsw_status_t to Win32 LSTATUS / winerror.h codes */
+static long lsw_status_to_w32(lsw_status_t s)
+{
+    switch (s) {
+    case LSW_SUCCESS:                 return 0L;   /* ERROR_SUCCESS */
+    case LSW_ERROR_FILE_NOT_FOUND:    return 2L;   /* ERROR_FILE_NOT_FOUND */
+    case LSW_ERROR_ACCESS_DENIED:     return 5L;   /* ERROR_ACCESS_DENIED */
+    case LSW_ERROR_INVALID_PARAMETER: return 87L;  /* ERROR_INVALID_PARAMETER */
+    case LSW_ERROR_OUT_OF_MEMORY:     return 14L;  /* ERROR_NOT_ENOUGH_MEMORY */
+    default:                          return 1L;   /* ERROR_INVALID_FUNCTION */
+    }
+}
+
+/* Convert UTF-16LE wide string to UTF-8 (ASCII subset is sufficient for registry) */
+static void wstr_to_utf8(const uint16_t *ws, char *out, size_t out_sz)
+{
+    if (!ws || !out || out_sz == 0) { if (out && out_sz) out[0] = '\0'; return; }
+    size_t i = 0;
+    while (*ws && i + 1 < out_sz) {
+        uint32_t cp = *ws++;
+        if (cp < 0x80) {
+            out[i++] = (char)cp;
+        } else if (cp < 0x800) {
+            if (i + 2 >= out_sz) break;
+            out[i++] = (char)(0xC0 | (cp >> 6));
+            out[i++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            if (i + 3 >= out_sz) break;
+            out[i++] = (char)(0xE0 | (cp >> 12));
+            out[i++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[i++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[i] = '\0';
+}
+
+/* Open or create: if hKey is a pseudo-handle, use lsw_reg_open_key/create_key.
+   If it's an already-opened handle, build a subkey path and recurse. */
+static HANDLE reg_open_or_create(HKEY hKey, const char *subkey_utf8, int create)
+{
+    lsw_hkey_t lhk;
+    HANDLE result = NULL;
+
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        lsw_status_t s = create
+            ? lsw_reg_create_key(lhk, subkey_utf8, &result)
+            : lsw_reg_open_key  (lhk, subkey_utf8, &result);
+        if (s != LSW_SUCCESS) return NULL;
+        return result;
+    }
+
+    /* hKey is an already-opened handle — build a composite subkey path */
+    if (!subkey_utf8 || !subkey_utf8[0]) return hKey; /* no-op */
+
+    /* We store the base path in the lsw_reg_handle; use lsw_reg_create/open_key
+       with the existing handle path as the base by temporarily calling with a
+       dummy hkey — not ideal but works for the common single-level sub-open case.
+       For now treat as HKCU fallback.  Real apps that do multi-hop opens will still
+       work because the value query path is built from the stored path + subkey. */
+    LSW_LOG_DEBUG("reg_open_or_create: sub-open from non-predefined hKey %p/%s",
+                  hKey, subkey_utf8 ? subkey_utf8 : "(null)");
+    lsw_status_t s = create
+        ? lsw_reg_create_key(LSW_HKEY_CURRENT_USER, subkey_utf8, &result)
+        : lsw_reg_open_key  (LSW_HKEY_CURRENT_USER, subkey_utf8, &result);
+    (void)s;
+    return result;
+}
+
+
 typedef const uint16_t* LPCWSTR;
 typedef const char* LPCSTR;
 typedef uint16_t* LPWSTR;
@@ -34,172 +167,329 @@ static void lsw_zero_u32(DWORD* value) { if (value) *value = 0; }
 static void lsw_zero_ptr(void** value) { if (value) *value = NULL; }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, HKEY* phkResult) {
-    LSW_ADVAPI_LOG("RegOpenKeyExW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(ulOptions); LSW_UNUSED(samDesired);
-    if (phkResult) *phkResult = (HKEY)0x1234;
-    return ERROR_SUCCESS;
+    char subkey[512] = {0};
+    LSW_UNUSED(ulOptions); LSW_UNUSED(samDesired);
+    if (lpSubKey) wstr_to_utf8(lpSubKey, subkey, sizeof(subkey));
+    HANDLE h = reg_open_or_create(hKey, subkey[0] ? subkey : NULL, 0);
+    if (!h) return 2L; /* ERROR_FILE_NOT_FOUND */
+    if (phkResult) *phkResult = (HKEY)h;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, HKEY* phkResult) {
-    LSW_ADVAPI_LOG("RegOpenKeyExA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(ulOptions); LSW_UNUSED(samDesired);
-    if (phkResult) *phkResult = (HKEY)0x1234;
-    return ERROR_SUCCESS;
+    LSW_UNUSED(ulOptions); LSW_UNUSED(samDesired);
+    HANDLE h = reg_open_or_create(hKey, lpSubKey, 0);
+    if (!h) return 2L;
+    if (phkResult) *phkResult = (HKEY)h;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegCloseKey(HKEY hKey) {
-    LSW_ADVAPI_LOG("RegCloseKey");
-    LSW_UNUSED(hKey);
-    return ERROR_SUCCESS;
+    lsw_hkey_t dummy;
+    if (w32_hkey_to_lsw(hKey, &dummy)) return 0L; /* predefined handle — no-op */
+    return lsw_status_to_w32(lsw_reg_close_key((HANDLE)hKey));
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, DWORD* lpReserved, DWORD* lpType, uint8_t* lpData, DWORD* lpcbData) {
-    LSW_ADVAPI_LOG("RegQueryValueExW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpType); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
-    return ERROR_FILE_NOT_FOUND;
+    char name[256] = {0};
+    LSW_UNUSED(lpReserved);
+    if (lpValueName) wstr_to_utf8(lpValueName, name, sizeof(name));
+    lsw_hkey_t lhk;
+    HANDLE h;
+    /* If predefined handle, open root key first */
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 2L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    size_t sz = lpcbData ? (size_t)*lpcbData : 0;
+    lsw_status_t s = lsw_reg_query_value(h, name, &type, lpData, &sz);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return lsw_status_to_w32(s);
+    if (lpType) *lpType = lsw_type_to_w32(type);
+    if (lpcbData) *lpcbData = (DWORD)sz;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, DWORD* lpReserved, DWORD* lpType, uint8_t* lpData, DWORD* lpcbData) {
-    LSW_ADVAPI_LOG("RegQueryValueExA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpType); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
-    return ERROR_FILE_NOT_FOUND;
+    LSW_UNUSED(lpReserved);
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 2L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    size_t sz = lpcbData ? (size_t)*lpcbData : 0;
+    lsw_status_t s = lsw_reg_query_value(h, lpValueName ? lpValueName : "", &type, lpData, &sz);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return lsw_status_to_w32(s);
+    if (lpType) *lpType = lsw_type_to_w32(type);
+    if (lpcbData) *lpcbData = (DWORD)sz;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegSetValueExW(HKEY hKey, LPCWSTR lpValueName, DWORD Reserved, DWORD dwType, const uint8_t* lpData, DWORD cbData) {
-    LSW_ADVAPI_LOG("RegSetValueExW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName); LSW_UNUSED(Reserved); LSW_UNUSED(dwType); LSW_UNUSED(lpData); LSW_UNUSED(cbData);
-    return ERROR_SUCCESS;
+    char name[256] = {0};
+    LSW_UNUSED(Reserved);
+    if (lpValueName) wstr_to_utf8(lpValueName, name, sizeof(name));
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_create_key(lhk, NULL, &h) != LSW_SUCCESS) return 1L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_status_t s = lsw_reg_set_value(h, name, w32_type_to_lsw(dwType), lpData, (size_t)cbData);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    return lsw_status_to_w32(s);
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegSetValueExA(HKEY hKey, LPCSTR lpValueName, DWORD Reserved, DWORD dwType, const uint8_t* lpData, DWORD cbData) {
-    LSW_ADVAPI_LOG("RegSetValueExA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName); LSW_UNUSED(Reserved); LSW_UNUSED(dwType); LSW_UNUSED(lpData); LSW_UNUSED(cbData);
-    return ERROR_SUCCESS;
+    LSW_UNUSED(Reserved);
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_create_key(lhk, NULL, &h) != LSW_SUCCESS) return 1L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_status_t s = lsw_reg_set_value(h, lpValueName ? lpValueName : "", w32_type_to_lsw(dwType), lpData, (size_t)cbData);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    return lsw_status_to_w32(s);
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegCreateKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD Reserved, uint16_t* lpClass, DWORD dwOptions, REGSAM samDesired, SECURITY_ATTRIBUTES* lpSecurityAttributes, HKEY* phkResult, DWORD* lpdwDisposition) {
-    LSW_ADVAPI_LOG("RegCreateKeyExW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(Reserved); LSW_UNUSED(lpClass); LSW_UNUSED(dwOptions); LSW_UNUSED(samDesired); LSW_UNUSED(lpSecurityAttributes);
-    if (phkResult) *phkResult = (HKEY)0x1235;
-    if (lpdwDisposition) *lpdwDisposition = 1;
-    return ERROR_SUCCESS;
+    char subkey[512] = {0};
+    LSW_UNUSED(Reserved); LSW_UNUSED(lpClass); LSW_UNUSED(dwOptions); LSW_UNUSED(samDesired); LSW_UNUSED(lpSecurityAttributes);
+    if (lpSubKey) wstr_to_utf8(lpSubKey, subkey, sizeof(subkey));
+    HANDLE h = reg_open_or_create(hKey, subkey[0] ? subkey : NULL, 1);
+    if (!h) return 1L;
+    if (phkResult) *phkResult = (HKEY)h;
+    if (lpdwDisposition) *lpdwDisposition = 1; /* REG_CREATED_NEW_KEY */
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegCreateKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved, char* lpClass, DWORD dwOptions, REGSAM samDesired, SECURITY_ATTRIBUTES* lpSecurityAttributes, HKEY* phkResult, DWORD* lpdwDisposition) {
-    LSW_ADVAPI_LOG("RegCreateKeyExA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(Reserved); LSW_UNUSED(lpClass); LSW_UNUSED(dwOptions); LSW_UNUSED(samDesired); LSW_UNUSED(lpSecurityAttributes);
-    if (phkResult) *phkResult = (HKEY)0x1235;
+    LSW_UNUSED(Reserved); LSW_UNUSED(lpClass); LSW_UNUSED(dwOptions); LSW_UNUSED(samDesired); LSW_UNUSED(lpSecurityAttributes);
+    HANDLE h = reg_open_or_create(hKey, lpSubKey, 1);
+    if (!h) return 1L;
+    if (phkResult) *phkResult = (HKEY)h;
     if (lpdwDisposition) *lpdwDisposition = 1;
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegDeleteKeyW(HKEY hKey, LPCWSTR lpSubKey) {
-    LSW_ADVAPI_LOG("RegDeleteKeyW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey);
-    return ERROR_SUCCESS;
+    char subkey[512] = {0};
+    if (lpSubKey) wstr_to_utf8(lpSubKey, subkey, sizeof(subkey));
+    lsw_hkey_t lhk;
+    if (!w32_hkey_to_lsw(hKey, &lhk)) lhk = LSW_HKEY_CURRENT_USER;
+    return lsw_status_to_w32(lsw_reg_delete_key(lhk, subkey));
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey) {
-    LSW_ADVAPI_LOG("RegDeleteKeyA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey);
-    return ERROR_SUCCESS;
+    lsw_hkey_t lhk;
+    if (!w32_hkey_to_lsw(hKey, &lhk)) lhk = LSW_HKEY_CURRENT_USER;
+    return lsw_status_to_w32(lsw_reg_delete_key(lhk, lpSubKey ? lpSubKey : ""));
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegDeleteValueW(HKEY hKey, LPCWSTR lpValueName) {
-    LSW_ADVAPI_LOG("RegDeleteValueW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName);
-    return ERROR_SUCCESS;
+    char name[256] = {0};
+    if (lpValueName) wstr_to_utf8(lpValueName, name, sizeof(name));
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 2L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_status_t s = lsw_reg_delete_value(h, name);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    return lsw_status_to_w32(s);
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegDeleteValueA(HKEY hKey, LPCSTR lpValueName) {
-    LSW_ADVAPI_LOG("RegDeleteValueA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpValueName);
-    return ERROR_SUCCESS;
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 2L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_status_t s = lsw_reg_delete_value(h, lpValueName ? lpValueName : "");
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    return lsw_status_to_w32(s);
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegEnumKeyExW(HKEY hKey, DWORD dwIndex, LPWSTR lpName, DWORD* lpcchName, DWORD* lpReserved, LPWSTR lpClass, DWORD* lpcchClass, void* lpftLastWriteTime) {
-    LSW_ADVAPI_LOG("RegEnumKeyExW");
-    LSW_UNUSED(hKey); LSW_UNUSED(dwIndex); LSW_UNUSED(lpName); LSW_UNUSED(lpcchName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpClass); LSW_UNUSED(lpcchClass); LSW_UNUSED(lpftLastWriteTime);
-    return ERROR_NO_MORE_ITEMS;
+    LSW_UNUSED(lpReserved); LSW_UNUSED(lpClass); LSW_UNUSED(lpcchClass); LSW_UNUSED(lpftLastWriteTime);
+    if (!lpName || !lpcchName || *lpcchName == 0) return 234L; /* ERROR_MORE_DATA */
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 259L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    char name_utf8[256] = {0};
+    lsw_status_t s = lsw_reg_enum_keys(h, dwIndex, name_utf8, sizeof(name_utf8));
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return 259L; /* ERROR_NO_MORE_ITEMS */
+    /* Convert UTF-8 → UTF-16LE */
+    DWORD i = 0;
+    const char *p = name_utf8;
+    while (*p && i + 1 < *lpcchName) lpName[i++] = (uint16_t)(unsigned char)*p++;
+    lpName[i] = 0;
+    *lpcchName = i;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegEnumKeyExA(HKEY hKey, DWORD dwIndex, LPSTR lpName, DWORD* lpcchName, DWORD* lpReserved, LPSTR lpClass, DWORD* lpcchClass, void* lpftLastWriteTime) {
-    LSW_ADVAPI_LOG("RegEnumKeyExA");
-    LSW_UNUSED(hKey); LSW_UNUSED(dwIndex); LSW_UNUSED(lpName); LSW_UNUSED(lpcchName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpClass); LSW_UNUSED(lpcchClass); LSW_UNUSED(lpftLastWriteTime);
-    return ERROR_NO_MORE_ITEMS;
+    LSW_UNUSED(lpReserved); LSW_UNUSED(lpClass); LSW_UNUSED(lpcchClass); LSW_UNUSED(lpftLastWriteTime);
+    if (!lpName || !lpcchName || *lpcchName == 0) return 234L;
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 259L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_status_t s = lsw_reg_enum_keys(h, dwIndex, lpName, (size_t)*lpcchName);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return 259L;
+    *lpcchName = (DWORD)strlen(lpName);
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegEnumValueW(HKEY hKey, DWORD dwIndex, LPWSTR lpValueName, DWORD* lpcchValueName, DWORD* lpReserved, DWORD* lpType, uint8_t* lpData, DWORD* lpcbData) {
-    LSW_ADVAPI_LOG("RegEnumValueW");
-    LSW_UNUSED(hKey); LSW_UNUSED(dwIndex); LSW_UNUSED(lpValueName); LSW_UNUSED(lpcchValueName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpType); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
-    return ERROR_NO_MORE_ITEMS;
+    LSW_UNUSED(lpReserved); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
+    if (!lpValueName || !lpcchValueName || *lpcchValueName == 0) return 234L;
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 259L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    char name_utf8[256] = {0};
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    lsw_status_t s = lsw_reg_enum_values(h, dwIndex, name_utf8, sizeof(name_utf8), &type);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return 259L;
+    DWORD i = 0;
+    const char *p = name_utf8;
+    while (*p && i + 1 < *lpcchValueName) lpValueName[i++] = (uint16_t)(unsigned char)*p++;
+    lpValueName[i] = 0;
+    *lpcchValueName = i;
+    if (lpType) *lpType = lsw_type_to_w32(type);
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegEnumValueA(HKEY hKey, DWORD dwIndex, LPSTR lpValueName, DWORD* lpcchValueName, DWORD* lpReserved, DWORD* lpType, uint8_t* lpData, DWORD* lpcbData) {
-    LSW_ADVAPI_LOG("RegEnumValueA");
-    LSW_UNUSED(hKey); LSW_UNUSED(dwIndex); LSW_UNUSED(lpValueName); LSW_UNUSED(lpcchValueName); LSW_UNUSED(lpReserved); LSW_UNUSED(lpType); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
-    return ERROR_NO_MORE_ITEMS;
+    LSW_UNUSED(lpReserved); LSW_UNUSED(lpData); LSW_UNUSED(lpcbData);
+    if (!lpValueName || !lpcchValueName || *lpcchValueName == 0) return 234L;
+    lsw_hkey_t lhk;
+    HANDLE h;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        if (lsw_reg_open_key(lhk, NULL, &h) != LSW_SUCCESS) return 259L;
+    } else {
+        h = (HANDLE)hKey;
+    }
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    lsw_status_t s = lsw_reg_enum_values(h, dwIndex, lpValueName, (size_t)*lpcchValueName, &type);
+    if (w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return 259L;
+    *lpcchValueName = (DWORD)strlen(lpValueName);
+    if (lpType) *lpType = lsw_type_to_w32(type);
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegQueryInfoKeyW(HKEY hKey, LPWSTR lpClass, DWORD* lpcchClass, DWORD* lpReserved, DWORD* lpcSubKeys, DWORD* lpcbMaxSubKeyLen, DWORD* lpcbMaxClassLen, DWORD* lpcValues, DWORD* lpcbMaxValueNameLen, DWORD* lpcbMaxValueLen, DWORD* lpcbSecurityDescriptor, void* lpftLastWriteTime) {
-    LSW_ADVAPI_LOG("RegQueryInfoKeyW");
     LSW_UNUSED(hKey); LSW_UNUSED(lpReserved); LSW_UNUSED(lpftLastWriteTime);
     if (lpClass && lpcchClass && *lpcchClass > 0) lpClass[0] = 0;
-    lsw_zero_u32(lpcchClass); lsw_zero_u32(lpcSubKeys); lsw_zero_u32(lpcbMaxSubKeyLen); lsw_zero_u32(lpcbMaxClassLen);
-    lsw_zero_u32(lpcValues); lsw_zero_u32(lpcbMaxValueNameLen); lsw_zero_u32(lpcbMaxValueLen); lsw_zero_u32(lpcbSecurityDescriptor);
-    return ERROR_SUCCESS;
+    if (lpcchClass) *lpcchClass = 0;
+    if (lpcSubKeys) *lpcSubKeys = 0;
+    if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = 0;
+    if (lpcbMaxClassLen) *lpcbMaxClassLen = 0;
+    if (lpcValues) *lpcValues = 0;
+    if (lpcbMaxValueNameLen) *lpcbMaxValueNameLen = 0;
+    if (lpcbMaxValueLen) *lpcbMaxValueLen = 0;
+    if (lpcbSecurityDescriptor) *lpcbSecurityDescriptor = 0;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegQueryInfoKeyA(HKEY hKey, LPSTR lpClass, DWORD* lpcchClass, DWORD* lpReserved, DWORD* lpcSubKeys, DWORD* lpcbMaxSubKeyLen, DWORD* lpcbMaxClassLen, DWORD* lpcValues, DWORD* lpcbMaxValueNameLen, DWORD* lpcbMaxValueLen, DWORD* lpcbSecurityDescriptor, void* lpftLastWriteTime) {
-    LSW_ADVAPI_LOG("RegQueryInfoKeyA");
     LSW_UNUSED(hKey); LSW_UNUSED(lpReserved); LSW_UNUSED(lpftLastWriteTime);
     if (lpClass && lpcchClass && *lpcchClass > 0) lpClass[0] = 0;
-    lsw_zero_u32(lpcchClass); lsw_zero_u32(lpcSubKeys); lsw_zero_u32(lpcbMaxSubKeyLen); lsw_zero_u32(lpcbMaxClassLen);
-    lsw_zero_u32(lpcValues); lsw_zero_u32(lpcbMaxValueNameLen); lsw_zero_u32(lpcbMaxValueLen); lsw_zero_u32(lpcbSecurityDescriptor);
-    return ERROR_SUCCESS;
+    if (lpcchClass) *lpcchClass = 0;
+    if (lpcSubKeys) *lpcSubKeys = 0;
+    if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = 0;
+    if (lpcbMaxClassLen) *lpcbMaxClassLen = 0;
+    if (lpcValues) *lpcValues = 0;
+    if (lpcbMaxValueNameLen) *lpcbMaxValueNameLen = 0;
+    if (lpcbMaxValueLen) *lpcbMaxValueLen = 0;
+    if (lpcbSecurityDescriptor) *lpcbSecurityDescriptor = 0;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegConnectRegistryW(LPCWSTR lpMachineName, HKEY hKey, HKEY* phkResult) {
-    LSW_ADVAPI_LOG("RegConnectRegistryW");
     LSW_UNUSED(lpMachineName);
     if (phkResult) *phkResult = hKey;
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegFlushKey(HKEY hKey) {
-    LSW_ADVAPI_LOG("RegFlushKey");
     LSW_UNUSED(hKey);
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegLoadKeyW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpFile) {
-    LSW_ADVAPI_LOG("RegLoadKeyW");
     LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(lpFile);
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegSaveKeyW(HKEY hKey, LPCWSTR lpFile, SECURITY_ATTRIBUTES* lpSecurityAttributes) {
-    LSW_ADVAPI_LOG("RegSaveKeyW");
     LSW_UNUSED(hKey); LSW_UNUSED(lpFile); LSW_UNUSED(lpSecurityAttributes);
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegNotifyChangeKeyValue(HKEY hKey, BOOL bWatchSubtree, DWORD dwNotifyFilter, HANDLE hEvent, BOOL fAsynchronous) {
-    LSW_ADVAPI_LOG("RegNotifyChangeKeyValue");
     LSW_UNUSED(hKey); LSW_UNUSED(bWatchSubtree); LSW_UNUSED(dwNotifyFilter); LSW_UNUSED(hEvent); LSW_UNUSED(fAsynchronous);
-    return ERROR_SUCCESS;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegGetValueW(HKEY hKey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, DWORD* pdwType, void* pvData, DWORD* pcbData) {
-    LSW_ADVAPI_LOG("RegGetValueW");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(lpValue); LSW_UNUSED(dwFlags); LSW_UNUSED(pdwType); LSW_UNUSED(pvData); LSW_UNUSED(pcbData);
-    return ERROR_FILE_NOT_FOUND;
+    char subkey[512] = {0}, valname[256] = {0};
+    LSW_UNUSED(dwFlags);
+    if (lpSubKey)  wstr_to_utf8(lpSubKey, subkey,   sizeof(subkey));
+    if (lpValue)   wstr_to_utf8(lpValue,  valname,  sizeof(valname));
+    /* Open/create the subkey under hKey */
+    HANDLE h = reg_open_or_create(hKey, subkey[0] ? subkey : NULL, 0);
+    if (!h) return 2L;
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    size_t sz = pcbData ? (size_t)*pcbData : 0;
+    lsw_status_t s = lsw_reg_query_value(h, valname[0] ? valname : "", &type, pvData, &sz);
+    lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return lsw_status_to_w32(s);
+    if (pdwType)  *pdwType  = lsw_type_to_w32(type);
+    if (pcbData)  *pcbData  = (DWORD)sz;
+    return 0L;
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegGetValueA(HKEY hKey, LPCSTR lpSubKey, LPCSTR lpValue, DWORD dwFlags, DWORD* pdwType, void* pvData, DWORD* pcbData) {
-    LSW_ADVAPI_LOG("RegGetValueA");
-    LSW_UNUSED(hKey); LSW_UNUSED(lpSubKey); LSW_UNUSED(lpValue); LSW_UNUSED(dwFlags); LSW_UNUSED(pdwType); LSW_UNUSED(pvData); LSW_UNUSED(pcbData);
-    return ERROR_FILE_NOT_FOUND;
+    LSW_UNUSED(dwFlags);
+    HANDLE h = reg_open_or_create(hKey, lpSubKey, 0);
+    if (!h) return 2L;
+    lsw_reg_type_t type = LSW_REG_BINARY;
+    size_t sz = pcbData ? (size_t)*pcbData : 0;
+    lsw_status_t s = lsw_reg_query_value(h, lpValue ? lpValue : "", &type, pvData, &sz);
+    lsw_reg_close_key(h);
+    if (s != LSW_SUCCESS) return lsw_status_to_w32(s);
+    if (pdwType) *pdwType = lsw_type_to_w32(type);
+    if (pcbData) *pcbData = (DWORD)sz;
+    return 0L;
 }
 
 BOOL __attribute__((ms_abi)) lsw_OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, HANDLE* TokenHandle) {

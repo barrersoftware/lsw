@@ -6,6 +6,7 @@
  * PE Loader Implementation
  */
 
+#define _GNU_SOURCE
 #include "pe-loader/pe_loader.h"
 #include "pe-loader/pe_parser.h"
 #include "pe-loader/pe_format.h"

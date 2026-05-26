@@ -634,6 +634,155 @@ HANDLE __attribute__((ms_abi)) lsw_GetClipboardData(UINT fmt) { (void)fmt; retur
 BOOL   __attribute__((ms_abi)) lsw_IsClipboardFormatAvailable(UINT fmt) { (void)fmt; return 0; }
 
 /* ============================================================
+ * Timer
+ * ============================================================ */
+typedef void* TIMERPROC;
+UINT __attribute__((ms_abi)) lsw_SetTimer(HWND hwnd, UINT id, UINT elapse, TIMERPROC fn)
+    { (void)hwnd; (void)elapse; (void)fn; return id ? id : 1; }
+BOOL __attribute__((ms_abi)) lsw_KillTimer(HWND hwnd, UINT id)
+    { (void)hwnd; (void)id; return 1; }
+
+/* ============================================================
+ * Caret
+ * ============================================================ */
+BOOL __attribute__((ms_abi)) lsw_CreateCaret(HWND hw, HBITMAP bmp, int w, int h)
+    { (void)hw; (void)bmp; (void)w; (void)h; return 1; }
+BOOL __attribute__((ms_abi)) lsw_DestroyCaret(void) { return 1; }
+BOOL __attribute__((ms_abi)) lsw_ShowCaret(HWND hw) { (void)hw; return 1; }
+BOOL __attribute__((ms_abi)) lsw_HideCaret(HWND hw) { (void)hw; return 1; }
+BOOL __attribute__((ms_abi)) lsw_SetCaretPos(int x, int y) { (void)x; (void)y; return 1; }
+BOOL __attribute__((ms_abi)) lsw_GetCaretPos(void* pt) { if (pt) memset(pt, 0, 8); return 1; }
+DWORD __attribute__((ms_abi)) lsw_GetCaretBlinkTime(void) { return 500; }
+BOOL __attribute__((ms_abi)) lsw_SetCaretBlinkTime(UINT ms) { (void)ms; return 1; }
+
+/* ============================================================
+ * System parameters (stubs already in win32_api.c — declared extern here)
+ * ============================================================ */
+extern int __attribute__((ms_abi)) lsw_SystemParametersInfoA(UINT, UINT, void*, UINT);
+extern int __attribute__((ms_abi)) lsw_SystemParametersInfoW(UINT, UINT, void*, UINT);
+
+/* ============================================================
+ * Input injection / hooks
+ * ============================================================ */
+typedef struct { UINT type; char data[32]; } INPUT_RECORD_STUB;
+UINT __attribute__((ms_abi)) lsw_SendInput(UINT cnt, void* inputs, int cbSize)
+    { (void)cnt; (void)inputs; (void)cbSize; return 0; }
+BOOL __attribute__((ms_abi)) lsw_BlockInput(BOOL block) { (void)block; return 1; }
+BOOL __attribute__((ms_abi)) lsw_ClipCursor(const void* rect) { (void)rect; return 1; }
+BOOL __attribute__((ms_abi)) lsw_GetClipCursor(void* rect)
+    { if (rect) memset(rect, 0, 16); return 1; }
+
+/* Windows hooks */
+typedef void* HOOKPROC;
+HANDLE __attribute__((ms_abi)) lsw_SetWindowsHookExA(int idHook, HOOKPROC fn, HINSTANCE hMod, DWORD tid)
+    { (void)idHook; (void)fn; (void)hMod; (void)tid; return (HANDLE)1; }
+HANDLE __attribute__((ms_abi)) lsw_SetWindowsHookExW(int idHook, HOOKPROC fn, HINSTANCE hMod, DWORD tid)
+    { (void)idHook; (void)fn; (void)hMod; (void)tid; return (HANDLE)1; }
+BOOL __attribute__((ms_abi)) lsw_UnhookWindowsHookEx(HANDLE hk) { (void)hk; return 1; }
+LRESULT __attribute__((ms_abi)) lsw_CallNextHookEx(HANDLE hk, int code, WPARAM w, LPARAM l)
+    { (void)hk; (void)code; (void)w; (void)l; return 0; }
+
+/* ============================================================
+ * Monitor (W variants)
+ * ============================================================ */
+typedef void* HMONITOR_T;
+BOOL __attribute__((ms_abi)) lsw_GetMonitorInfoW(HMONITOR mon, void* info) {
+    (void)mon;
+    if (info) {
+        /* MONITORINFOEXW: cbSize(4) flags(4) rcMonitor(16) rcWork(16) szDevice(64×2) */
+        memset(info, 0, 128);
+        int32_t* r = (int32_t*)((char*)info + 8);  /* rcMonitor */
+        r[0] = 0; r[1] = 0; r[2] = 1920; r[3] = 1080;
+        int32_t* w = (int32_t*)((char*)info + 24); /* rcWork */
+        w[0] = 0; w[1] = 0; w[2] = 1920; w[3] = 1040;
+        *(uint32_t*)info = 128; /* cbSize */
+        ((int32_t*)((char*)info + 4))[0] = 1; /* MONITORINFOF_PRIMARY */
+    }
+    return 1;
+}
+BOOL __attribute__((ms_abi)) lsw_EnumDisplayMonitors(HDC hdc, const void* clip, void* fn, LPARAM data)
+    { (void)hdc; (void)clip; (void)fn; (void)data; return 1; }
+BOOL __attribute__((ms_abi)) lsw_EnumDisplaySettingsA(const char* dev, DWORD mode, void* dm)
+    { (void)dev; (void)mode; if (dm) memset(dm, 0, 220); return 0; }
+BOOL __attribute__((ms_abi)) lsw_EnumDisplaySettingsW(const void* dev, DWORD mode, void* dm)
+    { (void)dev; (void)mode; if (dm) memset(dm, 0, 220); return 0; }
+LONG __attribute__((ms_abi)) lsw_ChangeDisplaySettingsA(void* dm, DWORD flags)
+    { (void)dm; (void)flags; return 0; }
+LONG __attribute__((ms_abi)) lsw_ChangeDisplaySettingsW(void* dm, DWORD flags)
+    { (void)dm; (void)flags; return 0; }
+HMONITOR __attribute__((ms_abi)) lsw_MonitorFromPoint(int x, int y, DWORD flags)
+    { (void)x; (void)y; (void)flags; return (HMONITOR)1; }
+HMONITOR __attribute__((ms_abi)) lsw_MonitorFromRect(const void* rc, DWORD flags)
+    { (void)rc; (void)flags; return (HMONITOR)1; }
+
+/* ============================================================
+ * Keyboard helpers
+ * ============================================================ */
+UINT __attribute__((ms_abi)) lsw_MapVirtualKeyA(UINT code, UINT maptype)
+    { (void)code; (void)maptype; return 0; }
+UINT __attribute__((ms_abi)) lsw_MapVirtualKeyW(UINT code, UINT maptype)
+    { (void)code; (void)maptype; return 0; }
+UINT __attribute__((ms_abi)) lsw_MapVirtualKeyExA(UINT code, UINT type, HANDLE layout)
+    { (void)code; (void)type; (void)layout; return 0; }
+int16_t __attribute__((ms_abi)) lsw_VkKeyScanA(char ch) { (void)ch; return -1; }
+int16_t __attribute__((ms_abi)) lsw_VkKeyScanW(uint16_t ch) { (void)ch; return -1; }
+int __attribute__((ms_abi)) lsw_GetKeyNameTextA(LONG lParam, char* buf, int size)
+    { (void)lParam; if (buf && size > 0) buf[0] = '\0'; return 0; }
+int __attribute__((ms_abi)) lsw_GetKeyNameTextW(LONG lParam, uint16_t* buf, int size)
+    { (void)lParam; if (buf && size > 0) buf[0] = 0; return 0; }
+HANDLE __attribute__((ms_abi)) lsw_GetKeyboardLayout(DWORD tid) { (void)tid; return (HANDLE)0x4090409; }
+int __attribute__((ms_abi)) lsw_GetKeyboardLayoutList(int size, void* list)
+    { (void)size; (void)list; return 1; }
+BOOL __attribute__((ms_abi)) lsw_GetKeyboardState(uint8_t* buf)
+    { if (buf) memset(buf, 0, 256); return 1; }
+BOOL __attribute__((ms_abi)) lsw_SetKeyboardState(uint8_t* buf) { (void)buf; return 1; }
+BOOL __attribute__((ms_abi)) lsw_GetLastInputInfo(void* plii)
+    { if (plii) memset(plii, 0, 8); return 1; }
+
+/* ============================================================
+ * Window long / ptr W variants
+ * ============================================================ */
+LONG __attribute__((ms_abi)) lsw_SetWindowLongW(HWND hw, int idx, LONG val)
+    { (void)hw; (void)idx; (void)val; return 0; }
+LONG __attribute__((ms_abi)) lsw_GetWindowLongW(HWND hw, int idx)
+    { (void)hw; (void)idx; return 0; }
+int64_t __attribute__((ms_abi)) lsw_SetWindowLongPtrW(HWND hw, int idx, int64_t val)
+    { (void)hw; (void)idx; (void)val; return 0; }
+int64_t __attribute__((ms_abi)) lsw_GetWindowLongPtrW(HWND hw, int idx)
+    { (void)hw; (void)idx; return 0; }
+
+/* ============================================================
+ * Process / window misc
+ * ============================================================ */
+BOOL __attribute__((ms_abi)) lsw_WaitForInputIdle(HANDLE proc, DWORD ms) { (void)proc; (void)ms; return 0; }
+BOOL __attribute__((ms_abi)) lsw_AllowSetForegroundWindow(DWORD pid) { (void)pid; return 1; }
+BOOL __attribute__((ms_abi)) lsw_FlashWindowEx(void* pfi) { (void)pfi; return 0; }
+BOOL __attribute__((ms_abi)) lsw_GetGUIThreadInfo(DWORD tid, void* pgui)
+    { (void)tid; if (pgui) memset(pgui, 0, 64); return 1; }
+int __attribute__((ms_abi)) lsw_InternalGetWindowText(HWND hw, void* buf, int n)
+    { (void)hw; if (buf && n > 0) ((uint16_t*)buf)[0] = 0; return 0; }
+BOOL __attribute__((ms_abi)) lsw_IsHungAppWindow(HWND hw) { (void)hw; return 0; }
+BOOL __attribute__((ms_abi)) lsw_SwitchToThisWindow(HWND hw, BOOL alt)
+    { (void)hw; (void)alt; return 0; }
+HWND __attribute__((ms_abi)) lsw_WindowFromPoint(int x, int y)
+    { (void)x; (void)y; return NULL; }
+HWND __attribute__((ms_abi)) lsw_ChildWindowFromPoint(HWND hw, int x, int y)
+    { (void)hw; (void)x; (void)y; return NULL; }
+BOOL __attribute__((ms_abi)) lsw_LockWorkStation(void) { return 0; }
+BOOL __attribute__((ms_abi)) lsw_ExitWindowsEx(UINT flags, DWORD reason) { (void)flags; (void)reason; return 1; }
+BOOL __attribute__((ms_abi)) lsw_ShutdownBlockReasonCreate(HWND hw, const void* reason)
+    { (void)hw; (void)reason; return 1; }
+BOOL __attribute__((ms_abi)) lsw_ShutdownBlockReasonDestroy(HWND hw) { (void)hw; return 1; }
+DWORD __attribute__((ms_abi)) lsw_GetQueueStatus(UINT flags) { (void)flags; return 0; }
+BOOL __attribute__((ms_abi)) lsw_GetInputState(void) { return 0; }
+BOOL __attribute__((ms_abi)) lsw_AttachThreadInput(DWORD a, DWORD b, BOOL att)
+    { (void)a; (void)b; (void)att; return 1; }
+BOOL __attribute__((ms_abi)) lsw_SetProcessDPIAware(void) { return 1; }
+BOOL __attribute__((ms_abi)) lsw_SetProcessDpiAwarenessContext(HANDLE ctx) { (void)ctx; return 1; }
+UINT __attribute__((ms_abi)) lsw_GetDpiForSystem(void) { return 96; }
+UINT __attribute__((ms_abi)) lsw_GetDpiForWindow(HWND hw) { (void)hw; return 96; }
+
+/* ============================================================
  * API Mapping tables — automatically picked up by Makefile wildcard
  * ============================================================ */
 const win32_api_mapping_t win32_api_user32_mappings[] = {
@@ -762,6 +911,78 @@ const win32_api_mapping_t win32_api_user32_mappings[] = {
     {"USER32.dll", "SetClipboardData",   (void*)lsw_SetClipboardData},
     {"USER32.dll", "GetClipboardData",   (void*)lsw_GetClipboardData},
     {"USER32.dll", "IsClipboardFormatAvailable", (void*)lsw_IsClipboardFormatAvailable},
+    /* Timer */
+    {"USER32.dll", "SetTimer",           (void*)lsw_SetTimer},
+    {"USER32.dll", "KillTimer",          (void*)lsw_KillTimer},
+    /* Caret */
+    {"USER32.dll", "CreateCaret",        (void*)lsw_CreateCaret},
+    {"USER32.dll", "DestroyCaret",       (void*)lsw_DestroyCaret},
+    {"USER32.dll", "ShowCaret",          (void*)lsw_ShowCaret},
+    {"USER32.dll", "HideCaret",          (void*)lsw_HideCaret},
+    {"USER32.dll", "SetCaretPos",        (void*)lsw_SetCaretPos},
+    {"USER32.dll", "GetCaretPos",        (void*)lsw_GetCaretPos},
+    {"USER32.dll", "GetCaretBlinkTime",  (void*)lsw_GetCaretBlinkTime},
+    {"USER32.dll", "SetCaretBlinkTime",  (void*)lsw_SetCaretBlinkTime},
+    /* System parameters */
+    {"USER32.dll", "SystemParametersInfoA", (void*)lsw_SystemParametersInfoA},
+    {"USER32.dll", "SystemParametersInfoW", (void*)lsw_SystemParametersInfoW},
+    /* Input injection / hooks */
+    {"USER32.dll", "SendInput",          (void*)lsw_SendInput},
+    {"USER32.dll", "BlockInput",         (void*)lsw_BlockInput},
+    {"USER32.dll", "ClipCursor",         (void*)lsw_ClipCursor},
+    {"USER32.dll", "GetClipCursor",      (void*)lsw_GetClipCursor},
+    {"USER32.dll", "SetWindowsHookExA",  (void*)lsw_SetWindowsHookExA},
+    {"USER32.dll", "SetWindowsHookExW",  (void*)lsw_SetWindowsHookExW},
+    {"USER32.dll", "UnhookWindowsHookEx",(void*)lsw_UnhookWindowsHookEx},
+    {"USER32.dll", "CallNextHookEx",     (void*)lsw_CallNextHookEx},
+    /* Monitor (W variants) */
+    {"USER32.dll", "GetMonitorInfoW",    (void*)lsw_GetMonitorInfoW},
+    {"USER32.dll", "EnumDisplayMonitors",(void*)lsw_EnumDisplayMonitors},
+    {"USER32.dll", "EnumDisplaySettingsA",(void*)lsw_EnumDisplaySettingsA},
+    {"USER32.dll", "EnumDisplaySettingsW",(void*)lsw_EnumDisplaySettingsW},
+    {"USER32.dll", "ChangeDisplaySettingsA",(void*)lsw_ChangeDisplaySettingsA},
+    {"USER32.dll", "ChangeDisplaySettingsW",(void*)lsw_ChangeDisplaySettingsW},
+    {"USER32.dll", "MonitorFromPoint",   (void*)lsw_MonitorFromPoint},
+    {"USER32.dll", "MonitorFromRect",    (void*)lsw_MonitorFromRect},
+    /* Keyboard helpers */
+    {"USER32.dll", "MapVirtualKeyA",     (void*)lsw_MapVirtualKeyA},
+    {"USER32.dll", "MapVirtualKeyW",     (void*)lsw_MapVirtualKeyW},
+    {"USER32.dll", "MapVirtualKeyExA",   (void*)lsw_MapVirtualKeyExA},
+    {"USER32.dll", "VkKeyScanA",         (void*)lsw_VkKeyScanA},
+    {"USER32.dll", "VkKeyScanW",         (void*)lsw_VkKeyScanW},
+    {"USER32.dll", "GetKeyNameTextA",    (void*)lsw_GetKeyNameTextA},
+    {"USER32.dll", "GetKeyNameTextW",    (void*)lsw_GetKeyNameTextW},
+    {"USER32.dll", "GetKeyboardLayout",  (void*)lsw_GetKeyboardLayout},
+    {"USER32.dll", "GetKeyboardLayoutList",(void*)lsw_GetKeyboardLayoutList},
+    {"USER32.dll", "GetKeyboardState",   (void*)lsw_GetKeyboardState},
+    {"USER32.dll", "SetKeyboardState",   (void*)lsw_SetKeyboardState},
+    {"USER32.dll", "GetLastInputInfo",   (void*)lsw_GetLastInputInfo},
+    /* Window long W variants */
+    {"USER32.dll", "SetWindowLongW",     (void*)lsw_SetWindowLongW},
+    {"USER32.dll", "GetWindowLongW",     (void*)lsw_GetWindowLongW},
+    {"USER32.dll", "SetWindowLongPtrW",  (void*)lsw_SetWindowLongPtrW},
+    {"USER32.dll", "GetWindowLongPtrW",  (void*)lsw_GetWindowLongPtrW},
+    /* Process / window misc */
+    {"USER32.dll", "WaitForInputIdle",   (void*)lsw_WaitForInputIdle},
+    {"USER32.dll", "AllowSetForegroundWindow", (void*)lsw_AllowSetForegroundWindow},
+    {"USER32.dll", "FlashWindowEx",      (void*)lsw_FlashWindowEx},
+    {"USER32.dll", "GetGUIThreadInfo",   (void*)lsw_GetGUIThreadInfo},
+    {"USER32.dll", "InternalGetWindowText",(void*)lsw_InternalGetWindowText},
+    {"USER32.dll", "IsHungAppWindow",    (void*)lsw_IsHungAppWindow},
+    {"USER32.dll", "SwitchToThisWindow", (void*)lsw_SwitchToThisWindow},
+    {"USER32.dll", "WindowFromPoint",    (void*)lsw_WindowFromPoint},
+    {"USER32.dll", "ChildWindowFromPoint",(void*)lsw_ChildWindowFromPoint},
+    {"USER32.dll", "LockWorkStation",    (void*)lsw_LockWorkStation},
+    {"USER32.dll", "ExitWindowsEx",      (void*)lsw_ExitWindowsEx},
+    {"USER32.dll", "ShutdownBlockReasonCreate",(void*)lsw_ShutdownBlockReasonCreate},
+    {"USER32.dll", "ShutdownBlockReasonDestroy",(void*)lsw_ShutdownBlockReasonDestroy},
+    {"USER32.dll", "GetQueueStatus",     (void*)lsw_GetQueueStatus},
+    {"USER32.dll", "GetInputState",      (void*)lsw_GetInputState},
+    {"USER32.dll", "AttachThreadInput",  (void*)lsw_AttachThreadInput},
+    {"USER32.dll", "SetProcessDPIAware", (void*)lsw_SetProcessDPIAware},
+    {"USER32.dll", "SetProcessDpiAwarenessContext",(void*)lsw_SetProcessDpiAwarenessContext},
+    {"USER32.dll", "GetDpiForSystem",    (void*)lsw_GetDpiForSystem},
+    {"USER32.dll", "GetDpiForWindow",    (void*)lsw_GetDpiForWindow},
     /* GDI32 */
     {"GDI32.dll",  "GetDC",              (void*)lsw_GetDC},
     {"gdi32.dll",  "GetDC",              (void*)lsw_GetDC},

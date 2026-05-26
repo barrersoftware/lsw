@@ -445,6 +445,133 @@ lsw_status_t lsw_reg_query_value(
 
 // TODO: Implement remaining functions (delete, enum) as needed
 
+/**
+ * lsw_reg_delete_value - Remove a value file from a key directory
+ */
+lsw_status_t lsw_reg_delete_value(HANDLE handle, const char* value_name)
+{
+    lsw_reg_handle_t* h = get_handle(handle);
+    if (!h || !value_name) return LSW_ERROR_INVALID_PARAMETER;
+
+    char value_path[LSW_MAX_PATH];
+    snprintf(value_path, sizeof(value_path), "%s/%s.value", h->path, value_name);
+
+    if (unlink(value_path) != 0) {
+        if (errno == ENOENT) return LSW_ERROR_FILE_NOT_FOUND;
+        return LSW_ERROR_REGISTRY_ERROR;
+    }
+    return LSW_SUCCESS;
+}
+
+/**
+ * lsw_reg_delete_key - Remove a registry key directory tree
+ */
+lsw_status_t lsw_reg_delete_key(lsw_hkey_t hkey, const char* subkey)
+{
+    char path[LSW_MAX_PATH];
+    lsw_status_t status = lsw_reg_get_path(hkey, subkey, path, sizeof(path));
+    if (status != LSW_SUCCESS) return status;
+
+    /* Remove all files in the directory, then the directory itself */
+    DIR* dir = opendir(path);
+    if (!dir) {
+        if (errno == ENOENT) return LSW_ERROR_FILE_NOT_FOUND;
+        return LSW_ERROR_REGISTRY_ERROR;
+    }
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char child[LSW_MAX_PATH];
+        snprintf(child, sizeof(child), "%s/%s", path, entry->d_name);
+        unlink(child); /* Ignore errors — may be a subdir */
+    }
+    closedir(dir);
+    rmdir(path);
+    return LSW_SUCCESS;
+}
+
+/**
+ * lsw_reg_enum_keys - Enumerate subkey directories at index
+ */
+lsw_status_t lsw_reg_enum_keys(HANDLE handle, uint32_t index,
+                                 char* name_buffer, size_t buffer_size)
+{
+    lsw_reg_handle_t* h = get_handle(handle);
+    if (!h || !name_buffer || buffer_size == 0) return LSW_ERROR_INVALID_PARAMETER;
+
+    DIR* dir = opendir(h->path);
+    if (!dir) return LSW_ERROR_FILE_NOT_FOUND;
+
+    uint32_t cur = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        /* Only enumerate subdirectories (not .value files) */
+        char child[LSW_MAX_PATH];
+        snprintf(child, sizeof(child), "%s/%s", h->path, entry->d_name);
+        struct stat st;
+        if (stat(child, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        if (cur == index) {
+            strncpy(name_buffer, entry->d_name, buffer_size - 1);
+            name_buffer[buffer_size - 1] = '\0';
+            closedir(dir);
+            return LSW_SUCCESS;
+        }
+        cur++;
+    }
+    closedir(dir);
+    return LSW_ERROR_FILE_NOT_FOUND; /* index out of range */
+}
+
+/**
+ * lsw_reg_enum_values - Enumerate value files at index
+ */
+lsw_status_t lsw_reg_enum_values(HANDLE handle, uint32_t index,
+                                   char* name_buffer, size_t buffer_size,
+                                   lsw_reg_type_t* type)
+{
+    lsw_reg_handle_t* h = get_handle(handle);
+    if (!h || !name_buffer || buffer_size == 0) return LSW_ERROR_INVALID_PARAMETER;
+
+    DIR* dir = opendir(h->path);
+    if (!dir) return LSW_ERROR_FILE_NOT_FOUND;
+
+    uint32_t cur = 0;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        /* Only enumerate .value files */
+        size_t len = strlen(entry->d_name);
+        if (len < 6 || strcmp(entry->d_name + len - 6, ".value") != 0) continue;
+        if (cur == index) {
+            /* Strip ".value" suffix */
+            size_t name_len = len - 6;
+            if (name_len >= buffer_size) name_len = buffer_size - 1;
+            strncpy(name_buffer, entry->d_name, name_len);
+            name_buffer[name_len] = '\0';
+            /* Read type from the file header */
+            if (type) {
+                char vpath[LSW_MAX_PATH];
+                snprintf(vpath, sizeof(vpath), "%s/%s", h->path, entry->d_name);
+                FILE* f = fopen(vpath, "rb");
+                if (f) {
+                    lsw_reg_type_t t = LSW_REG_BINARY;
+                    if (fread(&t, sizeof(t), 1, f) == 1) *type = t;
+                    else *type = LSW_REG_BINARY;
+                    fclose(f);
+                } else {
+                    *type = LSW_REG_BINARY;
+                }
+            }
+            closedir(dir);
+            return LSW_SUCCESS;
+        }
+        cur++;
+    }
+    closedir(dir);
+    return LSW_ERROR_FILE_NOT_FOUND;
+}
+
 // ============================================================================
 // SECTION: Registry Environment Population
 // ============================================================================

@@ -101,6 +101,7 @@ typedef enum {
     LSW_REG_EXPAND_SZ, // Expandable string
     LSW_REG_BINARY,    // Binary data
     LSW_REG_DWORD,     // 32-bit number
+    LSW_REG_MULTI_SZ,  // Multi-string
     LSW_REG_QWORD      // 64-bit number
 } lsw_reg_type_t;
 
