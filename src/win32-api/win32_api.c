@@ -35,6 +35,9 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <sys/time.h>
+#include <sys/statvfs.h>
+#include <sched.h>
+#include <ctype.h>
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
@@ -2711,7 +2714,7 @@ static lsw_reg_type_t win_regtype_to_lsw(DWORD type) {
 }
 
 // advapi32.dll!RegOpenKeyExA - Open registry key
-LONG __attribute__((ms_abi)) lsw_RegOpenKeyExA(
+LONG __attribute__((ms_abi)) lsw_legacy_RegOpenKeyExA(
     HANDLE hkey,
     const char* subkey,
     DWORD options,
@@ -2752,7 +2755,7 @@ LONG __attribute__((ms_abi)) lsw_RegOpenKeyExA(
 }
 
 // advapi32.dll!RegCreateKeyExA - Create or open registry key
-LONG __attribute__((ms_abi)) lsw_RegCreateKeyExA(
+LONG __attribute__((ms_abi)) lsw_legacy_RegCreateKeyExA(
     HANDLE hkey,
     const char* subkey,
     DWORD reserved,
@@ -2795,7 +2798,7 @@ LONG __attribute__((ms_abi)) lsw_RegCreateKeyExA(
 }
 
 // advapi32.dll!RegQueryValueExA - Read registry value
-LONG __attribute__((ms_abi)) lsw_RegQueryValueExA(
+LONG __attribute__((ms_abi)) lsw_legacy_RegQueryValueExA(
     HANDLE hkey,
     const char* value_name,
     DWORD* reserved,
@@ -2831,7 +2834,7 @@ LONG __attribute__((ms_abi)) lsw_RegQueryValueExA(
 }
 
 // advapi32.dll!RegSetValueExA - Write registry value
-LONG __attribute__((ms_abi)) lsw_RegSetValueExA(
+LONG __attribute__((ms_abi)) lsw_legacy_RegSetValueExA(
     HANDLE hkey,
     const char* value_name,
     DWORD reserved,
@@ -2862,7 +2865,7 @@ LONG __attribute__((ms_abi)) lsw_RegSetValueExA(
 }
 
 // advapi32.dll!RegCloseKey - Close registry key
-LONG __attribute__((ms_abi)) lsw_RegCloseKey(HANDLE hkey) {
+LONG __attribute__((ms_abi)) lsw_legacy_RegCloseKey(HANDLE hkey) {
     LSW_LOG_INFO("RegCloseKey: hkey=0x%p", hkey);
     
     // Don't close predefined keys
@@ -3755,6 +3758,734 @@ int __attribute__((ms_abi)) lsw_OemToCharA(const char* src, char* dst) {
 }
 
 // ============================================================================
+// SECTION: Additional KERNEL32 APIs — batch 2
+// ============================================================================
+
+// ---- IsWow64Process ----
+int __attribute__((ms_abi)) lsw_IsWow64Process(void* hProcess, int* Wow64Process) {
+    (void)hProcess;
+    if (Wow64Process) *Wow64Process = 0; // We are native 64-bit
+    return 1;
+}
+
+// ---- FreeLibrary ----
+int __attribute__((ms_abi)) lsw_FreeLibrary(void* hLibModule) {
+    if (hLibModule) dlclose(hLibModule);
+    return 1;
+}
+void __attribute__((ms_abi)) lsw_FreeLibraryAndExitThread(void* hLibModule, uint32_t dwExitCode) {
+    lsw_FreeLibrary(hLibModule);
+    pthread_exit((void*)(uintptr_t)dwExitCode);
+}
+void* __attribute__((ms_abi)) lsw_LoadLibraryExW(const uint16_t* lpLibFileName, void* hFile, uint32_t dwFlags) {
+    (void)hFile; (void)dwFlags;
+    if (!lpLibFileName) return NULL;
+    char narrow[512]; size_t i = 0;
+    while (lpLibFileName[i] && i < 511) { narrow[i] = (char)lpLibFileName[i]; i++; }
+    narrow[i] = 0;
+    return lsw_LoadLibraryA(narrow);
+}
+int __attribute__((ms_abi)) lsw_GetModuleHandleExW(uint32_t dwFlags, const uint16_t* lpModuleName, void** phModule) {
+    (void)dwFlags;
+    if (phModule) *phModule = lsw_LoadLibraryExW(lpModuleName, NULL, 0);
+    return phModule && *phModule ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_GetModuleHandleExA(uint32_t dwFlags, const char* lpModuleName, void** phModule) {
+    (void)dwFlags;
+    if (phModule) *phModule = lsw_LoadLibraryA(lpModuleName);
+    return phModule && *phModule ? 1 : 0;
+}
+
+// ---- Heap management ----
+void* __attribute__((ms_abi)) lsw_HeapCreate(uint32_t flOptions, size_t dwInitialSize, size_t dwMaximumSize) {
+    (void)flOptions; (void)dwInitialSize; (void)dwMaximumSize;
+    return (void*)0xDEADFACE; // fake heap handle
+}
+int __attribute__((ms_abi)) lsw_HeapDestroy(void* hHeap) {
+    (void)hHeap; return 1;
+}
+int __attribute__((ms_abi)) lsw_HeapValidate(void* hHeap, uint32_t dwFlags, const void* lpMem) {
+    (void)hHeap; (void)dwFlags; (void)lpMem; return 1;
+}
+size_t __attribute__((ms_abi)) lsw_HeapCompact(void* hHeap, uint32_t dwFlags) {
+    (void)hHeap; (void)dwFlags; return 0;
+}
+int __attribute__((ms_abi)) lsw_HeapLock(void* hHeap) { (void)hHeap; return 1; }
+int __attribute__((ms_abi)) lsw_HeapUnlock(void* hHeap) { (void)hHeap; return 1; }
+int __attribute__((ms_abi)) lsw_HeapWalk(void* hHeap, void* lpEntry) { (void)hHeap; (void)lpEntry; return 0; }
+int __attribute__((ms_abi)) lsw_HeapSetInformation(void* hHeap, int HeapInformationClass, void* HeapInformation, size_t HeapInformationLength) {
+    (void)hHeap; (void)HeapInformationClass; (void)HeapInformation; (void)HeapInformationLength;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_HeapQueryInformation(void* hHeap, int HeapInformationClass, void* HeapInformation, size_t HeapInformationLength, size_t* ReturnLength) {
+    (void)hHeap; (void)HeapInformationClass; (void)HeapInformation; (void)HeapInformationLength;
+    if (ReturnLength) *ReturnLength = 0;
+    return 1;
+}
+
+// ---- TLS (Thread Local Storage) ----
+// Slot 0 reserved; real TLS via pthread keys
+#define LSW_TLS_MAX 128
+static pthread_key_t lsw_tls_keys[LSW_TLS_MAX];
+static int           lsw_tls_used[LSW_TLS_MAX];
+static int           lsw_tls_once_done = 0;
+static pthread_mutex_t lsw_tls_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void lsw_tls_init(void) {
+    for (int i = 0; i < LSW_TLS_MAX; i++) lsw_tls_used[i] = 0;
+    lsw_tls_once_done = 1;
+}
+
+uint32_t __attribute__((ms_abi)) lsw_TlsAlloc(void) {
+    pthread_mutex_lock(&lsw_tls_lock);
+    if (!lsw_tls_once_done) lsw_tls_init();
+    for (int i = 0; i < LSW_TLS_MAX; i++) {
+        if (!lsw_tls_used[i]) {
+            if (pthread_key_create(&lsw_tls_keys[i], NULL) == 0) {
+                lsw_tls_used[i] = 1;
+                pthread_mutex_unlock(&lsw_tls_lock);
+                LSW_LOG_DEBUG("TlsAlloc -> slot %d", i);
+                return (uint32_t)i;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lsw_tls_lock);
+    return 0xFFFFFFFF; // TLS_OUT_OF_INDEXES
+}
+int __attribute__((ms_abi)) lsw_TlsFree(uint32_t dwTlsIndex) {
+    if (dwTlsIndex >= LSW_TLS_MAX) return 0;
+    pthread_mutex_lock(&lsw_tls_lock);
+    if (lsw_tls_used[dwTlsIndex]) {
+        pthread_key_delete(lsw_tls_keys[dwTlsIndex]);
+        lsw_tls_used[dwTlsIndex] = 0;
+    }
+    pthread_mutex_unlock(&lsw_tls_lock);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_TlsSetValue(uint32_t dwTlsIndex, void* lpTlsValue) {
+    if (dwTlsIndex >= LSW_TLS_MAX || !lsw_tls_used[dwTlsIndex]) return 0;
+    return pthread_setspecific(lsw_tls_keys[dwTlsIndex], lpTlsValue) == 0 ? 1 : 0;
+}
+void* __attribute__((ms_abi)) lsw_TlsGetValueEx(uint32_t dwTlsIndex) {
+    if (dwTlsIndex >= LSW_TLS_MAX || !lsw_tls_used[dwTlsIndex]) return NULL;
+    return pthread_getspecific(lsw_tls_keys[dwTlsIndex]);
+}
+
+// ---- CompareString ----
+int __attribute__((ms_abi)) lsw_CompareStringW(uint32_t Locale, uint32_t dwCmpFlags, const uint16_t* lpString1, int cchCount1, const uint16_t* lpString2, int cchCount2) {
+    (void)Locale; (void)dwCmpFlags;
+    if (!lpString1 || !lpString2) return 0; // CSTR_ERROR
+    // Convert to narrow and compare
+    char s1[1024], s2[1024];
+    int i = 0;
+    while (lpString1[i] && (cchCount1 < 0 || i < cchCount1) && i < 1023) { s1[i]=(char)lpString1[i]; i++; } s1[i]=0;
+    i = 0;
+    while (lpString2[i] && (cchCount2 < 0 || i < cchCount2) && i < 1023) { s2[i]=(char)lpString2[i]; i++; } s2[i]=0;
+    int r;
+    if (dwCmpFlags & 0x1) // NORM_IGNORECASE
+        r = strcasecmp(s1, s2);
+    else
+        r = strcmp(s1, s2);
+    return (r < 0) ? 1 : (r == 0) ? 2 : 3; // CSTR_LESS_THAN=1, CSTR_EQUAL=2, CSTR_GREATER_THAN=3
+}
+int __attribute__((ms_abi)) lsw_CompareStringA(uint32_t Locale, uint32_t dwCmpFlags, const char* lpString1, int cchCount1, const char* lpString2, int cchCount2) {
+    (void)Locale;
+    if (!lpString1 || !lpString2) return 0;
+    int r;
+    if (dwCmpFlags & 0x1)
+        r = strncasecmp(lpString1, lpString2, (cchCount1 < 0 || cchCount2 < 0) ? (size_t)-1 : (size_t)(cchCount1 < cchCount2 ? cchCount2 : cchCount1));
+    else
+        r = strncmp(lpString1, lpString2, (cchCount1 < 0 || cchCount2 < 0) ? (size_t)-1 : (size_t)(cchCount1 < cchCount2 ? cchCount2 : cchCount1));
+    return (r < 0) ? 1 : (r == 0) ? 2 : 3;
+}
+int __attribute__((ms_abi)) lsw_CompareStringEx(void* lpLocaleName, uint32_t dwCmpFlags, const uint16_t* lpString1, int cchCount1, const uint16_t* lpString2, int cchCount2, void* lpVersionInformation, void* lpReserved, int32_t lParam) {
+    (void)lpLocaleName; (void)lpVersionInformation; (void)lpReserved; (void)lParam;
+    return lsw_CompareStringW(0x0409, dwCmpFlags, lpString1, cchCount1, lpString2, cchCount2);
+}
+int __attribute__((ms_abi)) lsw_CompareStringOrdinal(const uint16_t* lpString1, int cchCount1, const uint16_t* lpString2, int cchCount2, int bIgnoreCase) {
+    uint32_t flags = bIgnoreCase ? 0x1 : 0x0;
+    return lsw_CompareStringW(0, flags, lpString1, cchCount1, lpString2, cchCount2);
+}
+int __attribute__((ms_abi)) lsw_lstrcmpA(const char* lpString1, const char* lpString2) {
+    if (!lpString1 || !lpString2) return 0;
+    return strcmp(lpString1, lpString2);
+}
+int __attribute__((ms_abi)) lsw_lstrcmpiA(const char* lpString1, const char* lpString2) {
+    if (!lpString1 || !lpString2) return 0;
+    return strcasecmp(lpString1, lpString2);
+}
+int __attribute__((ms_abi)) lsw_lstrcmpW(const uint16_t* lpString1, const uint16_t* lpString2) {
+    return lsw_CompareStringW(0, 0, lpString1, -1, lpString2, -1) - 2;
+}
+int __attribute__((ms_abi)) lsw_lstrcmpiW(const uint16_t* lpString1, const uint16_t* lpString2) {
+    return lsw_CompareStringW(0, 1, lpString1, -1, lpString2, -1) - 2;
+}
+int __attribute__((ms_abi)) lsw_lstrcpyA(char* lpString1, const char* lpString2) {
+    if (lpString1 && lpString2) strcpy(lpString1, lpString2);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_lstrcpynA(char* lpString1, const char* lpString2, int iMaxLength) {
+    if (lpString1 && lpString2 && iMaxLength > 0) { strncpy(lpString1, lpString2, (size_t)iMaxLength-1); lpString1[iMaxLength-1]=0; }
+    return 1;
+}
+/* lsw_lstrlenA already defined earlier — skip duplicate */
+int __attribute__((ms_abi)) lsw_lstrlenW(const uint16_t* lpString) {
+    if (!lpString) return 0;
+    int n = 0; while (lpString[n]) n++; return n;
+}
+
+// ---- SystemParametersInfo ----
+int __attribute__((ms_abi)) lsw_SystemParametersInfoW(uint32_t uiAction, uint32_t uiParam, void* pvParam, uint32_t fWinIni) {
+    (void)uiParam; (void)fWinIni;
+    // SPI_GETWORKAREA=48: fill RECT with (0,0,1920,1080)
+    if (uiAction == 48 && pvParam) {
+        int32_t* r = (int32_t*)pvParam;
+        r[0]=0; r[1]=0; r[2]=1920; r[3]=1080;
+        return 1;
+    }
+    // SPI_GETNONCLIENTMETRICS=41: partially fill
+    if (uiAction == 41 && pvParam) {
+        memset(pvParam, 0, uiParam > 0 ? uiParam : 500);
+        return 1;
+    }
+    // SPI_GETICONTITLELOGFONT=31: fill with default font info
+    if (uiAction == 31 && pvParam) {
+        memset(pvParam, 0, 92); // sizeof LOGFONTW
+        return 1;
+    }
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SystemParametersInfoA(uint32_t uiAction, uint32_t uiParam, void* pvParam, uint32_t fWinIni) {
+    return lsw_SystemParametersInfoW(uiAction, uiParam, pvParam, fWinIni);
+}
+
+// ---- TryAcquireSRWLock ----
+int __attribute__((ms_abi)) lsw_TryAcquireSRWLockExclusive(void** lock) {
+    if (!lock || !*lock) return 0;
+    return pthread_mutex_trylock((pthread_mutex_t*)*lock) == 0 ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_TryAcquireSRWLockShared(void** lock) {
+    if (!lock || !*lock) return 0;
+    return pthread_mutex_trylock((pthread_mutex_t*)*lock) == 0 ? 1 : 0;
+}
+
+// ---- More file mapping ----
+void* __attribute__((ms_abi)) lsw_OpenFileMappingW(uint32_t dwDesiredAccess, int bInheritHandle, const uint16_t* lpName) {
+    (void)dwDesiredAccess; (void)bInheritHandle; (void)lpName;
+    return NULL; // Named mappings not supported
+}
+void* __attribute__((ms_abi)) lsw_OpenFileMappingA(uint32_t dwDesiredAccess, int bInheritHandle, const char* lpName) {
+    (void)dwDesiredAccess; (void)bInheritHandle; (void)lpName;
+    return NULL;
+}
+void* __attribute__((ms_abi)) lsw_CreateFileMappingA(void* hFile, void* lpFileMappingAttributes, uint32_t flProtect, uint32_t dwMaximumSizeHigh, uint32_t dwMaximumSizeLow, const char* lpName) {
+    (void)lpName; (void)hFile; (void)lpFileMappingAttributes; (void)flProtect;
+    // Convert and delegate to W version
+    size_t size = ((size_t)dwMaximumSizeHigh << 32) | dwMaximumSizeLow;
+    if (size == 0) size = 4096;
+    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
+    lsw_file_mapping_t* fm = (lsw_file_mapping_t*)malloc(sizeof(*fm));
+    if (!fm) return NULL;
+    fm->base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (fm->base == MAP_FAILED) { free(fm); return NULL; }
+    fm->size = size;
+    return fm;
+}
+void* __attribute__((ms_abi)) lsw_MapViewOfFileEx(void* hFileMappingObject, uint32_t dwDesiredAccess, uint32_t dwFileOffsetHigh, uint32_t dwFileOffsetLow, size_t dwNumberOfBytesToMap, void* lpBaseAddress) {
+    (void)dwDesiredAccess; (void)lpBaseAddress;
+    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
+    lsw_file_mapping_t* fm = (lsw_file_mapping_t*)hFileMappingObject;
+    if (!fm) return NULL;
+    size_t offset = ((size_t)dwFileOffsetHigh << 32) | dwFileOffsetLow;
+    size_t bytes = dwNumberOfBytesToMap ? dwNumberOfBytesToMap : fm->size;
+    (void)offset;
+    return fm->base;
+}
+int __attribute__((ms_abi)) lsw_FlushViewOfFile(const void* lpBaseAddress, size_t dwNumberOfBytesToFlush) {
+    (void)lpBaseAddress; (void)dwNumberOfBytesToFlush; return 1;
+}
+int __attribute__((ms_abi)) lsw_FlushFileBuffers(void* hFile) { (void)hFile; return 1; }
+
+// ---- GetFileSizeEx / SetEndOfFile / LockFile ----
+int __attribute__((ms_abi)) lsw_GetFileSizeEx(void* hFile, void* lpFileSize) {
+    if (!hFile || !lpFileSize) return 0;
+    int fd = (int)(uintptr_t)hFile - 1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) { *(int64_t*)lpFileSize = 0; return 0; }
+    *(int64_t*)lpFileSize = (int64_t)st.st_size;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetEndOfFile(void* hFile) {
+    if (!hFile) return 0;
+    int fd = (int)(uintptr_t)hFile - 1;
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    return ftruncate(fd, pos) == 0 ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_LockFile(void* hFile, uint32_t dwFileOffsetLow, uint32_t dwFileOffsetHigh, uint32_t nNumberOfBytesToLockLow, uint32_t nNumberOfBytesToLockHigh) {
+    (void)hFile; (void)dwFileOffsetLow; (void)dwFileOffsetHigh; (void)nNumberOfBytesToLockLow; (void)nNumberOfBytesToLockHigh;
+    return 1; // Stub: no-op
+}
+int __attribute__((ms_abi)) lsw_UnlockFile(void* hFile, uint32_t dwFileOffsetLow, uint32_t dwFileOffsetHigh, uint32_t nNumberOfBytesToUnlockLow, uint32_t nNumberOfBytesToUnlockHigh) {
+    (void)hFile; (void)dwFileOffsetLow; (void)dwFileOffsetHigh; (void)nNumberOfBytesToUnlockLow; (void)nNumberOfBytesToUnlockHigh;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_LockFileEx(void* hFile, uint32_t dwFlags, uint32_t dwReserved, uint32_t nNumberOfBytesToLockLow, uint32_t nNumberOfBytesToLockHigh, void* lpOverlapped) {
+    (void)hFile; (void)dwFlags; (void)dwReserved; (void)nNumberOfBytesToLockLow; (void)nNumberOfBytesToLockHigh; (void)lpOverlapped;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_UnlockFileEx(void* hFile, uint32_t dwReserved, uint32_t nNumberOfBytesToUnlockLow, uint32_t nNumberOfBytesToUnlockHigh, void* lpOverlapped) {
+    (void)hFile; (void)dwReserved; (void)nNumberOfBytesToUnlockLow; (void)nNumberOfBytesToUnlockHigh; (void)lpOverlapped;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetFilePointerEx(void* hFile, int64_t liDistanceToMove, int64_t* lpNewFilePointer, uint32_t dwMoveMethod) {
+    if (!hFile) return 0;
+    int fd = (int)(uintptr_t)hFile - 1;
+    int whence = (dwMoveMethod == 0) ? SEEK_SET : (dwMoveMethod == 1) ? SEEK_CUR : SEEK_END;
+    off_t result = lseek(fd, (off_t)liDistanceToMove, whence);
+    if (result == (off_t)-1) return 0;
+    if (lpNewFilePointer) *lpNewFilePointer = (int64_t)result;
+    return 1;
+}
+
+// ---- GetFileTime / SetFileTime / GetFileInformationByHandle ----
+int __attribute__((ms_abi)) lsw_GetFileTime(void* hFile, void* lpCreationTime, void* lpLastAccessTime, void* lpLastWriteTime) {
+    if (!hFile) return 0;
+    int fd = (int)(uintptr_t)hFile - 1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    // Convert Unix time to FILETIME (100ns intervals since 1601-01-01)
+    uint64_t epoch_offset = 116444736000000000ULL;
+    uint64_t mtime = (uint64_t)st.st_mtime * 10000000ULL + epoch_offset;
+    if (lpCreationTime)  *(uint64_t*)lpCreationTime  = mtime;
+    if (lpLastAccessTime) *(uint64_t*)lpLastAccessTime = mtime;
+    if (lpLastWriteTime)  *(uint64_t*)lpLastWriteTime  = mtime;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetFileTime(void* hFile, const void* lpCreationTime, const void* lpLastAccessTime, const void* lpLastWriteTime) {
+    (void)hFile; (void)lpCreationTime; (void)lpLastAccessTime; (void)lpLastWriteTime;
+    return 1; // Stub
+}
+int __attribute__((ms_abi)) lsw_GetFileInformationByHandle(void* hFile, void* lpFileInformation) {
+    if (!hFile || !lpFileInformation) return 0;
+    int fd = (int)(uintptr_t)hFile - 1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return 0;
+    // BY_HANDLE_FILE_INFORMATION layout (80 bytes):
+    uint32_t* p = (uint32_t*)lpFileInformation;
+    uint64_t epoch_offset = 116444736000000000ULL;
+    uint64_t mtime = (uint64_t)st.st_mtime * 10000000ULL + epoch_offset;
+    p[0] = S_ISDIR(st.st_mode) ? 0x10 : 0x80; // dwFileAttributes
+    *(uint64_t*)(p+1) = mtime;   // ftCreationTime
+    *(uint64_t*)(p+3) = mtime;   // ftLastAccessTime
+    *(uint64_t*)(p+5) = mtime;   // ftLastWriteTime
+    p[7] = (uint32_t)st.st_dev;  // dwVolumeSerialNumber
+    p[8] = (uint32_t)(st.st_size & 0xFFFFFFFF);  // nFileSizeLow
+    p[9] = (uint32_t)(st.st_size >> 32);         // nFileSizeHigh
+    p[10] = 1; // nNumberOfLinks
+    p[11] = (uint32_t)(st.st_ino & 0xFFFFFFFF);
+    p[12] = (uint32_t)(st.st_ino >> 32);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetFileInformationByHandleEx(void* hFile, int FileInformationClass, void* lpFileInformation, uint32_t dwBufferSize) {
+    (void)hFile; (void)FileInformationClass; (void)dwBufferSize;
+    if (lpFileInformation) memset(lpFileInformation, 0, dwBufferSize > 0 ? dwBufferSize : 16);
+    return 0;
+}
+
+// ---- GetFileAttributesExW/A ----
+int __attribute__((ms_abi)) lsw_GetFileAttributesExW(const uint16_t* lpFileName, int fInfoLevelId, void* lpFileInformation) {
+    (void)fInfoLevelId;
+    if (!lpFileName || !lpFileInformation) return 0;
+    char path[4096]; int i=0;
+    while (lpFileName[i] && i<4095) { path[i]=(char)lpFileName[i]; i++; } path[i]=0;
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    uint32_t* p = (uint32_t*)lpFileInformation;
+    p[0] = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
+    uint64_t epoch_offset = 116444736000000000ULL;
+    uint64_t mtime = (uint64_t)st.st_mtime * 10000000ULL + epoch_offset;
+    *(uint64_t*)(p+1) = mtime; *(uint64_t*)(p+3) = mtime; *(uint64_t*)(p+5) = mtime;
+    p[7] = (uint32_t)(st.st_size & 0xFFFFFFFF);
+    p[8] = (uint32_t)(st.st_size >> 32);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetFileAttributesExA(const char* lpFileName, int fInfoLevelId, void* lpFileInformation) {
+    (void)fInfoLevelId;
+    if (!lpFileName || !lpFileInformation) return 0;
+    struct stat st;
+    if (stat(lpFileName, &st) != 0) return 0;
+    uint32_t* p = (uint32_t*)lpFileInformation;
+    p[0] = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
+    uint64_t epoch_offset = 116444736000000000ULL;
+    uint64_t mtime = (uint64_t)st.st_mtime * 10000000ULL + epoch_offset;
+    *(uint64_t*)(p+1) = mtime; *(uint64_t*)(p+3) = mtime; *(uint64_t*)(p+5) = mtime;
+    p[7] = (uint32_t)(st.st_size & 0xFFFFFFFF);
+    p[8] = (uint32_t)(st.st_size >> 32);
+    return 1;
+}
+
+// ---- Volume/Drive info ----
+int __attribute__((ms_abi)) lsw_GetVolumeInformationW(const uint16_t* lpRootPathName, uint16_t* lpVolumeNameBuffer, uint32_t nVolumeNameSize, uint32_t* lpVolumeSerialNumber, uint32_t* lpMaximumComponentLength, uint32_t* lpFileSystemFlags, uint16_t* lpFileSystemNameBuffer, uint32_t nFileSystemNameSize) {
+    (void)lpRootPathName;
+    if (lpVolumeNameBuffer && nVolumeNameSize > 3) { lpVolumeNameBuffer[0]='L'; lpVolumeNameBuffer[1]='S'; lpVolumeNameBuffer[2]='W'; lpVolumeNameBuffer[3]=0; }
+    if (lpVolumeSerialNumber)       *lpVolumeSerialNumber = 0xDEADBEEF;
+    if (lpMaximumComponentLength)   *lpMaximumComponentLength = 255;
+    if (lpFileSystemFlags)          *lpFileSystemFlags = 0x00000003; // case-sensitive + preserves case
+    if (lpFileSystemNameBuffer && nFileSystemNameSize > 5) { lpFileSystemNameBuffer[0]='e'; lpFileSystemNameBuffer[1]='x'; lpFileSystemNameBuffer[2]='t'; lpFileSystemNameBuffer[3]='4'; lpFileSystemNameBuffer[4]=0; }
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetVolumeInformationA(const char* lpRootPathName, char* lpVolumeNameBuffer, uint32_t nVolumeNameSize, uint32_t* lpVolumeSerialNumber, uint32_t* lpMaximumComponentLength, uint32_t* lpFileSystemFlags, char* lpFileSystemNameBuffer, uint32_t nFileSystemNameSize) {
+    (void)lpRootPathName;
+    if (lpVolumeNameBuffer && nVolumeNameSize > 3) strcpy(lpVolumeNameBuffer, "LSW");
+    if (lpVolumeSerialNumber)       *lpVolumeSerialNumber = 0xDEADBEEF;
+    if (lpMaximumComponentLength)   *lpMaximumComponentLength = 255;
+    if (lpFileSystemFlags)          *lpFileSystemFlags = 3;
+    if (lpFileSystemNameBuffer && nFileSystemNameSize > 4) strcpy(lpFileSystemNameBuffer, "ext4");
+    return 1;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetDriveTypeW(const uint16_t* lpRootPathName) {
+    (void)lpRootPathName; return 3; // DRIVE_FIXED
+}
+uint32_t __attribute__((ms_abi)) lsw_GetDriveTypeA(const char* lpRootPathName) {
+    (void)lpRootPathName; return 3;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetLogicalDrives(void) { return 0x4; } // 'C' drive bit
+uint32_t __attribute__((ms_abi)) lsw_GetLogicalDriveStringsW(uint32_t nBufferLength, uint16_t* lpBuffer) {
+    if (lpBuffer && nBufferLength >= 6) {
+        lpBuffer[0]='C'; lpBuffer[1]=':'; lpBuffer[2]='\\'; lpBuffer[3]=0;
+        lpBuffer[4]=0;
+    }
+    return 4; // "C:\0\0" = 4 wide chars
+}
+uint32_t __attribute__((ms_abi)) lsw_GetLogicalDriveStringsA(uint32_t nBufferLength, char* lpBuffer) {
+    if (lpBuffer && nBufferLength >= 5) { memcpy(lpBuffer, "C:\\\0\0", 5); }
+    return 4;
+}
+int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceExW(const uint16_t* lpDirectoryName, void* lpFreeBytesAvailableToCaller, void* lpTotalNumberOfBytes, void* lpTotalNumberOfFreeBytes) {
+    (void)lpDirectoryName;
+    struct statvfs sv;
+    statvfs("/", &sv);
+    uint64_t free_b = (uint64_t)sv.f_bavail * sv.f_bsize;
+    uint64_t total_b = (uint64_t)sv.f_blocks * sv.f_bsize;
+    if (lpFreeBytesAvailableToCaller) *(uint64_t*)lpFreeBytesAvailableToCaller = free_b;
+    if (lpTotalNumberOfBytes)         *(uint64_t*)lpTotalNumberOfBytes = total_b;
+    if (lpTotalNumberOfFreeBytes)     *(uint64_t*)lpTotalNumberOfFreeBytes = free_b;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceExA(const char* lpDirectoryName, void* lpFreeBytesAvailableToCaller, void* lpTotalNumberOfBytes, void* lpTotalNumberOfFreeBytes) {
+    (void)lpDirectoryName;
+    return lsw_GetDiskFreeSpaceExW(NULL, lpFreeBytesAvailableToCaller, lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
+}
+int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceW(const uint16_t* lpRootPathName, uint32_t* lpSectorsPerCluster, uint32_t* lpBytesPerSector, uint32_t* lpNumberOfFreeClusters, uint32_t* lpTotalNumberOfClusters) {
+    (void)lpRootPathName;
+    if (lpSectorsPerCluster)     *lpSectorsPerCluster = 8;
+    if (lpBytesPerSector)        *lpBytesPerSector = 512;
+    if (lpNumberOfFreeClusters)  *lpNumberOfFreeClusters = 1024*1024;
+    if (lpTotalNumberOfClusters) *lpTotalNumberOfClusters = 4*1024*1024;
+    return 1;
+}
+
+// ---- CriticalSection extras ----
+int __attribute__((ms_abi)) lsw_InitializeCriticalSectionAndSpinCount(void* lpCriticalSection, uint32_t dwSpinCount) {
+    (void)dwSpinCount;
+    lsw_InitializeCriticalSection(lpCriticalSection);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_InitializeCriticalSectionEx(void* lpCriticalSection, uint32_t dwSpinCount, uint32_t Flags) {
+    (void)dwSpinCount; (void)Flags;
+    lsw_InitializeCriticalSection(lpCriticalSection);
+    return 1;
+}
+/* lsw_TryEnterCriticalSection already defined earlier — skip duplicate */
+int __attribute__((ms_abi)) lsw_SetCriticalSectionSpinCount(void* lpCriticalSection, uint32_t dwSpinCount) {
+    (void)lpCriticalSection; (void)dwSpinCount; return 0;
+}
+
+// ---- Thread extras ----
+int __attribute__((ms_abi)) lsw_SuspendThread(void* hThread) { (void)hThread; return 0xFFFFFFFF; }
+int __attribute__((ms_abi)) lsw_ResumeThread(void* hThread) { (void)hThread; return 1; }
+int __attribute__((ms_abi)) lsw_TerminateThread(void* hThread, uint32_t dwExitCode) { (void)hThread; (void)dwExitCode; return 1; }
+int __attribute__((ms_abi)) lsw_TerminateProcess(void* hProcess, uint32_t uExitCode) { exit((int)uExitCode); return 1; }
+int __attribute__((ms_abi)) lsw_GetExitCodeThread(void* hThread, uint32_t* lpExitCode) { (void)hThread; if (lpExitCode) *lpExitCode = 0; return 1; }
+int __attribute__((ms_abi)) lsw_GetExitCodeProcess(void* hProcess, uint32_t* lpExitCode) { (void)hProcess; if (lpExitCode) *lpExitCode = 0; return 1; }
+void* __attribute__((ms_abi)) lsw_OpenThread(uint32_t dwDesiredAccess, int bInheritHandle, uint32_t dwThreadId) { (void)dwDesiredAccess; (void)bInheritHandle; (void)dwThreadId; return (void*)0xF001; }
+void* __attribute__((ms_abi)) lsw_OpenProcess(uint32_t dwDesiredAccess, int bInheritHandle, uint32_t dwProcessId) { (void)dwDesiredAccess; (void)bInheritHandle; (void)dwProcessId; return (void*)0xF002; }
+uint32_t __attribute__((ms_abi)) lsw_GetProcessId(void* Process) { (void)Process; return (uint32_t)getpid(); }
+uint32_t __attribute__((ms_abi)) lsw_GetThreadId(void* Thread) { (void)Thread; return (uint32_t)(uintptr_t)pthread_self(); }
+int __attribute__((ms_abi)) lsw_SetThreadPriority(void* hThread, int nPriority) { (void)hThread; (void)nPriority; return 1; }
+int __attribute__((ms_abi)) lsw_GetThreadPriority(void* hThread) { (void)hThread; return 0; } // THREAD_PRIORITY_NORMAL
+int __attribute__((ms_abi)) lsw_SetThreadPriorityBoost(void* hThread, int DisablePriorityBoost) { (void)hThread; (void)DisablePriorityBoost; return 1; }
+uint64_t __attribute__((ms_abi)) lsw_SetThreadAffinityMask(void* hThread, uint64_t dwThreadAffinityMask) { (void)hThread; return dwThreadAffinityMask; }
+int __attribute__((ms_abi)) lsw_SleepEx(uint32_t dwMilliseconds, int bAlertable) { (void)bAlertable; usleep(dwMilliseconds * 1000); return 0; }
+int __attribute__((ms_abi)) lsw_SwitchToThread(void) { sched_yield(); return 1; }
+int __attribute__((ms_abi)) lsw_Beep(uint32_t dwFreq, uint32_t dwDuration) { (void)dwFreq; (void)dwDuration; return 1; }
+
+// ---- CreatePipe ----
+int __attribute__((ms_abi)) lsw_CreatePipe(void** hReadPipe, void** hWritePipe, void* lpPipeAttributes, uint32_t nSize) {
+    (void)lpPipeAttributes; (void)nSize;
+    int pfd[2];
+    if (pipe(pfd) != 0) return 0;
+    if (hReadPipe)  *hReadPipe  = (void*)(uintptr_t)(pfd[0] + 1);
+    if (hWritePipe) *hWritePipe = (void*)(uintptr_t)(pfd[1] + 1);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_CreateNamedPipeW(const uint16_t* lpName, uint32_t dwOpenMode, uint32_t dwPipeMode, uint32_t nMaxInstances, uint32_t nOutBufferSize, uint32_t nInBufferSize, uint32_t nDefaultTimeOut, void* lpSecurityAttributes) {
+    (void)lpName; (void)dwOpenMode; (void)dwPipeMode; (void)nMaxInstances; (void)nOutBufferSize; (void)nInBufferSize; (void)nDefaultTimeOut; (void)lpSecurityAttributes;
+    return (int)(uintptr_t)0xFFFFFFFF; // INVALID_HANDLE_VALUE
+}
+int __attribute__((ms_abi)) lsw_ConnectNamedPipe(void* hNamedPipe, void* lpOverlapped) { (void)hNamedPipe; (void)lpOverlapped; return 0; }
+int __attribute__((ms_abi)) lsw_DisconnectNamedPipe(void* hNamedPipe) { (void)hNamedPipe; return 1; }
+int __attribute__((ms_abi)) lsw_CallNamedPipeW(const uint16_t* lpNamedPipeName, void* lpInBuffer, uint32_t nInBufferSize, void* lpOutBuffer, uint32_t nOutBufferSize, uint32_t* lpBytesRead, uint32_t nTimeOut) {
+    (void)lpNamedPipeName; (void)lpInBuffer; (void)nInBufferSize; (void)lpOutBuffer; (void)nOutBufferSize; (void)lpBytesRead; (void)nTimeOut;
+    return 0;
+}
+
+// ---- Console extra APIs ----
+uint32_t __attribute__((ms_abi)) lsw_GetConsoleCP(void) { return 65001; } // UTF-8
+uint32_t __attribute__((ms_abi)) lsw_GetConsoleOutputCP(void) { return 65001; }
+int __attribute__((ms_abi)) lsw_SetConsoleCP(uint32_t wCodePageID) { (void)wCodePageID; return 1; }
+int __attribute__((ms_abi)) lsw_SetConsoleOutputCP(uint32_t wCodePageID) { (void)wCodePageID; return 1; }
+int __attribute__((ms_abi)) lsw_GetConsoleCursorInfo(void* hConsoleOutput, void* lpConsoleCursorInfo) {
+    (void)hConsoleOutput;
+    if (lpConsoleCursorInfo) { *(uint32_t*)lpConsoleCursorInfo = 25; *((int32_t*)lpConsoleCursorInfo+1) = 1; }
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetConsoleCursorInfo(void* hConsoleOutput, const void* lpConsoleCursorInfo) { (void)hConsoleOutput; (void)lpConsoleCursorInfo; return 1; }
+int __attribute__((ms_abi)) lsw_SetConsoleCursorPosition(void* hConsoleOutput, uint32_t dwCursorPosition) { (void)hConsoleOutput; (void)dwCursorPosition; return 1; }
+int __attribute__((ms_abi)) lsw_GetConsoleScreenBufferInfo(void* hConsoleOutput, void* lpConsoleScreenBufferInfo) {
+    (void)hConsoleOutput;
+    if (lpConsoleScreenBufferInfo) {
+        memset(lpConsoleScreenBufferInfo, 0, 22);
+        uint16_t* p = (uint16_t*)lpConsoleScreenBufferInfo;
+        p[0]=1920; p[1]=1080; // dwSize
+        p[4]=1920-1; p[5]=1080-1; // srWindow Right/Bottom
+    }
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetConsoleTextAttribute(void* hConsoleOutput, uint16_t wAttributes) { (void)hConsoleOutput; (void)wAttributes; return 1; }
+int __attribute__((ms_abi)) lsw_SetConsoleScreenBufferSize(void* hConsoleOutput, uint32_t dwSize) { (void)hConsoleOutput; (void)dwSize; return 1; }
+int __attribute__((ms_abi)) lsw_FillConsoleOutputCharacterW(void* hConsoleOutput, uint16_t cCharacter, uint32_t nLength, uint32_t dwWriteCoord, uint32_t* lpNumberOfCharsWritten) {
+    (void)hConsoleOutput; (void)cCharacter;
+    if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = nLength;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_FillConsoleOutputAttribute(void* hConsoleOutput, uint16_t wAttribute, uint32_t nLength, uint32_t dwWriteCoord, uint32_t* lpNumberOfAttrsWritten) {
+    (void)hConsoleOutput; (void)wAttribute;
+    if (lpNumberOfAttrsWritten) *lpNumberOfAttrsWritten = nLength;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_WriteConsoleOutputCharacterW(void* hConsoleOutput, const uint16_t* lpCharacter, uint32_t nLength, uint32_t dwWriteCoord, uint32_t* lpNumberOfCharsWritten) {
+    (void)hConsoleOutput; (void)lpCharacter; (void)dwWriteCoord;
+    if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = nLength;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_WriteConsoleOutputW(void* hConsoleOutput, const void* lpBuffer, uint32_t dwBufferSize, uint32_t dwBufferCoord, void* lpWriteRegion) {
+    (void)hConsoleOutput; (void)lpBuffer; (void)dwBufferSize; (void)dwBufferCoord; (void)lpWriteRegion; return 1;
+}
+int __attribute__((ms_abi)) lsw_ReadConsoleInputW(void* hConsoleInput, void* lpBuffer, uint32_t nLength, uint32_t* lpNumberOfEventsRead) {
+    (void)hConsoleInput; (void)lpBuffer; (void)nLength;
+    if (lpNumberOfEventsRead) *lpNumberOfEventsRead = 0;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetNumberOfConsoleInputEvents(void* hConsoleInput, uint32_t* lpcNumberOfEvents) {
+    (void)hConsoleInput; if (lpcNumberOfEvents) *lpcNumberOfEvents = 0; return 1;
+}
+int __attribute__((ms_abi)) lsw_SetConsoleWindowInfo(void* hConsoleOutput, int bAbsolute, const void* lpConsoleWindow) { (void)hConsoleOutput; (void)bAbsolute; (void)lpConsoleWindow; return 1; }
+int __attribute__((ms_abi)) lsw_SetConsoleActiveScreenBuffer(void* hConsoleOutput) { (void)hConsoleOutput; return 1; }
+void* __attribute__((ms_abi)) lsw_CreateConsoleScreenBuffer(uint32_t dwDesiredAccess, uint32_t dwShareMode, const void* lpSecurityAttributes, uint32_t dwFlags, void* lpScreenBufferData) {
+    (void)dwDesiredAccess; (void)dwShareMode; (void)lpSecurityAttributes; (void)dwFlags; (void)lpScreenBufferData;
+    return (void*)2; // fake handle
+}
+
+// ---- GetStartupInfo ----
+void __attribute__((ms_abi)) lsw_GetStartupInfoW(void* lpStartupInfo) {
+    if (!lpStartupInfo) return;
+    memset(lpStartupInfo, 0, 104); // sizeof STARTUPINFOW
+    *(uint32_t*)lpStartupInfo = 104; // cb
+}
+void __attribute__((ms_abi)) lsw_GetStartupInfoA(void* lpStartupInfo) {
+    if (!lpStartupInfo) return;
+    memset(lpStartupInfo, 0, 68); // sizeof STARTUPINFOA
+    *(uint32_t*)lpStartupInfo = 68;
+}
+
+// ---- CreateProcess ----
+int __attribute__((ms_abi)) lsw_CreateProcessW(const uint16_t* lpApplicationName, uint16_t* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, uint32_t dwCreationFlags, void* lpEnvironment, const uint16_t* lpCurrentDirectory, void* lpStartupInfo, void* lpProcessInformation) {
+    (void)lpApplicationName; (void)lpCommandLine; (void)lpProcessAttributes; (void)lpThreadAttributes; (void)bInheritHandles; (void)dwCreationFlags; (void)lpEnvironment; (void)lpCurrentDirectory; (void)lpStartupInfo;
+    LSW_LOG_WARN("CreateProcessW: process creation not supported on LSW");
+    if (lpProcessInformation) memset(lpProcessInformation, 0, 24);
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_CreateProcessA(const char* lpApplicationName, char* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, uint32_t dwCreationFlags, void* lpEnvironment, const char* lpCurrentDirectory, void* lpStartupInfo, void* lpProcessInformation) {
+    (void)lpApplicationName; (void)lpCommandLine; (void)lpProcessAttributes; (void)lpThreadAttributes; (void)bInheritHandles; (void)dwCreationFlags; (void)lpEnvironment; (void)lpCurrentDirectory; (void)lpStartupInfo;
+    if (lpProcessInformation) memset(lpProcessInformation, 0, 24);
+    return 0;
+}
+
+// ---- Symbolic/Hard links ----
+int __attribute__((ms_abi)) lsw_CreateSymbolicLinkW(const uint16_t* lpSymlinkFileName, const uint16_t* lpTargetFileName, uint32_t dwFlags) {
+    (void)dwFlags;
+    if (!lpSymlinkFileName || !lpTargetFileName) return 0;
+    char link[512], target[512]; int i=0;
+    while (lpSymlinkFileName[i] && i<511) { link[i]=(char)lpSymlinkFileName[i]; i++; } link[i]=0;
+    i=0;
+    while (lpTargetFileName[i] && i<511) { target[i]=(char)lpTargetFileName[i]; i++; } target[i]=0;
+    return symlink(target, link) == 0 ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_CreateSymbolicLinkA(const char* lpSymlinkFileName, const char* lpTargetFileName, uint32_t dwFlags) {
+    (void)dwFlags;
+    return (lpSymlinkFileName && lpTargetFileName && symlink(lpTargetFileName, lpSymlinkFileName) == 0) ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_CreateHardLinkW(const uint16_t* lpFileName, const uint16_t* lpExistingFileName, void* lpSecurityAttributes) {
+    (void)lpSecurityAttributes;
+    if (!lpFileName || !lpExistingFileName) return 0;
+    char newf[512], existing[512]; int i=0;
+    while (lpFileName[i] && i<511) { newf[i]=(char)lpFileName[i]; i++; } newf[i]=0;
+    i=0;
+    while (lpExistingFileName[i] && i<511) { existing[i]=(char)lpExistingFileName[i]; i++; } existing[i]=0;
+    return link(existing, newf) == 0 ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_CreateHardLinkA(const char* lpFileName, const char* lpExistingFileName, void* lpSecurityAttributes) {
+    (void)lpSecurityAttributes;
+    return (lpFileName && lpExistingFileName && link(lpExistingFileName, lpFileName) == 0) ? 1 : 0;
+}
+
+// ---- LocalAlloc extras / GlobalAlloc extras ----
+void* __attribute__((ms_abi)) lsw_LocalLock(void* hMem) { return hMem; }
+void* __attribute__((ms_abi)) lsw_LocalUnlock(void* hMem) { (void)hMem; return 0; }
+size_t __attribute__((ms_abi)) lsw_LocalSize(void* hMem) { (void)hMem; return 0; }
+void* __attribute__((ms_abi)) lsw_LocalReAlloc(void* hMem, size_t uBytes, uint32_t uFlags) { (void)uFlags; return realloc(hMem, uBytes); }
+uint32_t __attribute__((ms_abi)) lsw_LocalFlags(void* hMem) { (void)hMem; return 0; }
+/* lsw_GlobalUnlock / lsw_GlobalSize already defined earlier — skip duplicates */
+void* __attribute__((ms_abi)) lsw_GlobalReAlloc(void* hMem, size_t dwBytes, uint32_t uFlags) { (void)uFlags; return realloc(hMem, dwBytes); }
+void* __attribute__((ms_abi)) lsw_GlobalHandle(void* pMem) { return pMem; }
+uint32_t __attribute__((ms_abi)) lsw_GlobalFlags(void* hMem) { (void)hMem; return 0; }
+uint32_t __attribute__((ms_abi)) lsw_GlobalGetAtomNameW(uint16_t nAtom, uint16_t* lpBuffer, int nSize) { (void)nAtom; (void)lpBuffer; (void)nSize; return 0; }
+uint16_t __attribute__((ms_abi)) lsw_GlobalAddAtomW(const uint16_t* lpString) { (void)lpString; return 0; }
+uint16_t __attribute__((ms_abi)) lsw_GlobalDeleteAtom(uint16_t nAtom) { (void)nAtom; return nAtom; }
+uint16_t __attribute__((ms_abi)) lsw_GlobalFindAtomW(const uint16_t* lpString) { (void)lpString; return 0; }
+uint16_t __attribute__((ms_abi)) lsw_AddAtomW(const uint16_t* lpString) { (void)lpString; return 0xC000; }
+uint16_t __attribute__((ms_abi)) lsw_DeleteAtom(uint16_t nAtom) { (void)nAtom; return nAtom; }
+uint16_t __attribute__((ms_abi)) lsw_FindAtomW(const uint16_t* lpString) { (void)lpString; return 0; }
+uint32_t __attribute__((ms_abi)) lsw_GetAtomNameW(uint16_t nAtom, uint16_t* lpBuffer, int nSize) { (void)nAtom; (void)lpBuffer; (void)nSize; return 0; }
+
+// ---- DeviceIoControl ----
+int __attribute__((ms_abi)) lsw_DeviceIoControl(void* hDevice, uint32_t dwIoControlCode, void* lpInBuffer, uint32_t nInBufferSize, void* lpOutBuffer, uint32_t nOutBufferSize, uint32_t* lpBytesReturned, void* lpOverlapped) {
+    (void)hDevice; (void)dwIoControlCode; (void)lpInBuffer; (void)nInBufferSize; (void)lpOutBuffer; (void)nOutBufferSize; (void)lpOverlapped;
+    if (lpBytesReturned) *lpBytesReturned = 0;
+    return 0; // Not supported
+}
+
+// ---- GetNativeSystemInfo ----
+void __attribute__((ms_abi)) lsw_GetNativeSystemInfo(void* lpSystemInfo) {
+    lsw_GetSystemInfo(lpSystemInfo);
+}
+
+// ---- GetSystemTimes / GetProcessTimes ----
+int __attribute__((ms_abi)) lsw_GetSystemTimes(void* lpIdleTime, void* lpKernelTime, void* lpUserTime) {
+    if (lpIdleTime)  *(uint64_t*)lpIdleTime  = 0;
+    if (lpKernelTime) *(uint64_t*)lpKernelTime = 0;
+    if (lpUserTime)  *(uint64_t*)lpUserTime  = 0;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetProcessTimes(void* hProcess, void* lpCreationTime, void* lpExitTime, void* lpKernelTime, void* lpUserTime) {
+    (void)hProcess;
+    uint64_t epoch_offset = 116444736000000000ULL;
+    uint64_t now = (uint64_t)time(NULL) * 10000000ULL + epoch_offset;
+    if (lpCreationTime) *(uint64_t*)lpCreationTime = now;
+    if (lpExitTime)     *(uint64_t*)lpExitTime     = 0;
+    if (lpKernelTime)   *(uint64_t*)lpKernelTime   = 0;
+    if (lpUserTime)     *(uint64_t*)lpUserTime     = 0;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetThreadTimes(void* hThread, void* lpCreationTime, void* lpExitTime, void* lpKernelTime, void* lpUserTime) {
+    return lsw_GetProcessTimes(hThread, lpCreationTime, lpExitTime, lpKernelTime, lpUserTime);
+}
+
+// ---- GetTimeZoneInformation ----
+uint32_t __attribute__((ms_abi)) lsw_GetTimeZoneInformation(void* lpTimeZoneInformation) {
+    if (lpTimeZoneInformation) memset(lpTimeZoneInformation, 0, 172);
+    return 0; // TIME_ZONE_ID_UNKNOWN
+}
+
+// ---- Overlapped I/O ----
+int __attribute__((ms_abi)) lsw_GetOverlappedResult(void* hFile, void* lpOverlapped, uint32_t* lpNumberOfBytesTransferred, int bWait) {
+    (void)hFile; (void)lpOverlapped; (void)bWait;
+    if (lpNumberOfBytesTransferred) *lpNumberOfBytesTransferred = 0;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_ReadFileEx(void* hFile, void* lpBuffer, uint32_t nNumberOfBytesToRead, void* lpOverlapped, void* lpCompletionRoutine) {
+    (void)lpOverlapped; (void)lpCompletionRoutine;
+    return lsw_ReadFile(hFile, lpBuffer, nNumberOfBytesToRead, NULL, NULL);
+}
+int __attribute__((ms_abi)) lsw_WriteFileEx(void* hFile, const void* lpBuffer, uint32_t nNumberOfBytesToWrite, void* lpOverlapped, void* lpCompletionRoutine) {
+    (void)lpOverlapped; (void)lpCompletionRoutine;
+    return lsw_WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, NULL, NULL);
+}
+int __attribute__((ms_abi)) lsw_CancelIo(void* hFile) { (void)hFile; return 1; }
+int __attribute__((ms_abi)) lsw_CancelIoEx(void* hFile, void* lpOverlapped) { (void)hFile; (void)lpOverlapped; return 1; }
+int __attribute__((ms_abi)) lsw_CancelSynchronousIo(void* hThread) { (void)hThread; return 1; }
+
+// ---- Memory extras ----
+void* __attribute__((ms_abi)) lsw_MapViewOfFile3(void* FileMappingObject, void* Process, void* BaseAddress, uint64_t Offset, size_t ViewSize, uint32_t AllocationType, uint32_t PageProtection, void* ExtendedParameters, uint32_t ParameterCount) {
+    (void)Process; (void)BaseAddress; (void)Offset; (void)ViewSize; (void)AllocationType; (void)PageProtection; (void)ExtendedParameters; (void)ParameterCount;
+    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
+    lsw_file_mapping_t* fm = (lsw_file_mapping_t*)FileMappingObject;
+    return fm ? fm->base : NULL;
+}
+void* __attribute__((ms_abi)) lsw_VirtualAllocEx(void* hProcess, void* lpAddress, size_t dwSize, uint32_t flAllocationType, uint32_t flProtect) {
+    (void)hProcess;
+    return lsw_VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+}
+int __attribute__((ms_abi)) lsw_VirtualFreeEx(void* hProcess, void* lpAddress, size_t dwSize, uint32_t dwFreeType) {
+    (void)hProcess;
+    return lsw_VirtualFree(lpAddress, dwSize, dwFreeType);
+}
+int __attribute__((ms_abi)) lsw_VirtualProtectEx(void* hProcess, void* lpAddress, size_t dwSize, uint32_t flNewProtect, uint32_t* lpflOldProtect) {
+    (void)hProcess;
+    return lsw_VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect);
+}
+
+// ---- Misc remaining ----
+int __attribute__((ms_abi)) lsw_GetBinaryTypeW(const uint16_t* lpApplicationName, uint32_t* lpBinaryType) {
+    (void)lpApplicationName;
+    if (lpBinaryType) *lpBinaryType = 6; // SCS_64BIT_BINARY
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetBinaryTypeA(const char* lpApplicationName, uint32_t* lpBinaryType) {
+    (void)lpApplicationName;
+    if (lpBinaryType) *lpBinaryType = 6;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetErrorMode(uint32_t uMode) { (void)uMode; return 0; }
+uint32_t __attribute__((ms_abi)) lsw_GetErrorMode(void) { return 0; }
+int __attribute__((ms_abi)) lsw_SetThreadErrorMode(uint32_t dwNewMode, uint32_t* lpOldMode) { if (lpOldMode) *lpOldMode = 0; (void)dwNewMode; return 1; }
+uint32_t __attribute__((ms_abi)) lsw_GetThreadErrorMode(void) { return 0; }
+uint32_t __attribute__((ms_abi)) lsw_GetProcessVersion(uint32_t ProcessId) { (void)ProcessId; return (6<<16)|1; } // 6.1 = Win7
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentPackageId(uint32_t* bufferLength, uint8_t* buffer) { (void)buffer; if (bufferLength) *bufferLength=0; return 15700L; } // APPMODEL_ERROR_NO_PACKAGE
+uint64_t __attribute__((ms_abi)) lsw_GetActiveProcessorCount(uint16_t GroupNumber) { (void)GroupNumber; return (uint64_t)sysconf(_SC_NPROCESSORS_ONLN); }
+uint16_t __attribute__((ms_abi)) lsw_GetActiveProcessorGroupCount(void) { return 1; }
+int __attribute__((ms_abi)) lsw_QueryFullProcessImageNameW(void* hProcess, uint32_t dwFlags, uint16_t* lpExeName, uint32_t* lpdwSize) {
+    (void)hProcess; (void)dwFlags;
+    if (lpExeName && lpdwSize && *lpdwSize > 4) { lpExeName[0]='l'; lpExeName[1]='s'; lpExeName[2]='w'; lpExeName[3]=0; *lpdwSize=3; }
+    return 1;
+}
+void __attribute__((ms_abi)) lsw_RaiseException(uint32_t dwExceptionCode, uint32_t dwExceptionFlags, uint32_t nNumberOfArguments, const uint64_t* lpArguments) {
+    (void)dwExceptionFlags; (void)nNumberOfArguments; (void)lpArguments;
+    LSW_LOG_ERROR("RaiseException: code=0x%08x", dwExceptionCode);
+    // Don't actually raise — log and return
+}
+int __attribute__((ms_abi)) lsw_SetConsoleCtrlHandler(void* HandlerRoutine, int Add) { (void)HandlerRoutine; (void)Add; return 1; }
+int __attribute__((ms_abi)) lsw_GenerateConsoleCtrlEvent(uint32_t dwCtrlEvent, uint32_t dwProcessGroupId) { (void)dwCtrlEvent; (void)dwProcessGroupId; return 1; }
+int __attribute__((ms_abi)) lsw_GetConsoleTitle(uint16_t* lpConsoleTitle, uint32_t nSize) { if (lpConsoleTitle && nSize > 3) { lpConsoleTitle[0]='L'; lpConsoleTitle[1]='S'; lpConsoleTitle[2]='W'; lpConsoleTitle[3]=0; } return 3; }
+/* lsw_FindClose already defined earlier — skip duplicate */
+// RemoveDirectoryA
+int __attribute__((ms_abi)) lsw_RemoveDirectoryA(const char* lpPathName) {
+    if (!lpPathName) return 0;
+    return rmdir(lpPathName) == 0 ? 1 : 0;
+}
+
+// ============================================================================
 // END Additional KERNEL32 APIs
 // ============================================================================
 
@@ -3830,13 +4561,6 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "WriteConsoleA", (void*)lsw_WriteConsoleA},
     {"KERNEL32.dll", "GetCommandLineA", (void*)lsw_GetCommandLineA},
     {"KERNEL32.dll", "ExitProcess", (void*)lsw_ExitProcess},
-    
-    // advapi32.dll - Registry APIs
-    {"advapi32.dll", "RegOpenKeyExA", (void*)lsw_RegOpenKeyExA},
-    {"advapi32.dll", "RegCreateKeyExA", (void*)lsw_RegCreateKeyExA},
-    {"advapi32.dll", "RegQueryValueExA", (void*)lsw_RegQueryValueExA},
-    {"advapi32.dll", "RegSetValueExA", (void*)lsw_RegSetValueExA},
-    {"advapi32.dll", "RegCloseKey", (void*)lsw_RegCloseKey},
     
     // COMDLG32.dll - Common Dialogs
     {"COMDLG32.dll", "PrintDlgW", (void*)lsw_PrintDlgW},
@@ -4173,6 +4897,180 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "MoveMemory",               (void*)lsw_MoveMemory},
     {"KERNEL32.dll", "CharToOemA",               (void*)lsw_CharToOemA},
     {"KERNEL32.dll", "OemToCharA",               (void*)lsw_OemToCharA},
+    // KERNEL32 batch 2
+    {"KERNEL32.dll", "IsWow64Process",           (void*)lsw_IsWow64Process},
+    {"KERNEL32.dll", "FreeLibrary",              (void*)lsw_FreeLibrary},
+    {"KERNEL32.dll", "FreeLibraryAndExitThread", (void*)lsw_FreeLibraryAndExitThread},
+    {"KERNEL32.dll", "LoadLibraryExW",           (void*)lsw_LoadLibraryExW},
+    {"KERNEL32.dll", "GetModuleHandleExW",       (void*)lsw_GetModuleHandleExW},
+    {"KERNEL32.dll", "GetModuleHandleExA",       (void*)lsw_GetModuleHandleExA},
+    {"KERNEL32.dll", "HeapCreate",               (void*)lsw_HeapCreate},
+    {"KERNEL32.dll", "HeapDestroy",              (void*)lsw_HeapDestroy},
+    {"KERNEL32.dll", "HeapValidate",             (void*)lsw_HeapValidate},
+    {"KERNEL32.dll", "HeapCompact",              (void*)lsw_HeapCompact},
+    {"KERNEL32.dll", "HeapLock",                 (void*)lsw_HeapLock},
+    {"KERNEL32.dll", "HeapUnlock",               (void*)lsw_HeapUnlock},
+    {"KERNEL32.dll", "HeapWalk",                 (void*)lsw_HeapWalk},
+    {"KERNEL32.dll", "HeapSetInformation",       (void*)lsw_HeapSetInformation},
+    {"KERNEL32.dll", "HeapQueryInformation",     (void*)lsw_HeapQueryInformation},
+    {"KERNEL32.dll", "TlsAlloc",                 (void*)lsw_TlsAlloc},
+    {"KERNEL32.dll", "TlsFree",                  (void*)lsw_TlsFree},
+    {"KERNEL32.dll", "TlsSetValue",              (void*)lsw_TlsSetValue},
+    {"KERNEL32.dll", "TlsGetValue",              (void*)lsw_TlsGetValueEx},
+    {"KERNEL32.dll", "CompareStringW",           (void*)lsw_CompareStringW},
+    {"KERNEL32.dll", "CompareStringA",           (void*)lsw_CompareStringA},
+    {"KERNEL32.dll", "CompareStringEx",          (void*)lsw_CompareStringEx},
+    {"KERNEL32.dll", "CompareStringOrdinal",     (void*)lsw_CompareStringOrdinal},
+    {"KERNEL32.dll", "lstrcmpA",                 (void*)lsw_lstrcmpA},
+    {"KERNEL32.dll", "lstrcmpiA",                (void*)lsw_lstrcmpiA},
+    {"KERNEL32.dll", "lstrcmpW",                 (void*)lsw_lstrcmpW},
+    {"KERNEL32.dll", "lstrcmpiW",                (void*)lsw_lstrcmpiW},
+    {"KERNEL32.dll", "lstrcpyA",                 (void*)lsw_lstrcpyA},
+    {"KERNEL32.dll", "lstrcpynA",                (void*)lsw_lstrcpynA},
+    {"KERNEL32.dll", "lstrlenA",                 (void*)lsw_lstrlenA},
+    {"KERNEL32.dll", "lstrlenW",                 (void*)lsw_lstrlenW},
+    {"KERNEL32.dll", "SystemParametersInfoW",    (void*)lsw_SystemParametersInfoW},
+    {"KERNEL32.dll", "SystemParametersInfoA",    (void*)lsw_SystemParametersInfoA},
+    {"KERNEL32.dll", "TryAcquireSRWLockExclusive",(void*)lsw_TryAcquireSRWLockExclusive},
+    {"KERNEL32.dll", "TryAcquireSRWLockShared",  (void*)lsw_TryAcquireSRWLockShared},
+    {"KERNEL32.dll", "OpenFileMappingW",         (void*)lsw_OpenFileMappingW},
+    {"KERNEL32.dll", "OpenFileMappingA",         (void*)lsw_OpenFileMappingA},
+    {"KERNEL32.dll", "CreateFileMappingA",       (void*)lsw_CreateFileMappingA},
+    {"KERNEL32.dll", "MapViewOfFileEx",          (void*)lsw_MapViewOfFileEx},
+    {"KERNEL32.dll", "FlushViewOfFile",          (void*)lsw_FlushViewOfFile},
+    {"KERNEL32.dll", "FlushFileBuffers",         (void*)lsw_FlushFileBuffers},
+    {"KERNEL32.dll", "GetFileSizeEx",            (void*)lsw_GetFileSizeEx},
+    {"KERNEL32.dll", "SetEndOfFile",             (void*)lsw_SetEndOfFile},
+    {"KERNEL32.dll", "LockFile",                 (void*)lsw_LockFile},
+    {"KERNEL32.dll", "UnlockFile",               (void*)lsw_UnlockFile},
+    {"KERNEL32.dll", "LockFileEx",               (void*)lsw_LockFileEx},
+    {"KERNEL32.dll", "UnlockFileEx",             (void*)lsw_UnlockFileEx},
+    {"KERNEL32.dll", "SetFilePointerEx",         (void*)lsw_SetFilePointerEx},
+    {"KERNEL32.dll", "GetFileTime",              (void*)lsw_GetFileTime},
+    {"KERNEL32.dll", "SetFileTime",              (void*)lsw_SetFileTime},
+    {"KERNEL32.dll", "GetFileInformationByHandle",(void*)lsw_GetFileInformationByHandle},
+    {"KERNEL32.dll", "GetFileInformationByHandleEx",(void*)lsw_GetFileInformationByHandleEx},
+    {"KERNEL32.dll", "GetFileAttributesExW",     (void*)lsw_GetFileAttributesExW},
+    {"KERNEL32.dll", "GetFileAttributesExA",     (void*)lsw_GetFileAttributesExA},
+    {"KERNEL32.dll", "FindFirstFileW",           (void*)lsw_FindFirstFileW},
+    {"KERNEL32.dll", "FindNextFileW",            (void*)lsw_FindNextFileW},
+    {"KERNEL32.dll", "FindFirstFileExW",         (void*)lsw_FindFirstFileExW},
+    {"KERNEL32.dll", "FindClose",                (void*)lsw_FindClose},
+    {"KERNEL32.dll", "RemoveDirectoryA",         (void*)lsw_RemoveDirectoryA},
+    {"KERNEL32.dll", "GetVolumeInformationW",    (void*)lsw_GetVolumeInformationW},
+    {"KERNEL32.dll", "GetVolumeInformationA",    (void*)lsw_GetVolumeInformationA},
+    {"KERNEL32.dll", "GetDriveTypeW",            (void*)lsw_GetDriveTypeW},
+    {"KERNEL32.dll", "GetDriveTypeA",            (void*)lsw_GetDriveTypeA},
+    {"KERNEL32.dll", "GetLogicalDrives",         (void*)lsw_GetLogicalDrives},
+    {"KERNEL32.dll", "GetLogicalDriveStringsW",  (void*)lsw_GetLogicalDriveStringsW},
+    {"KERNEL32.dll", "GetLogicalDriveStringsA",  (void*)lsw_GetLogicalDriveStringsA},
+    {"KERNEL32.dll", "GetDiskFreeSpaceExW",      (void*)lsw_GetDiskFreeSpaceExW},
+    {"KERNEL32.dll", "GetDiskFreeSpaceExA",      (void*)lsw_GetDiskFreeSpaceExA},
+    {"KERNEL32.dll", "GetDiskFreeSpaceW",        (void*)lsw_GetDiskFreeSpaceW},
+    {"KERNEL32.dll", "InitializeCriticalSectionAndSpinCount",(void*)lsw_InitializeCriticalSectionAndSpinCount},
+    {"KERNEL32.dll", "InitializeCriticalSectionEx",(void*)lsw_InitializeCriticalSectionEx},
+    {"KERNEL32.dll", "TryEnterCriticalSection",  (void*)lsw_TryEnterCriticalSection},
+    {"KERNEL32.dll", "SetCriticalSectionSpinCount",(void*)lsw_SetCriticalSectionSpinCount},
+    {"KERNEL32.dll", "SuspendThread",            (void*)lsw_SuspendThread},
+    {"KERNEL32.dll", "ResumeThread",             (void*)lsw_ResumeThread},
+    {"KERNEL32.dll", "TerminateThread",          (void*)lsw_TerminateThread},
+    {"KERNEL32.dll", "TerminateProcess",         (void*)lsw_TerminateProcess},
+    {"KERNEL32.dll", "GetExitCodeThread",        (void*)lsw_GetExitCodeThread},
+    {"KERNEL32.dll", "GetExitCodeProcess",       (void*)lsw_GetExitCodeProcess},
+    {"KERNEL32.dll", "OpenThread",               (void*)lsw_OpenThread},
+    {"KERNEL32.dll", "OpenProcess",              (void*)lsw_OpenProcess},
+    {"KERNEL32.dll", "GetProcessId",             (void*)lsw_GetProcessId},
+    {"KERNEL32.dll", "GetThreadId",              (void*)lsw_GetThreadId},
+    {"KERNEL32.dll", "SetThreadPriority",        (void*)lsw_SetThreadPriority},
+    {"KERNEL32.dll", "GetThreadPriority",        (void*)lsw_GetThreadPriority},
+    {"KERNEL32.dll", "SetThreadPriorityBoost",   (void*)lsw_SetThreadPriorityBoost},
+    {"KERNEL32.dll", "SetThreadAffinityMask",    (void*)lsw_SetThreadAffinityMask},
+    {"KERNEL32.dll", "SleepEx",                  (void*)lsw_SleepEx},
+    {"KERNEL32.dll", "SwitchToThread",           (void*)lsw_SwitchToThread},
+    {"KERNEL32.dll", "Beep",                     (void*)lsw_Beep},
+    {"KERNEL32.dll", "CreatePipe",               (void*)lsw_CreatePipe},
+    {"KERNEL32.dll", "CreateNamedPipeW",         (void*)lsw_CreateNamedPipeW},
+    {"KERNEL32.dll", "ConnectNamedPipe",         (void*)lsw_ConnectNamedPipe},
+    {"KERNEL32.dll", "DisconnectNamedPipe",      (void*)lsw_DisconnectNamedPipe},
+    {"KERNEL32.dll", "CallNamedPipeW",           (void*)lsw_CallNamedPipeW},
+    {"KERNEL32.dll", "GetConsoleCP",             (void*)lsw_GetConsoleCP},
+    {"KERNEL32.dll", "GetConsoleOutputCP",       (void*)lsw_GetConsoleOutputCP},
+    {"KERNEL32.dll", "SetConsoleCP",             (void*)lsw_SetConsoleCP},
+    {"KERNEL32.dll", "SetConsoleOutputCP",       (void*)lsw_SetConsoleOutputCP},
+    {"KERNEL32.dll", "GetConsoleCursorInfo",     (void*)lsw_GetConsoleCursorInfo},
+    {"KERNEL32.dll", "SetConsoleCursorInfo",     (void*)lsw_SetConsoleCursorInfo},
+    {"KERNEL32.dll", "SetConsoleCursorPosition", (void*)lsw_SetConsoleCursorPosition},
+    {"KERNEL32.dll", "GetConsoleScreenBufferInfo",(void*)lsw_GetConsoleScreenBufferInfo},
+    {"KERNEL32.dll", "SetConsoleTextAttribute",  (void*)lsw_SetConsoleTextAttribute},
+    {"KERNEL32.dll", "SetConsoleScreenBufferSize",(void*)lsw_SetConsoleScreenBufferSize},
+    {"KERNEL32.dll", "FillConsoleOutputCharacterW",(void*)lsw_FillConsoleOutputCharacterW},
+    {"KERNEL32.dll", "FillConsoleOutputAttribute",(void*)lsw_FillConsoleOutputAttribute},
+    {"KERNEL32.dll", "WriteConsoleOutputCharacterW",(void*)lsw_WriteConsoleOutputCharacterW},
+    {"KERNEL32.dll", "WriteConsoleOutputW",      (void*)lsw_WriteConsoleOutputW},
+    {"KERNEL32.dll", "ReadConsoleInputW",        (void*)lsw_ReadConsoleInputW},
+    {"KERNEL32.dll", "GetNumberOfConsoleInputEvents",(void*)lsw_GetNumberOfConsoleInputEvents},
+    {"KERNEL32.dll", "SetConsoleWindowInfo",     (void*)lsw_SetConsoleWindowInfo},
+    {"KERNEL32.dll", "SetConsoleActiveScreenBuffer",(void*)lsw_SetConsoleActiveScreenBuffer},
+    {"KERNEL32.dll", "CreateConsoleScreenBuffer",(void*)lsw_CreateConsoleScreenBuffer},
+    {"KERNEL32.dll", "GetStartupInfoW",          (void*)lsw_GetStartupInfoW},
+    {"KERNEL32.dll", "GetStartupInfoA",          (void*)lsw_GetStartupInfoA},
+    {"KERNEL32.dll", "CreateProcessW",           (void*)lsw_CreateProcessW},
+    {"KERNEL32.dll", "CreateProcessA",           (void*)lsw_CreateProcessA},
+    {"KERNEL32.dll", "CreateSymbolicLinkW",      (void*)lsw_CreateSymbolicLinkW},
+    {"KERNEL32.dll", "CreateSymbolicLinkA",      (void*)lsw_CreateSymbolicLinkA},
+    {"KERNEL32.dll", "CreateHardLinkW",          (void*)lsw_CreateHardLinkW},
+    {"KERNEL32.dll", "CreateHardLinkA",          (void*)lsw_CreateHardLinkA},
+    {"KERNEL32.dll", "LocalLock",                (void*)lsw_LocalLock},
+    {"KERNEL32.dll", "LocalUnlock",              (void*)lsw_LocalUnlock},
+    {"KERNEL32.dll", "LocalSize",                (void*)lsw_LocalSize},
+    {"KERNEL32.dll", "LocalReAlloc",             (void*)lsw_LocalReAlloc},
+    {"KERNEL32.dll", "LocalFlags",               (void*)lsw_LocalFlags},
+    {"KERNEL32.dll", "GlobalUnlock",             (void*)lsw_GlobalUnlock},
+    {"KERNEL32.dll", "GlobalSize",               (void*)lsw_GlobalSize},
+    {"KERNEL32.dll", "GlobalReAlloc",            (void*)lsw_GlobalReAlloc},
+    {"KERNEL32.dll", "GlobalHandle",             (void*)lsw_GlobalHandle},
+    {"KERNEL32.dll", "GlobalFlags",              (void*)lsw_GlobalFlags},
+    {"KERNEL32.dll", "GlobalAddAtomW",           (void*)lsw_GlobalAddAtomW},
+    {"KERNEL32.dll", "GlobalDeleteAtom",         (void*)lsw_GlobalDeleteAtom},
+    {"KERNEL32.dll", "GlobalFindAtomW",          (void*)lsw_GlobalFindAtomW},
+    {"KERNEL32.dll", "GlobalGetAtomNameW",       (void*)lsw_GlobalGetAtomNameW},
+    {"KERNEL32.dll", "AddAtomW",                 (void*)lsw_AddAtomW},
+    {"KERNEL32.dll", "DeleteAtom",               (void*)lsw_DeleteAtom},
+    {"KERNEL32.dll", "FindAtomW",                (void*)lsw_FindAtomW},
+    {"KERNEL32.dll", "GetAtomNameW",             (void*)lsw_GetAtomNameW},
+    {"KERNEL32.dll", "DeviceIoControl",          (void*)lsw_DeviceIoControl},
+    {"KERNEL32.dll", "GetNativeSystemInfo",      (void*)lsw_GetNativeSystemInfo},
+    {"KERNEL32.dll", "GetSystemTimes",           (void*)lsw_GetSystemTimes},
+    {"KERNEL32.dll", "GetProcessTimes",          (void*)lsw_GetProcessTimes},
+    {"KERNEL32.dll", "GetThreadTimes",           (void*)lsw_GetThreadTimes},
+    {"KERNEL32.dll", "GetTimeZoneInformation",   (void*)lsw_GetTimeZoneInformation},
+    {"KERNEL32.dll", "GetOverlappedResult",      (void*)lsw_GetOverlappedResult},
+    {"KERNEL32.dll", "ReadFileEx",               (void*)lsw_ReadFileEx},
+    {"KERNEL32.dll", "WriteFileEx",              (void*)lsw_WriteFileEx},
+    {"KERNEL32.dll", "CancelIo",                 (void*)lsw_CancelIo},
+    {"KERNEL32.dll", "CancelIoEx",               (void*)lsw_CancelIoEx},
+    {"KERNEL32.dll", "CancelSynchronousIo",      (void*)lsw_CancelSynchronousIo},
+    {"KERNEL32.dll", "VirtualAllocEx",           (void*)lsw_VirtualAllocEx},
+    {"KERNEL32.dll", "VirtualFreeEx",            (void*)lsw_VirtualFreeEx},
+    {"KERNEL32.dll", "VirtualProtectEx",         (void*)lsw_VirtualProtectEx},
+    {"KERNEL32.dll", "GetBinaryTypeW",           (void*)lsw_GetBinaryTypeW},
+    {"KERNEL32.dll", "GetBinaryTypeA",           (void*)lsw_GetBinaryTypeA},
+    {"KERNEL32.dll", "SetErrorMode",             (void*)lsw_SetErrorMode},
+    {"KERNEL32.dll", "GetErrorMode",             (void*)lsw_GetErrorMode},
+    {"KERNEL32.dll", "SetThreadErrorMode",       (void*)lsw_SetThreadErrorMode},
+    {"KERNEL32.dll", "GetThreadErrorMode",       (void*)lsw_GetThreadErrorMode},
+    {"KERNEL32.dll", "GetProcessVersion",        (void*)lsw_GetProcessVersion},
+    {"KERNEL32.dll", "GetCurrentPackageId",      (void*)lsw_GetCurrentPackageId},
+    {"KERNEL32.dll", "GetActiveProcessorCount",  (void*)lsw_GetActiveProcessorCount},
+    {"KERNEL32.dll", "GetActiveProcessorGroupCount",(void*)lsw_GetActiveProcessorGroupCount},
+    {"KERNEL32.dll", "QueryFullProcessImageNameW",(void*)lsw_QueryFullProcessImageNameW},
+    {"KERNEL32.dll", "RaiseException",           (void*)lsw_RaiseException},
+    {"KERNEL32.dll", "SetConsoleCtrlHandler",    (void*)lsw_SetConsoleCtrlHandler},
+    {"KERNEL32.dll", "GenerateConsoleCtrlEvent", (void*)lsw_GenerateConsoleCtrlEvent},
+    {"KERNEL32.dll", "GetConsoleTitle",          (void*)lsw_GetConsoleTitle},
+    // USER32 SystemParametersInfo (also lives under user32.dll)
+    {"user32.dll",   "SystemParametersInfoW",    (void*)lsw_SystemParametersInfoW},
+    {"user32.dll",   "SystemParametersInfoA",    (void*)lsw_SystemParametersInfoA},
 };
 
 #pragma GCC diagnostic pop
@@ -4274,11 +5172,25 @@ void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal) {
 }
 
 
-/* Secondary mapping tables from ntdll_api.c and user32_api.c */
+/* Secondary mapping tables from split Win32 API stub files */
 extern const win32_api_mapping_t win32_api_ntdll_mappings[];
 extern const size_t               win32_api_ntdll_mappings_count;
 extern const win32_api_mapping_t win32_api_user32_mappings[];
 extern const size_t               win32_api_user32_mappings_count;
+extern const win32_api_mapping_t win32_api_shlwapi_mappings[];
+extern const size_t               win32_api_shlwapi_mappings_count;
+extern const win32_api_mapping_t win32_api_shell32_mappings[];
+extern const size_t               win32_api_shell32_mappings_count;
+extern const win32_api_mapping_t win32_api_ole32_mappings[];
+extern const size_t               win32_api_ole32_mappings_count;
+extern const win32_api_mapping_t win32_api_oleaut32_mappings[];
+extern const size_t               win32_api_oleaut32_mappings_count;
+extern const win32_api_mapping_t win32_api_comctl32_mappings[];
+extern const size_t               win32_api_comctl32_mappings_count;
+extern const win32_api_mapping_t win32_api_misc_mappings[];
+extern const size_t               win32_api_misc_mappings_count;
+extern win32_api_mapping_t        win32_api_advapi32_mappings[];
+extern size_t                     win32_api_advapi32_mappings_count;
 
 void* win32_api_resolve(const char* dll_name, const char* function_name) {
     /* Primary table */
@@ -4303,6 +5215,62 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
             strcmp(win32_api_user32_mappings[i].function_name, function_name) == 0) {
             LSW_LOG_DEBUG("Resolved(user32) %s!%s -> %p", dll_name, function_name, win32_api_user32_mappings[i].implementation);
             return win32_api_user32_mappings[i].implementation;
+        }
+    }
+    /* shlwapi secondary table */
+    for (size_t i = 0; i < win32_api_shlwapi_mappings_count; i++) {
+        if (strcasecmp(win32_api_shlwapi_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_shlwapi_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(shlwapi) %s!%s -> %p", dll_name, function_name, win32_api_shlwapi_mappings[i].implementation);
+            return win32_api_shlwapi_mappings[i].implementation;
+        }
+    }
+    /* shell32 secondary table */
+    for (size_t i = 0; i < win32_api_shell32_mappings_count; i++) {
+        if (strcasecmp(win32_api_shell32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_shell32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(shell32) %s!%s -> %p", dll_name, function_name, win32_api_shell32_mappings[i].implementation);
+            return win32_api_shell32_mappings[i].implementation;
+        }
+    }
+    /* ole32 secondary table */
+    for (size_t i = 0; i < win32_api_ole32_mappings_count; i++) {
+        if (strcasecmp(win32_api_ole32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_ole32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(ole32) %s!%s -> %p", dll_name, function_name, win32_api_ole32_mappings[i].implementation);
+            return win32_api_ole32_mappings[i].implementation;
+        }
+    }
+    /* oleaut32 secondary table */
+    for (size_t i = 0; i < win32_api_oleaut32_mappings_count; i++) {
+        if (strcasecmp(win32_api_oleaut32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_oleaut32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(oleaut32) %s!%s -> %p", dll_name, function_name, win32_api_oleaut32_mappings[i].implementation);
+            return win32_api_oleaut32_mappings[i].implementation;
+        }
+    }
+    /* comctl32 secondary table */
+    for (size_t i = 0; i < win32_api_comctl32_mappings_count; i++) {
+        if (strcasecmp(win32_api_comctl32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_comctl32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(comctl32) %s!%s -> %p", dll_name, function_name, win32_api_comctl32_mappings[i].implementation);
+            return win32_api_comctl32_mappings[i].implementation;
+        }
+    }
+    /* misc DLL secondary table */
+    for (size_t i = 0; i < win32_api_misc_mappings_count; i++) {
+        if (strcasecmp(win32_api_misc_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_misc_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(misc) %s!%s -> %p", dll_name, function_name, win32_api_misc_mappings[i].implementation);
+            return win32_api_misc_mappings[i].implementation;
+        }
+    }
+    /* advapi32 secondary table */
+    for (size_t i = 0; i < win32_api_advapi32_mappings_count; i++) {
+        if (strcasecmp(win32_api_advapi32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_advapi32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(advapi32) %s!%s -> %p", dll_name, function_name, win32_api_advapi32_mappings[i].implementation);
+            return win32_api_advapi32_mappings[i].implementation;
         }
     }
 
