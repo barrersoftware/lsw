@@ -36,10 +36,16 @@ bool pe_apply_relocations(pe_image_t* image);
 // Process TLS directory callbacks (must run before entry point)
 bool pe_process_tls_callbacks(pe_image_t* image);
 
+// Apply correct section protections (RWX) — call after imports are resolved
+bool pe_apply_section_permissions(pe_image_t* image);
+
 // Execute PE image
 int pe_execute(pe_image_t* image, int argc, char** argv);
 
 // Unload PE image
 void pe_unload_image(pe_image_t* image);
+
+// Free all real DLLs loaded by the DLL chain loader
+void pe_dll_chain_cleanup(void);
 
 #endif // LSW_PE_LOADER_H

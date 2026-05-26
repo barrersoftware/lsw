@@ -77,6 +77,15 @@ int lsw_process_terminate(__u32 win32_pid, __u32 exit_code);
  */
 int lsw_thread_terminate(__u32 win32_tid, __u32 exit_code);
 
+/**
+ * lsw_process_is_pe_pid - Check if a Linux PID is a registered PE process
+ *
+ * @linux_pid: The Linux task PID to check
+ *
+ * Returns: true if the PID is currently running a PE image under LSW.
+ */
+bool lsw_process_is_pe_pid(pid_t linux_pid);
+
 /* Initialize/cleanup process system */
 int lsw_process_init(void);
 void lsw_process_exit(void);

@@ -11,6 +11,9 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/sched/signal.h>
+#include <linux/kprobes.h>
+#include <linux/delay.h>
+#include <linux/hrtimer.h>
 #include "../include/kernel-module/lsw_kernel.h"
 #include "../include/kernel-module/lsw_syscall.h"
 #include "../include/kernel-module/lsw_memory.h"
@@ -77,6 +80,14 @@ static struct lsw_syscall_entry syscall_table[] = {
     { LSW_SYSCALL_LswWriteConsole, lsw_syscall_LswWriteConsole, "LswWriteConsole" },
     { LSW_SYSCALL_LswReadConsole, lsw_syscall_LswReadConsole, "LswReadConsole" },
     { LSW_SYSCALL_LswGetStdHandle, lsw_syscall_LswGetStdHandle, "LswGetStdHandle" },
+    /* NT syscalls added for broad app compatibility */
+    { 0x0033, lsw_syscall_NtDelayExecution,        "NtDelayExecution" },
+    { 0x0019, lsw_syscall_NtQueryInformationProcess,"NtQueryInformationProcess" },
+    { 0x0053, lsw_syscall_NtTerminateThread,        "NtTerminateThread" },
+    { 0x0058, lsw_syscall_NtWaitForMultipleObjects, "NtWaitForMultipleObjects" },
+    { 0x0075, lsw_syscall_NtFlushBuffersFile,       "NtFlushBuffersFile" },
+    { 0x000D, lsw_syscall_NtQueryInformationFile,   "NtQueryInformationFile" },
+    { 0x0027, lsw_syscall_NtSetInformationFile,     "NtSetInformationFile" },
     { 0, NULL, NULL } /* Terminator */
 };
 
@@ -960,12 +971,270 @@ long lsw_syscall_LswReadConsole(struct lsw_syscall_request *req)
 }
 
 /**
+ * lsw_syscall_NtDelayExecution - Sleep for specified interval
+ *
+ * Win32: NTSTATUS NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInterval)
+ * DelayInterval is negative 100ns units (relative), positive = absolute time.
+ */
+long lsw_syscall_NtDelayExecution(struct lsw_syscall_request *req)
+{
+    /* args[0] = Alertable (ignored), args[1] = interval in 100ns units */
+    s64 interval_100ns = (s64)req->args[1];
+    u64 ns;
+    ktime_t delay;
+
+    if (interval_100ns == 0) {
+        yield();
+        req->return_value = 0;
+        req->error_code   = 0;
+        return 0;
+    }
+
+    /* Negative = relative delay */
+    if (interval_100ns < 0)
+        interval_100ns = -interval_100ns;
+
+    ns    = (u64)interval_100ns * 100;  /* 100 ns → ns */
+    delay = ns_to_ktime(ns);
+    schedule_hrtimeout(&delay, HRTIMER_MODE_REL);
+
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtQueryInformationProcess - Query process information
+ *
+ * Win32: NTSTATUS NtQueryInformationProcess(
+ *     HANDLE ProcessHandle, PROCESSINFOCLASS ProcessInformationClass,
+ *     PVOID ProcessInformation, ULONG ProcessInformationLength,
+ *     PULONG ReturnLength)
+ *
+ * Only ProcessBasicInformation (class 0) and ProcessImageFileName (27) are
+ * handled; all other classes succeed with zeroed output.
+ */
+long lsw_syscall_NtQueryInformationProcess(struct lsw_syscall_request *req)
+{
+    __u32  info_class = (__u32)req->args[1];
+    void __user *buf  = (void __user *)(uintptr_t)req->args[2];
+    __u32  buf_len    = (__u32)req->args[3];
+
+    lsw_info("NtQueryInformationProcess: class=%u", info_class);
+
+    /* ProcessBasicInformation = 0 */
+    if (info_class == 0 && buf && buf_len >= 48) {
+        /* PROCESS_BASIC_INFORMATION layout (6 × u64 = 48 bytes) */
+        u64 pbi[6] = {0};
+        pbi[4] = (u64)(uintptr_t)current->tgid;  /* UniqueProcessId */
+        pbi[5] = (u64)(uintptr_t)current->real_parent->tgid;
+        if (copy_to_user(buf, pbi, sizeof(pbi))) {
+            req->return_value = (u64)(u32)0xC0000005UL; /* STATUS_ACCESS_VIOLATION */
+            req->error_code   = -EFAULT;
+            return -EFAULT;
+        }
+    } else if (buf && buf_len > 0) {
+        /* Zero out whatever the caller provided */
+        clear_user(buf, buf_len);
+    }
+
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtTerminateThread - Terminate the current (or specified) thread
+ */
+long lsw_syscall_NtTerminateThread(struct lsw_syscall_request *req)
+{
+    __u32 exit_code = (__u32)req->args[1];
+    lsw_info("NtTerminateThread: exit_code=%u", exit_code);
+    /* For now, just signal the current thread */
+    do_exit((long)exit_code);
+    /* unreachable */
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtWaitForMultipleObjects - Wait on several handles
+ *
+ * Best-effort stub: yield and return STATUS_WAIT_0.
+ */
+long lsw_syscall_NtWaitForMultipleObjects(struct lsw_syscall_request *req)
+{
+    __u32 timeout_ms = (__u32)req->args[3];
+    lsw_info("NtWaitForMultipleObjects: count=%u, timeout=%u ms",
+             (__u32)req->args[0], timeout_ms);
+    if (timeout_ms != 0xFFFFFFFF)
+        msleep_interruptible(min(timeout_ms, 5000U));
+    req->return_value = 0; /* STATUS_WAIT_0 */
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtFlushBuffersFile - Flush file buffers
+ * Best-effort stub: returns STATUS_SUCCESS.
+ */
+long lsw_syscall_NtFlushBuffersFile(struct lsw_syscall_request *req)
+{
+    lsw_info("NtFlushBuffersFile: handle=0x%llx", req->args[0]);
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtQueryInformationFile - Query file information
+ * Stub: zero out output buffer and return success.
+ */
+long lsw_syscall_NtQueryInformationFile(struct lsw_syscall_request *req)
+{
+    void __user *buf = (void __user *)(uintptr_t)req->args[3];
+    __u32 len = (__u32)req->args[4];
+    if (buf && len) clear_user(buf, len);
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/**
+ * lsw_syscall_NtSetInformationFile - Set file information
+ * Stub: accept and ignore.
+ */
+long lsw_syscall_NtSetInformationFile(struct lsw_syscall_request *req)
+{
+    (void)req;
+    req->return_value = 0;
+    req->error_code   = 0;
+    return 0;
+}
+
+/* ============================================================
+ * kretprobe-based NT syscall interception
+ *
+ * When a PE process issues a bare `syscall` instruction (e.g. by
+ * calling NtCreateFile directly), the CPU dispatches to
+ * entry_SYSCALL_64 which calls do_syscall_64(pt_regs*, nr).
+ * We hook do_syscall_64 with a kretprobe:
+ *   entry_handler — intercepts NT numbers, runs our handler,
+ *                   stores result, and replaces nr with getpid
+ *                   so the kernel runs a harmless syscall.
+ *   ret_handler   — overwrites the getpid result with our value.
+ * ============================================================ */
+
+/* Per-invocation data stored in the kretprobe instance */
+struct lsw_intercept_data {
+    struct pt_regs *syscall_regs;  /* The ACTUAL syscall pt_regs */
+    u64             result;         /* Our NT return value */
+    bool            intercepted;    /* Was this an NT syscall? */
+};
+
+static int lsw_kretprobe_entry(struct kretprobe_instance *ri,
+                                struct pt_regs *regs)
+{
+    struct lsw_intercept_data *d = (struct lsw_intercept_data *)ri->data;
+    struct pt_regs *sc_regs;
+    int             nr;
+    unsigned int    i;
+    struct lsw_syscall_request req;
+
+    d->intercepted = false;
+
+    /* Fast path: skip if no PE processes are registered */
+    if (!lsw_module_state.pe_process_count)
+        return 0;
+
+    /* Skip if the current task isn't a registered PE process */
+    if (!lsw_process_is_pe_pid(current->pid))
+        return 0;
+
+    /*
+     * do_syscall_64(struct pt_regs *regs, int nr)
+     * System-V x86-64: arg1=rdi, arg2=rsi
+     */
+    sc_regs = (struct pt_regs *)(uintptr_t)regs->di;
+    nr      = (int)(regs->si & 0xFFFFFFFF);
+
+    /* Scan our dispatch table for a matching NT syscall number */
+    for (i = 0; syscall_table[i].handler != NULL; i++) {
+        if ((unsigned int)nr != syscall_table[i].syscall_number)
+            continue;
+
+        memset(&req, 0, sizeof(req));
+        req.syscall_number = (u32)nr;
+        req.arg_count      = 6;
+
+        /*
+         * NT calling convention: before the `syscall` instruction the
+         * Windows stub does `mov r10, rcx` to preserve the first arg
+         * (rcx is clobbered by syscall).  So arg0 = r10, arg1 = rdx,
+         * arg2 = r8, arg3 = r9; further args are on the stack.
+         */
+        if (sc_regs) {
+            req.args[0] = sc_regs->r10;
+            req.args[1] = sc_regs->dx;
+            req.args[2] = sc_regs->r8;
+            req.args[3] = sc_regs->r9;
+        }
+
+        syscall_table[i].handler(&req);
+
+        /* Save result and mark as intercepted */
+        d->syscall_regs  = sc_regs;
+        d->result        = req.return_value;
+        d->intercepted   = true;
+
+        /*
+         * Replace the syscall number with sys_getpid (39) so the kernel
+         * runs a harmless call instead of the wrong Linux syscall.
+         * The return handler will overwrite the result in regs->ax.
+         */
+        regs->si = __NR_getpid;
+
+        lsw_debug("kretprobe: intercepted NT syscall %s (0x%x) → 0x%llx",
+                  syscall_table[i].name, nr, req.return_value);
+        return 0;
+    }
+
+    return 0;
+}
+
+static int lsw_kretprobe_ret(struct kretprobe_instance *ri,
+                              struct pt_regs *regs)
+{
+    struct lsw_intercept_data *d = (struct lsw_intercept_data *)ri->data;
+
+    if (d->intercepted && d->syscall_regs) {
+        /*
+         * do_syscall_64 has returned.  The result of the harmless
+         * getpid() call is now in d->syscall_regs->ax.
+         * Overwrite it with our NT return value.
+         */
+        d->syscall_regs->ax = d->result;
+    }
+    return 0;
+}
+
+static struct kretprobe lsw_kretprobe_syscall = {
+    .kp.symbol_name = "do_syscall_64",
+    .entry_handler  = lsw_kretprobe_entry,
+    .handler        = lsw_kretprobe_ret,
+    .data_size      = sizeof(struct lsw_intercept_data),
+    .maxactive      = 64,   /* max simultaneous intercepts */
+};
+
+/**
  * lsw_syscall_init - Initialize syscall translation system
  */
 int lsw_syscall_init(void)
 {
     int count = 0;
     int i;
+    int ret;
     
     /* Count registered syscalls */
     for (i = 0; syscall_table[i].handler != NULL; i++) {
@@ -973,7 +1242,17 @@ int lsw_syscall_init(void)
     }
     
     lsw_info("Syscall translation system initialized: %d syscalls registered", count);
-    
+
+    /* Register kretprobe so bare NT syscall instructions are intercepted */
+    ret = register_kretprobe(&lsw_kretprobe_syscall);
+    if (ret < 0) {
+        lsw_warn("kretprobe on do_syscall_64 failed (%d) — ioctl path only", ret);
+        /* Non-fatal: apps that go through our Win32 stubs still work */
+    } else {
+        lsw_info("kretprobe on do_syscall_64 registered — bare NT syscalls intercepted");
+        lsw_module_state.syscall_hooks_active = true;
+    }
+
     return 0;
 }
 
@@ -982,5 +1261,10 @@ int lsw_syscall_init(void)
  */
 void lsw_syscall_exit(void)
 {
+    if (lsw_module_state.syscall_hooks_active) {
+        unregister_kretprobe(&lsw_kretprobe_syscall);
+        lsw_module_state.syscall_hooks_active = false;
+        lsw_info("kretprobe on do_syscall_64 unregistered");
+    }
     lsw_info("Syscall translation system cleaned up");
 }

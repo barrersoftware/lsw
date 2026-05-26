@@ -79,6 +79,15 @@ long lsw_syscall_NtCreateProcess(struct lsw_syscall_request *req);
 long lsw_syscall_NtCreateThreadEx(struct lsw_syscall_request *req);
 long lsw_syscall_NtTerminateProcess(struct lsw_syscall_request *req);
 
+/* Additional NT syscalls for broad app compatibility */
+long lsw_syscall_NtDelayExecution(struct lsw_syscall_request *req);
+long lsw_syscall_NtQueryInformationProcess(struct lsw_syscall_request *req);
+long lsw_syscall_NtTerminateThread(struct lsw_syscall_request *req);
+long lsw_syscall_NtWaitForMultipleObjects(struct lsw_syscall_request *req);
+long lsw_syscall_NtFlushBuffersFile(struct lsw_syscall_request *req);
+long lsw_syscall_NtQueryInformationFile(struct lsw_syscall_request *req);
+long lsw_syscall_NtSetInformationFile(struct lsw_syscall_request *req);
+
 /* Initialize syscall translation system */
 int lsw_syscall_init(void);
 void lsw_syscall_exit(void);

@@ -17,23 +17,357 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
 #include <execinfo.h>
+#include <ucontext.h>
+#include <setjmp.h>
+#include <ctype.h>
 
-static void segfault_handler(int sig) {
-    LSW_LOG_ERROR("SEGFAULT! Signal: %d", sig);
-    LSW_LOG_ERROR("PE code crashed - likely missing CRT or TEB/PEB structures");
-    
-    // Print backtrace
-    void *buffer[10];
-    int nptrs = backtrace(buffer, 10);
-    LSW_LOG_ERROR("Backtrace (%d frames):", nptrs);
-    backtrace_symbols_fd(buffer, nptrs, STDERR_FILENO);
-    
-    exit(139);
+// ============================================================================
+// DLL chain loader — real DLL search & export resolution
+// ============================================================================
+
+/*
+ * Search paths for real Windows DLL files, in priority order.
+ * Users can place DLL files (from a Windows installation, Wine, or the
+ * official Windows Compatibility Toolkit) in any of these locations.
+ * Set LSW_SYSTEM32 env var to override the default search paths.
+ */
+#define LSW_MAX_DLL_SEARCH_PATHS 8
+#define LSW_MAX_LOADED_DLLS      64
+
+typedef struct {
+    char   dll_name[64];    /* lower-cased DLL name, e.g. "msvcrt.dll" */
+    void*  image_base;
+    size_t image_size;
+    pe_file_t pe;
+} lsw_loaded_dll_t;
+
+static lsw_loaded_dll_t g_loaded_dlls[LSW_MAX_LOADED_DLLS];
+static int g_loaded_dll_count = 0;
+
+/* Case-insensitive DLL name match */
+static int dll_name_eq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* Build search paths from environment or defaults */
+static int build_dll_search_paths(char paths[][512], int max_paths)
+{
+    int n = 0;
+    const char* env_path = getenv("LSW_SYSTEM32");
+
+    /* User-specified path takes priority */
+    if (env_path && env_path[0] && n < max_paths) {
+        snprintf(paths[n++], 512, "%s", env_path);
+    }
+
+    const char* home = getenv("HOME");
+    if (!home) home = "/root";
+
+    /* ~/.lsw/system32/ — LSW-specific Windows files */
+    if (n < max_paths) snprintf(paths[n++], 512, "%s/.lsw/system32", home);
+    /* ~/.wine/drive_c/windows/system32/ — Wine installation */
+    if (n < max_paths) snprintf(paths[n++], 512, "%s/.wine/drive_c/windows/system32", home);
+    /* /opt/lsw/system32/ — system-wide installation */
+    if (n < max_paths) snprintf(paths[n++], 512, "/opt/lsw/system32");
+    /* /usr/share/lsw/system32/ — package manager installation */
+    if (n < max_paths) snprintf(paths[n++], 512, "/usr/share/lsw/system32");
+
+    return n;
+}
+
+/* Look up an already-loaded DLL by name */
+static lsw_loaded_dll_t* find_loaded_dll(const char* dll_name)
+{
+    for (int i = 0; i < g_loaded_dll_count; i++) {
+        if (dll_name_eq(g_loaded_dlls[i].dll_name, dll_name))
+            return &g_loaded_dlls[i];
+    }
+    return NULL;
+}
+
+/* Resolve a named export from a loaded DLL image */
+static void* resolve_export_from_dll(lsw_loaded_dll_t* dll, const char* func_name)
+{
+    pe_data_directory_t* exp_dir = pe_get_data_directory(&dll->pe, PE_DIR_EXPORT);
+    if (!exp_dir || !exp_dir->VirtualAddress) return NULL;
+
+    pe_export_directory_t* exp = (pe_export_directory_t*)(
+        (uint8_t*)dll->image_base + exp_dir->VirtualAddress);
+
+    uint32_t* name_ptrs = (uint32_t*)((uint8_t*)dll->image_base + exp->AddressOfNames);
+    uint16_t* ordinals  = (uint16_t*)((uint8_t*)dll->image_base + exp->AddressOfNameOrdinals);
+    uint32_t* functions = (uint32_t*)((uint8_t*)dll->image_base + exp->AddressOfFunctions);
+
+    for (uint32_t i = 0; i < exp->NumberOfNames; i++) {
+        const char* name = (const char*)((uint8_t*)dll->image_base + name_ptrs[i]);
+        if (strcmp(name, func_name) == 0) {
+            uint32_t rva = functions[ordinals[i]];
+            return (void*)((uint8_t*)dll->image_base + rva);
+        }
+    }
+    return NULL;
+}
+
+/* Load a real DLL file from disk, map it, and register it in g_loaded_dlls */
+static lsw_loaded_dll_t* load_real_dll(const char* dll_name)
+{
+    char search_paths[LSW_MAX_DLL_SEARCH_PATHS][512];
+    int  n_paths;
+    char filepath[640];
+
+    /* Already at capacity? */
+    if (g_loaded_dll_count >= LSW_MAX_LOADED_DLLS) {
+        LSW_LOG_WARN("DLL chain: table full (%d), cannot load %s",
+                     LSW_MAX_LOADED_DLLS, dll_name);
+        return NULL;
+    }
+
+    n_paths = build_dll_search_paths(search_paths, LSW_MAX_DLL_SEARCH_PATHS);
+
+    for (int p = 0; p < n_paths; p++) {
+        snprintf(filepath, sizeof(filepath), "%s/%s", search_paths[p], dll_name);
+        /* Try exact case first, then lower-cased */
+        struct stat st;
+        if (stat(filepath, &st) != 0) {
+            /* Try lower-cased filename */
+            char lower_name[64];
+            size_t j;
+            for (j = 0; dll_name[j] && j < sizeof(lower_name) - 1; j++)
+                lower_name[j] = (char)tolower((unsigned char)dll_name[j]);
+            lower_name[j] = '\0';
+            snprintf(filepath, sizeof(filepath), "%s/%s", search_paths[p], lower_name);
+            if (stat(filepath, &st) != 0)
+                continue;
+        }
+
+        /* Found the file — load it */
+        int fd = open(filepath, O_RDONLY);
+        if (fd < 0) continue;
+
+        off_t file_size = lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
+        if (file_size <= 0) { close(fd); continue; }
+
+        void* file_data = mmap(NULL, (size_t)file_size, PROT_READ,
+                               MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (file_data == MAP_FAILED) continue;
+
+        /* Parse the DLL PE headers */
+        lsw_loaded_dll_t* slot = &g_loaded_dlls[g_loaded_dll_count];
+        memset(slot, 0, sizeof(*slot));
+
+        if (!pe_parse_file(&slot->pe, file_data, (size_t)file_size)) {
+            LSW_LOG_WARN("DLL chain: pe_parse_file failed for %s", filepath);
+            munmap(file_data, (size_t)file_size);
+            continue;
+        }
+
+        /* Allocate memory for the DLL image */
+        size_t image_size = slot->pe.is_64bit
+            ? slot->pe.nt_headers64->OptionalHeader.SizeOfImage
+            : slot->pe.nt_headers32->OptionalHeader.SizeOfImage;
+
+        void* image_base = mmap(NULL, image_size,
+                                PROT_READ | PROT_WRITE | PROT_EXEC,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (image_base == MAP_FAILED) {
+            munmap(file_data, (size_t)file_size);
+            continue;
+        }
+
+        /* Copy sections */
+        for (uint16_t s = 0; s < slot->pe.num_sections; s++) {
+            pe_section_header_t* sec = &slot->pe.sections[s];
+            if (sec->SizeOfRawData == 0) continue;
+            void* dst = (uint8_t*)image_base + sec->VirtualAddress;
+            void* src = (uint8_t*)file_data  + sec->PointerToRawData;
+            size_t copy_sz = sec->SizeOfRawData < sec->VirtualSize
+                           ? sec->SizeOfRawData : sec->VirtualSize;
+            memcpy(dst, src, copy_sz);
+        }
+
+        munmap(file_data, (size_t)file_size);
+
+        slot->image_base = image_base;
+        slot->image_size = image_size;
+
+        /* Store lower-cased name */
+        size_t k;
+        for (k = 0; dll_name[k] && k < sizeof(slot->dll_name) - 1; k++)
+            slot->dll_name[k] = (char)tolower((unsigned char)dll_name[k]);
+        slot->dll_name[k] = '\0';
+
+        g_loaded_dll_count++;
+        LSW_LOG_INFO("DLL chain: loaded real %s from %s (base=%p, size=0x%zx)",
+                     dll_name, filepath, image_base, image_size);
+        return slot;
+    }
+
+    LSW_LOG_DEBUG("DLL chain: %s not found in any search path — using stubs", dll_name);
+    return NULL;
+}
+
+/*
+ * Resolve a Win32 import first from our stub table, then from any real
+ * DLL files found on disk.  Returns NULL only if completely unresolved
+ * (caller will install a generic stub so execution can continue).
+ */
+static void* resolve_import_with_dll_chain(const char* dll_name,
+                                            const char* func_name)
+{
+    /* 1. Try our built-in Win32 API stubs (fast path, covers most apps) */
+    void* addr = win32_api_resolve(dll_name, func_name);
+    if (addr) return addr;
+
+    /* 2. Check already-loaded real DLLs */
+    lsw_loaded_dll_t* dll = find_loaded_dll(dll_name);
+    if (!dll) {
+        /* 3. Try loading the DLL from disk */
+        dll = load_real_dll(dll_name);
+    }
+
+    if (dll) {
+        addr = resolve_export_from_dll(dll, func_name);
+        if (addr) {
+            LSW_LOG_DEBUG("DLL chain: resolved %s!%s from real DLL → %p",
+                          dll_name, func_name, addr);
+            return addr;
+        }
+    }
+
+    return NULL;
+}
+
+void pe_dll_chain_cleanup(void)
+{
+    for (int i = 0; i < g_loaded_dll_count; i++) {
+        if (g_loaded_dlls[i].image_base)
+            munmap(g_loaded_dlls[i].image_base, g_loaded_dlls[i].image_size);
+    }
+    g_loaded_dll_count = 0;
+}
+
+
+// SEH / Signal-based exception handling
+// ============================================================================
+
+// Windows exception codes mapped from Linux signals
+#define WIN_EXCEPTION_ACCESS_VIOLATION   0xC0000005
+#define WIN_EXCEPTION_ILLEGAL_INSTRUCTION 0xC000001D
+#define WIN_EXCEPTION_INT_DIVIDE_BY_ZERO  0xC0000094
+#define WIN_EXCEPTION_STACK_OVERFLOW      0xC00000FD
+#define WIN_EXCEPTION_GUARD_PAGE          0x80000001
+
+// Simple vectored exception handler type (mirrors Windows VEH signature)
+typedef int (*lsw_veh_handler_t)(uint32_t exception_code, void* context);
+
+#define LSW_MAX_VEH_HANDLERS 16
+static lsw_veh_handler_t g_veh_handlers[LSW_MAX_VEH_HANDLERS];
+static int g_veh_count = 0;
+
+void lsw_add_veh_handler(lsw_veh_handler_t h) {
+    if (g_veh_count < LSW_MAX_VEH_HANDLERS)
+        g_veh_handlers[g_veh_count++] = h;
+}
+
+// Dispatch an exception through VEH handlers and the SEH chain in the TEB.
+// Returns 1 if handled (execution continues), 0 if unhandled (terminate).
+static int lsw_dispatch_exception(uint32_t code, siginfo_t* si, ucontext_t* uc) {
+    LSW_LOG_ERROR("Win32 Exception: code=0x%08x addr=%p", code, si->si_addr);
+
+    // Walk VEH handlers first
+    for (int i = 0; i < g_veh_count; i++) {
+        if (g_veh_handlers[i](code, uc) != 0) {
+            LSW_LOG_INFO("Exception handled by VEH handler %d", i);
+            return 1;
+        }
+    }
+
+    // Walk SEH chain from TEB.ExceptionList (gs:0x00)
+    win32_teb_t* teb = win32_teb_get();
+    if (teb) {
+        // SEH frame: { EXCEPTION_REGISTRATION_RECORD* Next; void* Handler; }
+        typedef struct _seh_frame {
+            struct _seh_frame* next;
+            void* handler;
+        } seh_frame_t;
+
+        seh_frame_t* frame = (seh_frame_t*)teb->ExceptionList;
+        int depth = 0;
+        while (frame && (uintptr_t)frame != 0xFFFFFFFFFFFFFFFFULL && depth < 64) {
+            typedef int (*seh_handler_t)(uint32_t, seh_frame_t*, void*, void*);
+            seh_handler_t h = (seh_handler_t)frame->handler;
+            if (h) {
+                LSW_LOG_INFO("  SEH frame[%d] handler=%p", depth, (void*)h);
+                // EXCEPTION_EXECUTE_HANDLER = 1, EXCEPTION_CONTINUE_EXECUTION = -1
+                // We pass minimal args; real SEH needs full EXCEPTION_RECORD + CONTEXT
+                // but this at least gives handlers a chance to run
+                int r = h(code, frame, uc, NULL);
+                if (r == -1) { // EXCEPTION_CONTINUE_EXECUTION
+                    LSW_LOG_INFO("  SEH: continue execution");
+                    return 1;
+                }
+                if (r == 1) { // EXCEPTION_EXECUTE_HANDLER
+                    LSW_LOG_INFO("  SEH: execute handler (unwind)");
+                    // In a full implementation, we'd unwind the stack here.
+                    // For now, log and terminate gracefully.
+                    break;
+                }
+            }
+            frame = frame->next;
+            depth++;
+        }
+    }
+
+    // Print backtrace before giving up
+    void* bt[16];
+    int n = backtrace(bt, 16);
+    LSW_LOG_ERROR("Unhandled exception — backtrace:");
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    return 0;
+}
+
+static void lsw_signal_handler(int sig, siginfo_t* si, void* ctx) {
+    ucontext_t* uc = (ucontext_t*)ctx;
+    uint32_t code;
+    switch (sig) {
+        case SIGSEGV: code = WIN_EXCEPTION_ACCESS_VIOLATION;    break;
+        case SIGILL:  code = WIN_EXCEPTION_ILLEGAL_INSTRUCTION; break;
+        case SIGFPE:  code = WIN_EXCEPTION_INT_DIVIDE_BY_ZERO;  break;
+        case SIGBUS:  code = WIN_EXCEPTION_ACCESS_VIOLATION;    break;
+        default:      code = 0xC0000000 | (uint32_t)sig;       break;
+    }
+
+    if (!lsw_dispatch_exception(code, si, uc)) {
+        LSW_LOG_ERROR("Fatal: unhandled signal %d at %p — terminating", sig, si->si_addr);
+        _exit(139);
+    }
+}
+
+static void lsw_install_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = lsw_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    LSW_LOG_INFO("SEH signal handlers installed (SIGSEGV/SIGILL/SIGFPE/SIGBUS)");
 }
 
 bool pe_load_image(pe_image_t* image, const char* filepath) {
@@ -146,6 +480,9 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
         return false;
     }
 
+    // Apply correct R/W/X protections now that IAT is written
+    pe_apply_section_permissions(image);
+
     // Run TLS callbacks (MSVC CRT static constructors, etc.)
     if (!pe_process_tls_callbacks(image)) {
         LSW_LOG_ERROR("Failed to process TLS callbacks");
@@ -220,6 +557,45 @@ bool pe_map_sections(pe_image_t* image) {
     return true;
 }
 
+bool pe_apply_section_permissions(pe_image_t* image) {
+    if (!image || !image->pe.sections) return true;
+
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    LSW_LOG_INFO("Applying section permissions (%u sections)...", image->pe.num_sections);
+
+    for (uint16_t i = 0; i < image->pe.num_sections; i++) {
+        pe_section_header_t* sec = &image->pe.sections[i];
+        if (sec->VirtualSize == 0 && sec->SizeOfRawData == 0) continue;
+
+        uint32_t ch = sec->Characteristics;
+        int prot = 0;
+        if (ch & PE_SCN_MEM_READ)    prot |= PROT_READ;
+        if (ch & PE_SCN_MEM_WRITE)   prot |= PROT_WRITE;
+        if (ch & PE_SCN_MEM_EXECUTE) prot |= PROT_READ | PROT_EXEC;
+        if (prot == 0) prot = PROT_READ; // at least readable
+
+        void* va   = (uint8_t*)image->image_base + sec->VirtualAddress;
+        size_t sz  = sec->VirtualSize ? sec->VirtualSize : sec->SizeOfRawData;
+
+        // Align to page boundaries
+        uintptr_t base_aligned = (uintptr_t)va & ~(page_size - 1);
+        size_t    size_aligned = ((sz + page_size - 1) / page_size) * page_size;
+
+        char name[9] = {0};
+        memcpy(name, sec->Name, 8);
+        if (mprotect((void*)base_aligned, size_aligned, prot) != 0) {
+            LSW_LOG_WARN("mprotect failed for section %s: %s", name, strerror(errno));
+        } else {
+            LSW_LOG_DEBUG("  %s: %c%c%c", name,
+                (prot & PROT_READ)  ? 'R' : '-',
+                (prot & PROT_WRITE) ? 'W' : '-',
+                (prot & PROT_EXEC)  ? 'X' : '-');
+        }
+    }
+    LSW_LOG_INFO("Section permissions applied");
+    return true;
+}
+
 bool pe_resolve_imports(pe_image_t* image) {
     pe_data_directory_t* import_dir = pe_get_data_directory(&image->pe, PE_DIR_IMPORT);
     if (!import_dir || !import_dir->VirtualAddress) {
@@ -271,16 +647,15 @@ bool pe_resolve_imports(pe_image_t* image) {
                 continue;
             }
             
-            // Resolve the function
-            void* func_addr = win32_api_resolve(dll_name, func_name);
+            // Resolve the function — stubs first, then real DLL chain
+            void* func_addr = resolve_import_with_dll_chain(dll_name, func_name);
             if (func_addr) {
                 iat[i] = (uint64_t)func_addr;
                 func_count++;
                 LSW_LOG_DEBUG("    ✓ %s -> %p", func_name, func_addr);
             } else {
-                LSW_LOG_WARN("    ✗ %s - unresolved", func_name);
-                // Leave as NULL - will crash if called
-                iat[i] = 0;
+                LSW_LOG_WARN("    ✗ %s!%s - unresolved, using stub", dll_name, func_name);
+                iat[i] = (uint64_t)win32_api_get_generic_stub();
             }
         }
         
@@ -495,10 +870,9 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     typedef int (*pe_entry_func_t)(void);
     pe_entry_func_t entry_func = (pe_entry_func_t)image->entry_point;
     
-    // Install segfault handler to debug crashes
-    signal(SIGSEGV, segfault_handler);
+    // Install SEH-emulating signal handlers
+    lsw_install_signal_handlers();
     
-    LSW_LOG_INFO("WARNING: About to execute PE code - this may crash!");
     LSW_LOG_INFO("Entry point type: %s", 
                  image->pe.nt_headers64 && image->pe.nt_headers64->OptionalHeader.Subsystem == 3 ? 
                  "Console" : "GUI");
@@ -528,15 +902,6 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     LSW_LOG_INFO("Calling PE entry point at 0x%lx...", (unsigned long)entry_func);
     LSW_LOG_INFO("Image base: 0x%lx, Size: 0x%x", 
                  (unsigned long)image->image_base, image->image_size);
-    
-    // HACK: Make our .text section writable temporarily
-    // The PE's CRT tries to write to imported function addresses
-    // This is a workaround - proper solution is IAT trampolines
-    extern void lsw__initenv(void);
-    void* page_addr = (void*)((uintptr_t)lsw__initenv & ~0xFFF);
-    if (mprotect(page_addr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-        LSW_LOG_INFO("Made our .text section writable at %p (HACK)", page_addr);
-    }
     
     // Give Win32 APIs access to kernel fd for syscalls
     win32_api_set_kernel_fd(kernel_fd);

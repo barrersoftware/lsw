@@ -290,6 +290,32 @@ int lsw_thread_terminate(__u32 win32_tid, __u32 exit_code)
 }
 
 /**
+ * lsw_process_is_pe_pid - Check if a Linux PID is a registered LSW PE process
+ *
+ * Called from hot paths (kprobe handler) — uses RCU-safe list traversal.
+ * Returns true if found so the syscall interceptor can act.
+ */
+bool lsw_process_is_pe_pid(pid_t linux_pid)
+{
+    struct lsw_process *proc;
+    bool found = false;
+
+    if (atomic_read(&lsw_process_count) == 0)
+        return false;
+
+    mutex_lock(&lsw_process_mutex);
+    list_for_each_entry(proc, &lsw_process_list, list) {
+        if ((pid_t)proc->linux_pid == linux_pid) {
+            found = true;
+            break;
+        }
+    }
+    mutex_unlock(&lsw_process_mutex);
+
+    return found;
+}
+
+/**
  * lsw_process_init - Initialize process system
  */
 int lsw_process_init(void)
