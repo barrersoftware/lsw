@@ -25,8 +25,14 @@ void win32_api_init(void);
 // Set kernel fd for syscalls
 void win32_api_set_kernel_fd(int fd);
 
-// Resolve a function by DLL and name
+// Resolve a function by DLL and name (returns NULL if not found)
 void* win32_api_resolve(const char* dll_name, const char* function_name);
+
+// Resolve a function by DLL name and ordinal number (returns generic_stub if unknown)
+void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal);
+
+// Get the address of the generic (do-nothing) stub — used for unresolved ordinals
+void* win32_api_get_generic_stub(void);
 
 // Get all API mappings
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count);

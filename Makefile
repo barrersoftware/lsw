@@ -89,7 +89,7 @@ pe-loader: shared $(PE_LOADER_BIN)
 
 $(PE_LOADER_BIN): $(PE_OBJECTS) $(WIN32_OBJECTS) $(SHARED_LIB)
 	@echo "$(COLOR_BLUE)🔗 Linking PE loader...$(COLOR_RESET)"
-	$(CC) -o $@ $(PE_OBJECTS) $(WIN32_OBJECTS) -L$(LIB_DIR) -llsw-shared -lpthread
+	$(CC) -o $@ $(PE_OBJECTS) $(WIN32_OBJECTS) -L$(LIB_DIR) -llsw-shared -lpthread -lm
 
 # Build MSI installer
 msi-installer: shared $(MSI_INSTALLER_BIN)

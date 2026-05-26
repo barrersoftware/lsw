@@ -145,7 +145,15 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
         munmap(file_data, file_size);
         return false;
     }
-    
+
+    // Run TLS callbacks (MSVC CRT static constructors, etc.)
+    if (!pe_process_tls_callbacks(image)) {
+        LSW_LOG_ERROR("Failed to process TLS callbacks");
+        munmap(image->image_base, image->image_size);
+        munmap(file_data, file_size);
+        return false;
+    }
+
     image->loaded = true;
     
     // Keep file_data mapped - we'll need it for relocs/imports
@@ -249,8 +257,17 @@ bool pe_resolve_imports(pe_image_t* image) {
                 pe_import_by_name_t* import_name = (pe_import_by_name_t*)((uint8_t*)image->image_base + ilt[i]);
                 func_name = (const char*)import_name->Name;
             } else {
-                // Import by ordinal - skip for now
-                LSW_LOG_WARN("    Ordinal import not supported yet");
+                // Import by ordinal — extract 16-bit ordinal and resolve
+                uint16_t ordinal = (uint16_t)(ilt[i] & 0xFFFF);
+                void* func_addr = win32_api_resolve_ordinal(dll_name, ordinal);
+                if (func_addr) {
+                    iat[i] = (uint64_t)func_addr;
+                    func_count++;
+                    LSW_LOG_DEBUG("    ✓ %s!#%u -> %p", dll_name, ordinal, func_addr);
+                } else {
+                    LSW_LOG_WARN("    ✗ %s!#%u (ordinal) - using generic stub", dll_name, ordinal);
+                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                }
                 continue;
             }
             
@@ -352,6 +369,61 @@ bool pe_apply_relocations(pe_image_t* image) {
     }
 
     LSW_LOG_INFO("Relocations: applied %d fixups", total_fixups);
+    return true;
+}
+
+/*
+ * pe_process_tls_callbacks - Execute TLS callbacks before the entry point.
+ *
+ * Windows PE files may have a TLS (Thread-Local Storage) directory that
+ * contains a NULL-terminated list of callback function pointers.  These
+ * must be invoked with reason DLL_PROCESS_ATTACH (1) before the executable
+ * entry point runs — typically the MSVC CRT uses them to call per-module
+ * C++ static constructors.
+ *
+ * Both 32-bit and 64-bit TLS directory layouts are handled.
+ * If there is no TLS directory the function returns true immediately.
+ */
+bool pe_process_tls_callbacks(pe_image_t* image) {
+    pe_data_directory_t* tls_dir = pe_get_data_directory(&image->pe, PE_DIR_TLS);
+    if (!tls_dir || tls_dir->VirtualAddress == 0 || tls_dir->Size == 0) {
+        return true;  /* No TLS directory — nothing to do */
+    }
+
+    LSW_LOG_INFO("TLS directory found at RVA 0x%x — processing callbacks", tls_dir->VirtualAddress);
+
+    if (image->pe.is_64bit) {
+        pe_tls_directory64_t* tls = (pe_tls_directory64_t*)(
+            (uint8_t*)image->image_base + tls_dir->VirtualAddress);
+
+        if (tls->AddressOfCallBacks) {
+            pe_tls_callback_t* cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
+            int n = 0;
+            while (*cb) {
+                LSW_LOG_INFO("  TLS callback[%d]: %p", n, (void*)(uintptr_t)*cb);
+                (*cb)(image->image_base, 1 /* DLL_PROCESS_ATTACH */, NULL);
+                cb++;
+                n++;
+            }
+            LSW_LOG_INFO("  Executed %d TLS callback(s)", n);
+        }
+    } else {
+        pe_tls_directory32_t* tls = (pe_tls_directory32_t*)(
+            (uint8_t*)image->image_base + tls_dir->VirtualAddress);
+
+        if (tls->AddressOfCallBacks) {
+            pe_tls_callback_t* cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
+            int n = 0;
+            while (*cb) {
+                LSW_LOG_INFO("  TLS callback[%d]: %p", n, (void*)(uintptr_t)*cb);
+                (*cb)(image->image_base, 1 /* DLL_PROCESS_ATTACH */, NULL);
+                cb++;
+                n++;
+            }
+            LSW_LOG_INFO("  Executed %d TLS callback(s)", n);
+        }
+    }
+
     return true;
 }
 

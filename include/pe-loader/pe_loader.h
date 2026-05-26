@@ -33,6 +33,9 @@ bool pe_resolve_imports(pe_image_t* image);
 // Apply relocations
 bool pe_apply_relocations(pe_image_t* image);
 
+// Process TLS directory callbacks (must run before entry point)
+bool pe_process_tls_callbacks(pe_image_t* image);
+
 // Execute PE image
 int pe_execute(pe_image_t* image, int argc, char** argv);
 

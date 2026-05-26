@@ -75,6 +75,8 @@ typedef struct {
     uint16_t cFileName[260];        // offset  44 (520 bytes)
     uint16_t cAlternateFileName[14];// offset 564 (28 bytes)
 } WIN32_FIND_DATAW;                 // total: 592 bytes
+_Static_assert(sizeof(WIN32_FIND_DATAW) == 592,
+               "WIN32_FIND_DATAW must be exactly 592 bytes — layout mismatch!");
 
 // Global kernel fd for syscalls
 static int g_kernel_fd = -1;
@@ -100,6 +102,9 @@ void* __attribute__((ms_abi)) lsw_calloc(size_t num, size_t size) {
     return calloc(num, size);
 }
 
+void* __attribute__((ms_abi)) lsw_realloc(void* ptr, size_t size) {
+    return realloc(ptr, size);
+}
 void* __attribute__((ms_abi)) lsw_memcpy(void* dest, const void* src, size_t n) {
     return memcpy(dest, src, n);
 }
@@ -3195,7 +3200,565 @@ uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameA(void* module, char* buf,
 // END Missing high-priority KERNEL32 APIs
 // ============================================================================
 
-// Disable pedantic warnings for function pointer to void* casts
+// ============================================================================
+// SECTION: Additional msvcrt.dll stubs (sprintf, string, math, ctype, I/O)
+// ============================================================================
+
+int __attribute__((ms_abi)) lsw_sprintf(char* buf, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, 65536, fmt, ap);
+    va_end(ap);
+    return r;
+}
+int __attribute__((ms_abi)) lsw_snprintf(char* buf, size_t n, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+// _snprintf (Windows, not null-terminated if truncated)
+int __attribute__((ms_abi)) lsw__snprintf(char* buf, size_t n, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+int __attribute__((ms_abi)) lsw_vsprintf(char* buf, const char* fmt, va_list ap) {
+    return vsprintf(buf, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw_vsnprintf(char* buf, size_t n, const char* fmt, va_list ap) {
+    return vsnprintf(buf, n, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw_sscanf(const char* s, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
+}
+int __attribute__((ms_abi)) lsw_vsscanf(const char* s, const char* fmt, va_list ap) {
+    return vsscanf(s, fmt, ap);
+}
+
+// String functions
+char* __attribute__((ms_abi)) lsw_strcpy(char* dst, const char* src)   { return strcpy(dst, src); }
+char* __attribute__((ms_abi)) lsw_strncpy(char* dst, const char* src, size_t n) { return strncpy(dst, src, n); }
+char* __attribute__((ms_abi)) lsw_strcat(char* dst, const char* src)   { return strcat(dst, src); }
+char* __attribute__((ms_abi)) lsw_strncat(char* dst, const char* src, size_t n) { return strncat(dst, src, n); }
+char* __attribute__((ms_abi)) lsw_strchr(const char* s, int c)         { return strchr(s, c); }
+char* __attribute__((ms_abi)) lsw_strrchr(const char* s, int c)        { return strrchr(s, c); }
+char* __attribute__((ms_abi)) lsw_strtok(char* s, const char* delim)   { return strtok(s, delim); }
+char* __attribute__((ms_abi)) lsw_strdup(const char* s)                { return strdup(s); }
+char* __attribute__((ms_abi)) lsw__strdup(const char* s)               { return strdup(s); }
+int   __attribute__((ms_abi)) lsw_strcasecmp(const char* a, const char* b) { return strcasecmp(a, b); }
+int   __attribute__((ms_abi)) lsw__stricmp(const char* a, const char* b)   { return strcasecmp(a, b); }
+int   __attribute__((ms_abi)) lsw__strnicmp(const char* a, const char* b, size_t n) {
+    return strncasecmp(a, b, n);
+}
+
+// Wide string helpers
+wchar_t* __attribute__((ms_abi)) lsw_wcscpy(wchar_t* d, const wchar_t* s)            { return wcscpy(d, s); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsncpy(wchar_t* d, const wchar_t* s, size_t n) { return wcsncpy(d, s, n); }
+wchar_t* __attribute__((ms_abi)) lsw_wcscat(wchar_t* d, const wchar_t* s)            { return wcscat(d, s); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsncat(wchar_t* d, const wchar_t* s, size_t n) { return wcsncat(d, s, n); }
+int      __attribute__((ms_abi)) lsw_wcscmp(const wchar_t* a, const wchar_t* b)      { return wcscmp(a, b); }
+int      __attribute__((ms_abi)) lsw_wcsncmp(const wchar_t* a, const wchar_t* b, size_t n) { return wcsncmp(a, b, n); }
+wchar_t* __attribute__((ms_abi)) lsw_wcschr(const wchar_t* s, wchar_t c)             { return wcschr(s, c); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsrchr(const wchar_t* s, wchar_t c)            { return wcsrchr(s, c); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsstr(const wchar_t* h, const wchar_t* n)      { return wcsstr(h, n); }
+wchar_t* __attribute__((ms_abi)) lsw__wcsdup(const wchar_t* s)                       { return wcsdup(s); }
+
+// Numeric conversion
+int       __attribute__((ms_abi)) lsw_atoi(const char* s)               { return atoi(s); }
+long      __attribute__((ms_abi)) lsw_atol(const char* s)               { return atol(s); }
+double    __attribute__((ms_abi)) lsw_atof(const char* s)               { return atof(s); }
+long      __attribute__((ms_abi)) lsw_strtol(const char* s, char** e, int b)  { return strtol(s, e, b); }
+unsigned long __attribute__((ms_abi)) lsw_strtoul(const char* s, char** e, int b) { return strtoul(s, e, b); }
+double    __attribute__((ms_abi)) lsw_strtod(const char* s, char** e)   { return strtod(s, e); }
+long long __attribute__((ms_abi)) lsw__atoi64(const char* s)            { return atoll(s); }
+long long __attribute__((ms_abi)) lsw_strtoll(const char* s, char** e, int b) { return strtoll(s, e, b); }
+
+// Memory
+void* __attribute__((ms_abi)) lsw_memmove(void* d, const void* s, size_t n)     { return memmove(d, s, n); }
+void* __attribute__((ms_abi)) lsw_memchr(const void* s, int c, size_t n)        { return memchr(s, c, n); }
+int   __attribute__((ms_abi)) lsw_memcmp(const void* a, const void* b, size_t n){ return memcmp(a, b, n); }
+
+// ctype
+int __attribute__((ms_abi)) lsw_toupper(int c)   { return toupper(c); }
+int __attribute__((ms_abi)) lsw_tolower(int c)   { return tolower(c); }
+int __attribute__((ms_abi)) lsw_isalpha(int c)   { return isalpha(c); }
+int __attribute__((ms_abi)) lsw_isdigit(int c)   { return isdigit(c); }
+int __attribute__((ms_abi)) lsw_isspace(int c)   { return isspace(c); }
+int __attribute__((ms_abi)) lsw_isalnum(int c)   { return isalnum(c); }
+int __attribute__((ms_abi)) lsw_isupper(int c)   { return isupper(c); }
+int __attribute__((ms_abi)) lsw_islower(int c)   { return islower(c); }
+int __attribute__((ms_abi)) lsw_isprint(int c)   { return isprint(c); }
+int __attribute__((ms_abi)) lsw_ispunct(int c)   { return ispunct(c); }
+
+// stdlib sorting
+void __attribute__((ms_abi)) lsw_qsort(void* base, size_t n, size_t size,
+    int (*cmp)(const void*, const void*)) {
+    qsort(base, n, size, cmp);
+}
+void* __attribute__((ms_abi)) lsw_bsearch(const void* key, const void* base, size_t n, size_t size,
+    int (*cmp)(const void*, const void*)) {
+    return bsearch(key, base, n, size, cmp);
+}
+
+// Time
+#include <time.h>
+typedef long lsw_time_t;
+lsw_time_t __attribute__((ms_abi)) lsw_time(lsw_time_t* t) {
+    time_t v = time(NULL);
+    if (t) *t = (lsw_time_t)v;
+    return (lsw_time_t)v;
+}
+double __attribute__((ms_abi)) lsw_difftime(lsw_time_t t1, lsw_time_t t0) {
+    return difftime((time_t)t1, (time_t)t0);
+}
+uint64_t __attribute__((ms_abi)) lsw_clock(void) { return (uint64_t)clock(); }
+
+// Random
+int __attribute__((ms_abi)) lsw_rand(void)     { return rand(); }
+void __attribute__((ms_abi)) lsw_srand(unsigned int seed) { srand(seed); }
+
+// I/O
+#include <ctype.h>
+void* __attribute__((ms_abi)) lsw_fopen(const char* path, const char* mode) {
+    return fopen(path, mode);
+}
+int   __attribute__((ms_abi)) lsw_fclose(void* f)  { return fclose((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_feof(void* f)    { return feof((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_ferror(void* f)  { return ferror((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_fgetc(void* f)   { return fgetc((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_ungetc(int c, void* f) { return ungetc(c, (FILE*)f); }
+char* __attribute__((ms_abi)) lsw_fgets(char* s, int n, void* f) { return fgets(s, n, (FILE*)f); }
+size_t __attribute__((ms_abi)) lsw_fread(void* buf, size_t sz, size_t cnt, void* f) {
+    return fread(buf, sz, cnt, (FILE*)f);
+}
+long  __attribute__((ms_abi)) lsw_ftell(void* f)  { return ftell((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_fseek(void* f, long off, int whence) { return fseek((FILE*)f, off, whence); }
+void  __attribute__((ms_abi)) lsw_rewind(void* f) { rewind((FILE*)f); }
+int   __attribute__((ms_abi)) lsw_puts(const char* s)    { return puts(s); }
+int   __attribute__((ms_abi)) lsw_putchar(int c)          { return putchar(c); }
+int   __attribute__((ms_abi)) lsw_getchar(void)           { return getchar(); }
+int   __attribute__((ms_abi)) lsw_fscanf(void* f, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfscanf((FILE*)f, fmt, ap);
+    va_end(ap);
+    return r;
+}
+int   __attribute__((ms_abi)) lsw_vprintf(const char* fmt, va_list ap) {
+    return vprintf(fmt, ap);
+}
+int   __attribute__((ms_abi)) lsw_swprintf(wchar_t* buf, const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vswprintf(buf, 65536, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+// Math
+#include <math.h>
+double __attribute__((ms_abi)) lsw_floor(double x)  { return floor(x); }
+double __attribute__((ms_abi)) lsw_ceil(double x)   { return ceil(x); }
+double __attribute__((ms_abi)) lsw_fabs(double x)   { return fabs(x); }
+double __attribute__((ms_abi)) lsw_sqrt(double x)   { return sqrt(x); }
+double __attribute__((ms_abi)) lsw_pow(double x, double y) { return pow(x, y); }
+double __attribute__((ms_abi)) lsw_math_log(double x)    { return log(x); }
+double __attribute__((ms_abi)) lsw_math_log10(double x)  { return log10(x); }
+double __attribute__((ms_abi)) lsw_exp(double x)    { return exp(x); }
+double __attribute__((ms_abi)) lsw_sin(double x)    { return sin(x); }
+double __attribute__((ms_abi)) lsw_cos(double x)    { return cos(x); }
+double __attribute__((ms_abi)) lsw_tan(double x)    { return tan(x); }
+double __attribute__((ms_abi)) lsw_atan2(double y, double x) { return atan2(y, x); }
+
+// ============================================================================
+// SECTION: vcruntime140.dll / api-ms-win-crt-* stubs
+// Modern MSVC apps (VS2015+) import from vcruntime140.dll and the
+// api-ms-win-crt-*.dll Universal CRT forwarder DLLs instead of msvcrt.dll.
+// These are mostly identical to their msvcrt counterparts.
+// ============================================================================
+
+// __acrt_iob_func(index) returns FILE* for stdin(0)/stdout(1)/stderr(2)
+void* __attribute__((ms_abi)) lsw___acrt_iob_func(unsigned int index) {
+    switch (index) {
+        case 0: return stdin;
+        case 1: return stdout;
+        case 2: return stderr;
+        default: return NULL;
+    }
+}
+
+// __stdio_common_vfprintf / __stdio_common_vsprintf: used by all printf family
+// Signature: int __stdio_common_vfprintf(uint64_t options, FILE* f, const char* fmt, ..., va_list ap)
+int __attribute__((ms_abi)) lsw___stdio_common_vfprintf(
+    uint64_t opts, void* f, const char* fmt, void* locale, va_list ap)
+{
+    (void)opts; (void)locale;
+    return vfprintf((FILE*)f, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw___stdio_common_vsprintf(
+    uint64_t opts, char* buf, size_t bufsz, const char* fmt, void* locale, va_list ap)
+{
+    (void)opts; (void)locale;
+    return vsnprintf(buf, bufsz, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw___stdio_common_vsscanf(
+    uint64_t opts, const char* buf, size_t bufsz, const char* fmt, void* locale, va_list ap)
+{
+    (void)opts; (void)locale; (void)bufsz;
+    return vsscanf(buf, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw___stdio_common_vswprintf(
+    uint64_t opts, wchar_t* buf, size_t n, const wchar_t* fmt, void* locale, va_list ap)
+{
+    (void)opts; (void)locale;
+    return vswprintf(buf, n, fmt, ap);
+}
+int __attribute__((ms_abi)) lsw___stdio_common_vfwprintf(
+    uint64_t opts, void* f, const wchar_t* fmt, void* locale, va_list ap)
+{
+    (void)opts; (void)locale;
+    return vfwprintf((FILE*)f, fmt, ap);
+}
+
+// _configure_narrow_argv / _configure_wide_argv — CRT startup config, no-op
+void __attribute__((ms_abi)) lsw__configure_narrow_argv(int mode) { (void)mode; }
+void __attribute__((ms_abi)) lsw__configure_wide_argv(int mode)   { (void)mode; }
+
+// _initialize_narrow_environment / _initialize_wide_environment — no-op
+void __attribute__((ms_abi)) lsw__initialize_narrow_environment(void) {}
+void __attribute__((ms_abi)) lsw__initialize_wide_environment(void)   {}
+void __attribute__((ms_abi)) lsw__initialize_onexit_table(void* t) { (void)t; }
+void __attribute__((ms_abi)) lsw__register_onexit_function(void* t, void* fn) { (void)t; (void)fn; }
+void __attribute__((ms_abi)) lsw__execute_onexit_table(void* t) { (void)t; }
+void __attribute__((ms_abi)) lsw___p___argc(void)   {}   // Returns pointer to __argc — stubbed
+void __attribute__((ms_abi)) lsw___p___argv(void)   {}
+void __attribute__((ms_abi)) lsw___p__commode(void) {}
+
+// terminate / unexpected
+void __attribute__((ms_abi)) lsw__crt_atexit(void* fn) { (void)fn; }
+void __attribute__((ms_abi)) lsw___crt_at_quick_exit(void* fn) { (void)fn; }
+
+// vcruntime: memory functions
+void* __attribute__((ms_abi)) lsw___std_type_info_destroy_list(void* p) { (void)p; return NULL; }
+
+// C++ exception helpers (vcruntime)
+void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* type) {
+    (void)obj; (void)type;
+    LSW_LOG_ERROR("_CxxThrowException called — C++ exceptions not supported; aborting");
+    abort();
+}
+
+// ============================================================================
+// END vcruntime140 / api-ms-win-crt-* stubs
+// ============================================================================
+
+// ============================================================================
+// SECTION: Additional KERNEL32 APIs (process, console, misc)
+// ============================================================================
+
+// GetCurrentThread / GetCurrentProcess
+void* __attribute__((ms_abi)) lsw_GetCurrentThread(void) {
+    return (void*)(uintptr_t)0xFFFFFFFFFFFFFFFEULL; // pseudohandle
+}
+void* __attribute__((ms_abi)) lsw_GetCurrentProcess(void) {
+    return (void*)(uintptr_t)0xFFFFFFFFFFFFFFFFULL; // pseudohandle
+}
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentThreadId(void) {
+    return (uint32_t)(uintptr_t)pthread_self();
+}
+
+// GetSystemTimeAsFileTime — fills FILETIME (100-ns intervals since 1601-01-01)
+void __attribute__((ms_abi)) lsw_GetSystemTimeAsFileTime(uint64_t* ft) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    // Unix epoch (1970-01-01) in Windows FILETIME ticks (100 ns since 1601-01-01):
+    // Difference = 116444736000000000 ticks
+    uint64_t ticks = (uint64_t)tv.tv_sec * 10000000ULL
+                   + (uint64_t)tv.tv_usec * 10ULL
+                   + 116444736000000000ULL;
+    if (ft) *ft = ticks;
+}
+void __attribute__((ms_abi)) lsw_GetSystemTime(void* lpSystemTime) {
+    // SYSTEMTIME: Year, Month, DayOfWeek, Day, Hour, Minute, Second, Ms (each 2 bytes)
+    uint16_t* st = (uint16_t*)lpSystemTime;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    (void)st; // TODO: fill from tm struct
+}
+void __attribute__((ms_abi)) lsw_GetLocalTime(void* lpSystemTime) {
+    lsw_GetSystemTime(lpSystemTime); // stub — same as SystemTime
+}
+int __attribute__((ms_abi)) lsw_FileTimeToSystemTime(const uint64_t* ft, void* st) {
+    (void)ft; (void)st; return 1; // stub
+}
+int __attribute__((ms_abi)) lsw_SystemTimeToFileTime(const void* st, uint64_t* ft) {
+    (void)st; if (ft) *ft = 0; return 1; // stub
+}
+
+// QueryPerformanceCounter/Frequency
+int __attribute__((ms_abi)) lsw_QueryPerformanceCounter(uint64_t* out) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    if (out) *out = (uint64_t)tv.tv_sec * 1000000ULL + tv.tv_usec;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_QueryPerformanceFrequency(uint64_t* out) {
+    if (out) *out = 1000000ULL; // 1 MHz (matches gettimeofday resolution)
+    return 1;
+}
+
+// Console functions
+int __attribute__((ms_abi)) lsw_AllocConsole(void) { return 1; }
+int __attribute__((ms_abi)) lsw_FreeConsole(void)  { return 1; }
+int __attribute__((ms_abi)) lsw_AttachConsole(uint32_t pid) { (void)pid; return 1; }
+void* __attribute__((ms_abi)) lsw_GetConsoleWindow(void) { return NULL; }
+int __attribute__((ms_abi)) lsw_SetConsoleTitle(const char* t) { (void)t; return 1; }
+int __attribute__((ms_abi)) lsw_SetConsoleTitleA(const char* t) {
+    if (t) LSW_LOG_DEBUG("SetConsoleTitleA: \"%s\"", t);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetConsoleTitleW(const uint16_t* t) { (void)t; return 1; }
+int __attribute__((ms_abi)) lsw_GetConsoleMode(void* h, uint32_t* mode) {
+    (void)h; if (mode) *mode = 0x3; return 1;
+}
+int __attribute__((ms_abi)) lsw_SetConsoleMode(void* h, uint32_t mode) {
+    (void)h; (void)mode; return 1;
+}
+uint32_t __attribute__((ms_abi)) lsw_WriteConsoleW(
+    void* h, const uint16_t* buf, uint32_t nchars, uint32_t* written, void* reserved) {
+    (void)h; (void)reserved;
+    // Simple Latin-1 downcast for console output
+    for (uint32_t i = 0; i < nchars; i++) {
+        uint16_t c = buf[i];
+        if (c < 128) putchar((char)c);
+        else putchar('?');
+    }
+    if (written) *written = nchars;
+    return 1;
+}
+uint32_t __attribute__((ms_abi)) lsw_ReadConsoleA(
+    void* h, char* buf, uint32_t toread, uint32_t* nread, void* reserved) {
+    (void)h; (void)reserved;
+    char* r = fgets(buf, (int)toread, stdin);
+    uint32_t n = r ? (uint32_t)strlen(buf) : 0;
+    if (nread) *nread = n;
+    return r ? 1 : 0;
+}
+uint32_t __attribute__((ms_abi)) lsw_ReadConsoleW(
+    void* h, uint16_t* buf, uint32_t toread, uint32_t* nread, void* reserved) {
+    (void)h; (void)reserved;
+    char tmp[4096] = {0};
+    uint32_t limit = toread < 4095 ? toread : 4095;
+    char* r = fgets(tmp, (int)limit, stdin);
+    uint32_t n = 0;
+    if (r) {
+        while (tmp[n] && n < toread) { buf[n] = (uint16_t)tmp[n]; n++; }
+    }
+    if (nread) *nread = n;
+    return r ? 1 : 0;
+}
+
+// Misc KERNEL32
+uint32_t __attribute__((ms_abi)) lsw_GetFileType(void* h) {
+    (void)h;
+    return 2; // FILE_TYPE_CHAR (console)
+}
+int __attribute__((ms_abi)) lsw_DuplicateHandle(
+    void* hsrcproc, void* hsrc, void* hdstproc, void** hdst,
+    uint32_t access, int inherit, uint32_t opts) {
+    (void)hsrcproc; (void)hsrc; (void)hdstproc; (void)access; (void)inherit; (void)opts;
+    if (hdst) *hdst = hsrc; // shallow dup
+    return 1;
+}
+void __attribute__((ms_abi)) lsw_OutputDebugStringA(const char* s) {
+    if (s) LSW_LOG_DEBUG("[ODS] %s", s);
+}
+void __attribute__((ms_abi)) lsw_OutputDebugStringW(const uint16_t* s) { (void)s; }
+int __attribute__((ms_abi)) lsw_CreateDirectoryA(const char* path, void* attrs) {
+    (void)attrs;
+    if (!path) return 0;
+    return (mkdir(path, 0755) == 0) ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_GetFileAttributesA(const char* path) {
+    if (!path) return (int)0xFFFFFFFF;
+    struct stat st;
+    if (stat(path, &st) != 0) return (int)0xFFFFFFFF;
+    int attr = 0x20; // FILE_ATTRIBUTE_ARCHIVE
+    if (S_ISDIR(st.st_mode)) attr = 0x10; // FILE_ATTRIBUTE_DIRECTORY
+    return attr;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetFullPathNameA(const char* path, uint32_t buf_len, char* buf, char** fname) {
+    if (!path || !buf || buf_len == 0) return 0;
+    char* r = realpath(path, buf);
+    if (!r) { snprintf(buf, buf_len, "%s", path); }
+    if (fname) {
+        char* slash = strrchr(buf, '/');
+        *fname = slash ? slash + 1 : buf;
+    }
+    return (uint32_t)strlen(buf);
+}
+uint32_t __attribute__((ms_abi)) lsw_GetFullPathNameW(const uint16_t* path, uint32_t buf_len, uint16_t* buf, uint16_t** fname) {
+    (void)path; (void)buf_len; (void)buf; (void)fname; return 0;
+}
+int __attribute__((ms_abi)) lsw_SetCurrentDirectoryA(const char* path) {
+    if (!path) return 0;
+    return (chdir(path) == 0) ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_SetCurrentDirectoryW(const uint16_t* path) { (void)path; return 1; }
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentDirectoryA(uint32_t n, char* buf) {
+    if (!buf || n == 0) return 0;
+    if (!getcwd(buf, n)) return 0;
+    return (uint32_t)strlen(buf);
+}
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentDirectoryW(uint32_t n, uint16_t* buf) {
+    (void)n; (void)buf; return 0;
+}
+int __attribute__((ms_abi)) lsw_MoveFileA(const char* src, const char* dst) {
+    if (!src || !dst) return 0;
+    return (rename(src, dst) == 0) ? 1 : 0;
+}
+int __attribute__((ms_abi)) lsw_MoveFileW(const uint16_t* src, const uint16_t* dst) { (void)src; (void)dst; return 0; }
+int __attribute__((ms_abi)) lsw_CopyFileA(const char* src, const char* dst, int fail_if_exists) {
+    (void)fail_if_exists;
+    if (!src || !dst) return 0;
+    int sfd = open(src, O_RDONLY);
+    if (sfd < 0) return 0;
+    int dfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dfd < 0) { close(sfd); return 0; }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(sfd, buf, sizeof(buf))) > 0) {
+        if (write(dfd, buf, (size_t)n) != n) { close(sfd); close(dfd); return 0; }
+    }
+    close(sfd); close(dfd);
+    return 1;
+}
+void* __attribute__((ms_abi)) lsw_FindFirstFileA(const char* pattern, void* data) {
+    (void)pattern; (void)data;
+    LSW_LOG_WARN("FindFirstFileA: stub");
+    return (void*)(uintptr_t)0xFFFFFFFFFFFFFFFFULL; // INVALID_HANDLE_VALUE
+}
+int __attribute__((ms_abi)) lsw_FindNextFileA(void* h, void* data) { (void)h; (void)data; return 0; }
+
+// Heap size tracking — trivially returns 0; real implementation needs an alloc map
+size_t __attribute__((ms_abi)) lsw_HeapSize_impl(void* heap, uint32_t flags, const void* mem) {
+    (void)heap; (void)flags; (void)mem;
+    return 0;
+}
+
+// WaitForMultipleObjects (basic: loop WaitForSingleObject)
+uint32_t __attribute__((ms_abi)) lsw_WaitForMultipleObjects(
+    uint32_t count, void** handles, int wait_all, uint32_t timeout_ms)
+{
+    (void)wait_all;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t r = lsw_WaitForSingleObject(handles[i], timeout_ms);
+        if (r == 0) return i; // WAIT_OBJECT_0 + i
+    }
+    return 0xFFFFFFFF; // WAIT_FAILED
+}
+
+// CreateMutexA — same as CreateMutexW but accepts ASCII name
+void* __attribute__((ms_abi)) lsw_CreateMutexA(void* attrs, int initial_owner, const char* name) {
+    (void)attrs; (void)name;
+    pthread_mutex_t* m = malloc(sizeof(pthread_mutex_t));
+    if (!m) return NULL;
+    pthread_mutex_init(m, NULL);
+    if (initial_owner) pthread_mutex_lock(m);
+    return (void*)m;
+}
+// OpenMutex stubs
+void* __attribute__((ms_abi)) lsw_OpenMutexA(uint32_t access, int inherit, const char* name) {
+    (void)access; (void)inherit; (void)name; return NULL;
+}
+int __attribute__((ms_abi)) lsw_ReleaseMutex(void* h) {
+    if (!h) return 0;
+    pthread_mutex_t* m = (pthread_mutex_t*)h;
+    return (pthread_mutex_unlock(m) == 0) ? 1 : 0;
+}
+
+// CreateSemaphoreA/W, OpenSemaphoreA, ReleaseSemaphore (backed by sem_t)
+#include <semaphore.h>
+void* __attribute__((ms_abi)) lsw_CreateSemaphoreA(void* attrs, long init, long max, const char* name) {
+    (void)attrs; (void)max; (void)name;
+    sem_t* s = malloc(sizeof(sem_t));
+    if (!s) return NULL;
+    sem_init(s, 0, (unsigned int)init);
+    return (void*)s;
+}
+void* __attribute__((ms_abi)) lsw_CreateSemaphoreW(void* attrs, long init, long max, const uint16_t* name) {
+    (void)attrs; (void)max; (void)name;
+    sem_t* s = malloc(sizeof(sem_t));
+    if (!s) return NULL;
+    sem_init(s, 0, (unsigned int)init);
+    return (void*)s;
+}
+int __attribute__((ms_abi)) lsw_ReleaseSemaphore(void* h, long count, long* prev) {
+    if (!h) return 0;
+    sem_t* s = (sem_t*)h;
+    if (prev) { int v = 0; sem_getvalue(s, &v); *prev = v; }
+    for (long i = 0; i < count; i++) sem_post(s);
+    return 1;
+}
+
+// InitOnceExecuteOnce — simple spinlock-style stub
+int __attribute__((ms_abi)) lsw_InitOnceExecuteOnce(
+    void* once, void* initfn, void* param, void** ctx) {
+    // Call initfn unconditionally (no real once guarantee, but correct for most uses)
+    typedef int (__attribute__((ms_abi)) *initonce_fn_t)(void*, void*, void**);
+    initonce_fn_t fn = (initonce_fn_t)(uintptr_t)initfn;
+    if (fn) return fn(once, param, ctx);
+    return 0;
+}
+
+// SetHandleInformation / GetHandleInformation (stubs)
+int __attribute__((ms_abi)) lsw_SetHandleInformation(void* h, uint32_t mask, uint32_t flags) {
+    (void)h; (void)mask; (void)flags; return 1;
+}
+int __attribute__((ms_abi)) lsw_GetHandleInformation(void* h, uint32_t* flags) {
+    (void)h; if (flags) *flags = 0; return 1;
+}
+
+// Process environment block helpers
+void* __attribute__((ms_abi)) lsw_GetCommandLineW(void) {
+    // Return a static empty wide string
+    static uint16_t empty[2] = {0, 0};
+    return (void*)empty;
+}
+
+// RtlMoveMemory / RtlFillMemory / RtlZeroMemory (KERNEL32 re-exports of ntdll)
+void __attribute__((ms_abi)) lsw_RtlMoveMemory(void* d, const void* s, size_t n) { memmove(d, s, n); }
+void __attribute__((ms_abi)) lsw_RtlFillMemory(void* d, size_t n, int c)         { memset(d, c, n); }
+void __attribute__((ms_abi)) lsw_RtlZeroMemory(void* d, size_t n)                { memset(d, 0, n); }
+void __attribute__((ms_abi)) lsw_ZeroMemory(void* d, size_t n)                   { memset(d, 0, n); }
+void __attribute__((ms_abi)) lsw_FillMemory(void* d, size_t n, int c)            { memset(d, c, n); }
+void __attribute__((ms_abi)) lsw_CopyMemory(void* d, const void* s, size_t n)    { memcpy(d, s, n); }
+void __attribute__((ms_abi)) lsw_MoveMemory(void* d, const void* s, size_t n)    { memmove(d, s, n); }
+
+// MultiByteToWideChar / WideCharToMultiByte already exist; add stubs for
+// common CharToOem / OemToChar / CharNext
+int __attribute__((ms_abi)) lsw_CharToOemA(const char* src, char* dst) {
+    if (src && dst) strcpy(dst, src);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_OemToCharA(const char* src, char* dst) {
+    if (src && dst) strcpy(dst, src);
+    return 1;
+}
+
+// ============================================================================
+// END Additional KERNEL32 APIs
+// ============================================================================
+
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 
@@ -3205,6 +3768,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "malloc", (void*)lsw_malloc},
     {"msvcrt.dll", "free", (void*)lsw_free},
     {"msvcrt.dll", "calloc", (void*)lsw_calloc},
+    {"msvcrt.dll", "realloc", (void*)lsw_realloc},
     {"msvcrt.dll", "memcpy", (void*)lsw_memcpy},
     {"msvcrt.dll", "memset", (void*)lsw_memset},
     {"msvcrt.dll", "strlen", (void*)lsw_strlen},
@@ -3377,6 +3941,238 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetModuleHandleW", (void*)lsw_GetModuleHandleW},
     {"KERNEL32.dll", "GetModuleFileNameW", (void*)lsw_GetModuleFileNameW},
     {"KERNEL32.dll", "GetModuleFileNameA", (void*)lsw_GetModuleFileNameA},
+
+    /* ----------------------------------------------------------------
+     * msvcrt.dll / ucrtbase.dll — sprintf/string/math/IO/ctype
+     * ---------------------------------------------------------------- */
+    {"msvcrt.dll",   "sprintf",      (void*)lsw_sprintf},
+    {"msvcrt.dll",   "snprintf",     (void*)lsw_snprintf},
+    {"msvcrt.dll",   "_snprintf",    (void*)lsw__snprintf},
+    {"msvcrt.dll",   "vsprintf",     (void*)lsw_vsprintf},
+    {"msvcrt.dll",   "vsnprintf",    (void*)lsw_vsnprintf},
+    {"msvcrt.dll",   "sscanf",       (void*)lsw_sscanf},
+    {"msvcrt.dll",   "vsscanf",      (void*)lsw_vsscanf},
+    {"msvcrt.dll",   "strcpy",       (void*)lsw_strcpy},
+    {"msvcrt.dll",   "strncpy",      (void*)lsw_strncpy},
+    {"msvcrt.dll",   "strcat",       (void*)lsw_strcat},
+    {"msvcrt.dll",   "strncat",      (void*)lsw_strncat},
+    {"msvcrt.dll",   "strchr",       (void*)lsw_strchr},
+    {"msvcrt.dll",   "strrchr",      (void*)lsw_strrchr},
+    {"msvcrt.dll",   "strtok",       (void*)lsw_strtok},
+    {"msvcrt.dll",   "strdup",       (void*)lsw_strdup},
+    {"msvcrt.dll",   "_strdup",      (void*)lsw__strdup},
+    {"msvcrt.dll",   "_stricmp",     (void*)lsw__stricmp},
+    {"msvcrt.dll",   "_strnicmp",    (void*)lsw__strnicmp},
+    {"msvcrt.dll",   "wcscpy",       (void*)lsw_wcscpy},
+    {"msvcrt.dll",   "wcsncpy",      (void*)lsw_wcsncpy},
+    {"msvcrt.dll",   "wcscat",       (void*)lsw_wcscat},
+    {"msvcrt.dll",   "wcsncat",      (void*)lsw_wcsncat},
+    {"msvcrt.dll",   "wcscmp",       (void*)lsw_wcscmp},
+    {"msvcrt.dll",   "wcsncmp",      (void*)lsw_wcsncmp},
+    {"msvcrt.dll",   "wcschr",       (void*)lsw_wcschr},
+    {"msvcrt.dll",   "wcsrchr",      (void*)lsw_wcsrchr},
+    {"msvcrt.dll",   "wcsstr",       (void*)lsw_wcsstr},
+    {"msvcrt.dll",   "_wcsdup",      (void*)lsw__wcsdup},
+    {"msvcrt.dll",   "atoi",         (void*)lsw_atoi},
+    {"msvcrt.dll",   "atol",         (void*)lsw_atol},
+    {"msvcrt.dll",   "atof",         (void*)lsw_atof},
+    {"msvcrt.dll",   "strtol",       (void*)lsw_strtol},
+    {"msvcrt.dll",   "strtoul",      (void*)lsw_strtoul},
+    {"msvcrt.dll",   "strtod",       (void*)lsw_strtod},
+    {"msvcrt.dll",   "_atoi64",      (void*)lsw__atoi64},
+    {"msvcrt.dll",   "strtoll",      (void*)lsw_strtoll},
+    {"msvcrt.dll",   "memmove",      (void*)lsw_memmove},
+    {"msvcrt.dll",   "memchr",       (void*)lsw_memchr},
+    {"msvcrt.dll",   "memcmp",       (void*)lsw_memcmp},
+    {"msvcrt.dll",   "toupper",      (void*)lsw_toupper},
+    {"msvcrt.dll",   "tolower",      (void*)lsw_tolower},
+    {"msvcrt.dll",   "isalpha",      (void*)lsw_isalpha},
+    {"msvcrt.dll",   "isdigit",      (void*)lsw_isdigit},
+    {"msvcrt.dll",   "isspace",      (void*)lsw_isspace},
+    {"msvcrt.dll",   "isalnum",      (void*)lsw_isalnum},
+    {"msvcrt.dll",   "isupper",      (void*)lsw_isupper},
+    {"msvcrt.dll",   "islower",      (void*)lsw_islower},
+    {"msvcrt.dll",   "isprint",      (void*)lsw_isprint},
+    {"msvcrt.dll",   "ispunct",      (void*)lsw_ispunct},
+    {"msvcrt.dll",   "qsort",        (void*)lsw_qsort},
+    {"msvcrt.dll",   "bsearch",      (void*)lsw_bsearch},
+    {"msvcrt.dll",   "time",         (void*)lsw_time},
+    {"msvcrt.dll",   "difftime",     (void*)lsw_difftime},
+    {"msvcrt.dll",   "clock",        (void*)lsw_clock},
+    {"msvcrt.dll",   "rand",         (void*)lsw_rand},
+    {"msvcrt.dll",   "srand",        (void*)lsw_srand},
+    {"msvcrt.dll",   "fopen",        (void*)lsw_fopen},
+    {"msvcrt.dll",   "fclose",       (void*)lsw_fclose},
+    {"msvcrt.dll",   "feof",         (void*)lsw_feof},
+    {"msvcrt.dll",   "ferror",       (void*)lsw_ferror},
+    {"msvcrt.dll",   "fgetc",        (void*)lsw_fgetc},
+    {"msvcrt.dll",   "ungetc",       (void*)lsw_ungetc},
+    {"msvcrt.dll",   "fgets",        (void*)lsw_fgets},
+    {"msvcrt.dll",   "fread",        (void*)lsw_fread},
+    {"msvcrt.dll",   "ftell",        (void*)lsw_ftell},
+    {"msvcrt.dll",   "fseek",        (void*)lsw_fseek},
+    {"msvcrt.dll",   "rewind",       (void*)lsw_rewind},
+    {"msvcrt.dll",   "puts",         (void*)lsw_puts},
+    {"msvcrt.dll",   "putchar",      (void*)lsw_putchar},
+    {"msvcrt.dll",   "getchar",      (void*)lsw_getchar},
+    {"msvcrt.dll",   "fscanf",       (void*)lsw_fscanf},
+    {"msvcrt.dll",   "vprintf",      (void*)lsw_vprintf},
+    {"msvcrt.dll",   "swprintf",     (void*)lsw_swprintf},
+    {"msvcrt.dll",   "floor",        (void*)lsw_floor},
+    {"msvcrt.dll",   "ceil",         (void*)lsw_ceil},
+    {"msvcrt.dll",   "fabs",         (void*)lsw_fabs},
+    {"msvcrt.dll",   "sqrt",         (void*)lsw_sqrt},
+    {"msvcrt.dll",   "pow",          (void*)lsw_pow},
+    {"msvcrt.dll",   "log",          (void*)lsw_math_log},
+    {"msvcrt.dll",   "log10",        (void*)lsw_math_log10},
+    {"msvcrt.dll",   "exp",          (void*)lsw_exp},
+    {"msvcrt.dll",   "sin",          (void*)lsw_sin},
+    {"msvcrt.dll",   "cos",          (void*)lsw_cos},
+    {"msvcrt.dll",   "tan",          (void*)lsw_tan},
+    {"msvcrt.dll",   "atan2",        (void*)lsw_atan2},
+    /* ucrtbase.dll aliases (same functions, different DLL name) */
+    {"ucrtbase.dll", "sprintf",      (void*)lsw_sprintf},
+    {"ucrtbase.dll", "snprintf",     (void*)lsw_snprintf},
+    {"ucrtbase.dll", "_snprintf",    (void*)lsw__snprintf},
+    {"ucrtbase.dll", "vsprintf",     (void*)lsw_vsprintf},
+    {"ucrtbase.dll", "sscanf",       (void*)lsw_sscanf},
+    {"ucrtbase.dll", "strcpy",       (void*)lsw_strcpy},
+    {"ucrtbase.dll", "strncpy",      (void*)lsw_strncpy},
+    {"ucrtbase.dll", "strcat",       (void*)lsw_strcat},
+    {"ucrtbase.dll", "atoi",         (void*)lsw_atoi},
+    {"ucrtbase.dll", "atof",         (void*)lsw_atof},
+    {"ucrtbase.dll", "strtol",       (void*)lsw_strtol},
+    {"ucrtbase.dll", "strtod",       (void*)lsw_strtod},
+    {"ucrtbase.dll", "memmove",      (void*)lsw_memmove},
+    {"ucrtbase.dll", "fopen",        (void*)lsw_fopen},
+    {"ucrtbase.dll", "fclose",       (void*)lsw_fclose},
+    {"ucrtbase.dll", "fread",        (void*)lsw_fread},
+    {"ucrtbase.dll", "fseek",        (void*)lsw_fseek},
+    {"ucrtbase.dll", "ftell",        (void*)lsw_ftell},
+    {"ucrtbase.dll", "qsort",        (void*)lsw_qsort},
+    {"ucrtbase.dll", "rand",         (void*)lsw_rand},
+    {"ucrtbase.dll", "srand",        (void*)lsw_srand},
+    {"ucrtbase.dll", "floor",        (void*)lsw_floor},
+    {"ucrtbase.dll", "ceil",         (void*)lsw_ceil},
+    {"ucrtbase.dll", "sqrt",         (void*)lsw_sqrt},
+    {"ucrtbase.dll", "pow",          (void*)lsw_pow},
+    {"ucrtbase.dll", "sin",          (void*)lsw_sin},
+    {"ucrtbase.dll", "cos",          (void*)lsw_cos},
+    {"ucrtbase.dll", "exp",          (void*)lsw_exp},
+    /* ----------------------------------------------------------------
+     * vcruntime140.dll / api-ms-win-crt-* stubs
+     * ---------------------------------------------------------------- */
+    {"vcruntime140.dll", "__acrt_iob_func",              (void*)lsw___acrt_iob_func},
+    {"vcruntime140.dll", "__stdio_common_vfprintf",      (void*)lsw___stdio_common_vfprintf},
+    {"vcruntime140.dll", "__stdio_common_vsprintf",      (void*)lsw___stdio_common_vsprintf},
+    {"vcruntime140.dll", "__stdio_common_vsscanf",       (void*)lsw___stdio_common_vsscanf},
+    {"vcruntime140.dll", "__stdio_common_vswprintf",     (void*)lsw___stdio_common_vswprintf},
+    {"vcruntime140.dll", "__stdio_common_vfwprintf",     (void*)lsw___stdio_common_vfwprintf},
+    {"vcruntime140.dll", "_configure_narrow_argv",       (void*)lsw__configure_narrow_argv},
+    {"vcruntime140.dll", "_configure_wide_argv",         (void*)lsw__configure_wide_argv},
+    {"vcruntime140.dll", "_initialize_narrow_environment",(void*)lsw__initialize_narrow_environment},
+    {"vcruntime140.dll", "_initialize_wide_environment", (void*)lsw__initialize_wide_environment},
+    {"vcruntime140.dll", "_initialize_onexit_table",     (void*)lsw__initialize_onexit_table},
+    {"vcruntime140.dll", "_register_onexit_function",    (void*)lsw__register_onexit_function},
+    {"vcruntime140.dll", "_execute_onexit_table",        (void*)lsw__execute_onexit_table},
+    {"vcruntime140.dll", "__p___argc",                   (void*)lsw___p___argc},
+    {"vcruntime140.dll", "__p___argv",                   (void*)lsw___p___argv},
+    {"vcruntime140.dll", "__p__commode",                 (void*)lsw___p__commode},
+    {"vcruntime140.dll", "_crt_atexit",                  (void*)lsw__crt_atexit},
+    {"vcruntime140.dll", "__crt_at_quick_exit",          (void*)lsw___crt_at_quick_exit},
+    {"vcruntime140.dll", "__std_type_info_destroy_list", (void*)lsw___std_type_info_destroy_list},
+    {"vcruntime140.dll", "_CxxThrowException",           (void*)lsw__CxxThrowException},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__acrt_iob_func",          (void*)lsw___acrt_iob_func},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vfprintf",  (void*)lsw___stdio_common_vfprintf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsprintf",  (void*)lsw___stdio_common_vsprintf},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_configure_narrow_argv",   (void*)lsw__configure_narrow_argv},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment", (void*)lsw__initialize_narrow_environment},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table", (void*)lsw__initialize_onexit_table},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_register_onexit_function",(void*)lsw__register_onexit_function},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_execute_onexit_table",    (void*)lsw__execute_onexit_table},
+    {"api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit",              (void*)lsw__crt_atexit},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "floor",    (void*)lsw_floor},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "ceil",     (void*)lsw_ceil},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "sqrt",     (void*)lsw_sqrt},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "pow",      (void*)lsw_pow},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "sin",      (void*)lsw_sin},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "cos",      (void*)lsw_cos},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "exp",      (void*)lsw_exp},
+    {"api-ms-win-crt-math-l1-1-0.dll",    "fabs",     (void*)lsw_fabs},
+    {"api-ms-win-crt-string-l1-1-0.dll",  "strcpy",   (void*)lsw_strcpy},
+    {"api-ms-win-crt-string-l1-1-0.dll",  "strlen",   (void*)lsw_strlen},
+    {"api-ms-win-crt-string-l1-1-0.dll",  "strcmp",   (void*)lsw_strcmp},
+    {"api-ms-win-crt-string-l1-1-0.dll",  "strncmp",  (void*)lsw_strncmp},
+    {"api-ms-win-crt-string-l1-1-0.dll",  "strstr",   (void*)lsw_strstr},
+    {"api-ms-win-crt-convert-l1-1-0.dll", "atoi",     (void*)lsw_atoi},
+    {"api-ms-win-crt-convert-l1-1-0.dll", "atof",     (void*)lsw_atof},
+    {"api-ms-win-crt-convert-l1-1-0.dll", "strtol",   (void*)lsw_strtol},
+    {"api-ms-win-crt-convert-l1-1-0.dll", "strtod",   (void*)lsw_strtod},
+    {"api-ms-win-crt-heap-l1-1-0.dll",    "malloc",   (void*)lsw_malloc},
+    {"api-ms-win-crt-heap-l1-1-0.dll",    "free",     (void*)lsw_free},
+    {"api-ms-win-crt-heap-l1-1-0.dll",    "calloc",   (void*)lsw_calloc},
+    {"api-ms-win-crt-heap-l1-1-0.dll",    "realloc",  (void*)lsw_realloc},
+    /* ----------------------------------------------------------------
+     * KERNEL32.dll — new APIs added in this session
+     * ---------------------------------------------------------------- */
+    {"KERNEL32.dll", "GetCurrentThread",         (void*)lsw_GetCurrentThread},
+    {"KERNEL32.dll", "GetCurrentProcess",        (void*)lsw_GetCurrentProcess},
+    {"KERNEL32.dll", "GetCurrentThreadId",       (void*)lsw_GetCurrentThreadId},
+    {"KERNEL32.dll", "GetSystemTimeAsFileTime",  (void*)lsw_GetSystemTimeAsFileTime},
+    {"KERNEL32.dll", "GetSystemTime",            (void*)lsw_GetSystemTime},
+    {"KERNEL32.dll", "GetLocalTime",             (void*)lsw_GetLocalTime},
+    {"KERNEL32.dll", "FileTimeToSystemTime",     (void*)lsw_FileTimeToSystemTime},
+    {"KERNEL32.dll", "SystemTimeToFileTime",     (void*)lsw_SystemTimeToFileTime},
+    {"KERNEL32.dll", "QueryPerformanceCounter",  (void*)lsw_QueryPerformanceCounter},
+    {"KERNEL32.dll", "QueryPerformanceFrequency",(void*)lsw_QueryPerformanceFrequency},
+    {"KERNEL32.dll", "AllocConsole",             (void*)lsw_AllocConsole},
+    {"KERNEL32.dll", "FreeConsole",              (void*)lsw_FreeConsole},
+    {"KERNEL32.dll", "AttachConsole",            (void*)lsw_AttachConsole},
+    {"KERNEL32.dll", "GetConsoleWindow",         (void*)lsw_GetConsoleWindow},
+    {"KERNEL32.dll", "SetConsoleTitleA",         (void*)lsw_SetConsoleTitleA},
+    {"KERNEL32.dll", "SetConsoleTitleW",         (void*)lsw_SetConsoleTitleW},
+    {"KERNEL32.dll", "GetConsoleMode",           (void*)lsw_GetConsoleMode},
+    {"KERNEL32.dll", "SetConsoleMode",           (void*)lsw_SetConsoleMode},
+    {"KERNEL32.dll", "WriteConsoleW",            (void*)lsw_WriteConsoleW},
+    {"KERNEL32.dll", "ReadConsoleA",             (void*)lsw_ReadConsoleA},
+    {"KERNEL32.dll", "ReadConsoleW",             (void*)lsw_ReadConsoleW},
+    {"KERNEL32.dll", "GetFileType",              (void*)lsw_GetFileType},
+    {"KERNEL32.dll", "DuplicateHandle",          (void*)lsw_DuplicateHandle},
+    {"KERNEL32.dll", "OutputDebugStringA",       (void*)lsw_OutputDebugStringA},
+    {"KERNEL32.dll", "OutputDebugStringW",       (void*)lsw_OutputDebugStringW},
+    {"KERNEL32.dll", "CreateDirectoryA",         (void*)lsw_CreateDirectoryA},
+    {"KERNEL32.dll", "GetFileAttributesA",       (void*)lsw_GetFileAttributesA},
+    {"KERNEL32.dll", "GetFullPathNameA",         (void*)lsw_GetFullPathNameA},
+    {"KERNEL32.dll", "GetFullPathNameW",         (void*)lsw_GetFullPathNameW},
+    {"KERNEL32.dll", "SetCurrentDirectoryA",     (void*)lsw_SetCurrentDirectoryA},
+    {"KERNEL32.dll", "SetCurrentDirectoryW",     (void*)lsw_SetCurrentDirectoryW},
+    {"KERNEL32.dll", "GetCurrentDirectoryA",     (void*)lsw_GetCurrentDirectoryA},
+    {"KERNEL32.dll", "GetCurrentDirectoryW",     (void*)lsw_GetCurrentDirectoryW},
+    {"KERNEL32.dll", "MoveFileA",                (void*)lsw_MoveFileA},
+    {"KERNEL32.dll", "MoveFileW",                (void*)lsw_MoveFileW},
+    {"KERNEL32.dll", "CopyFileA",                (void*)lsw_CopyFileA},
+    {"KERNEL32.dll", "FindFirstFileA",           (void*)lsw_FindFirstFileA},
+    {"KERNEL32.dll", "FindNextFileA",            (void*)lsw_FindNextFileA},
+    {"KERNEL32.dll", "WaitForMultipleObjects",   (void*)lsw_WaitForMultipleObjects},
+    {"KERNEL32.dll", "CreateMutexA",             (void*)lsw_CreateMutexA},
+    {"KERNEL32.dll", "OpenMutexA",               (void*)lsw_OpenMutexA},
+    {"KERNEL32.dll", "ReleaseMutex",             (void*)lsw_ReleaseMutex},
+    {"KERNEL32.dll", "CreateSemaphoreA",         (void*)lsw_CreateSemaphoreA},
+    {"KERNEL32.dll", "CreateSemaphoreW",         (void*)lsw_CreateSemaphoreW},
+    {"KERNEL32.dll", "ReleaseSemaphore",         (void*)lsw_ReleaseSemaphore},
+    {"KERNEL32.dll", "InitOnceExecuteOnce",      (void*)lsw_InitOnceExecuteOnce},
+    {"KERNEL32.dll", "SetHandleInformation",     (void*)lsw_SetHandleInformation},
+    {"KERNEL32.dll", "GetHandleInformation",     (void*)lsw_GetHandleInformation},
+    {"KERNEL32.dll", "GetCommandLineW",          (void*)lsw_GetCommandLineW},
+    {"KERNEL32.dll", "RtlMoveMemory",            (void*)lsw_RtlMoveMemory},
+    {"KERNEL32.dll", "RtlFillMemory",            (void*)lsw_RtlFillMemory},
+    {"KERNEL32.dll", "RtlZeroMemory",            (void*)lsw_RtlZeroMemory},
+    {"KERNEL32.dll", "ZeroMemory",               (void*)lsw_ZeroMemory},
+    {"KERNEL32.dll", "FillMemory",               (void*)lsw_FillMemory},
+    {"KERNEL32.dll", "CopyMemory",               (void*)lsw_CopyMemory},
+    {"KERNEL32.dll", "MoveMemory",               (void*)lsw_MoveMemory},
+    {"KERNEL32.dll", "CharToOemA",               (void*)lsw_CharToOemA},
+    {"KERNEL32.dll", "OemToCharA",               (void*)lsw_OemToCharA},
 };
 
 #pragma GCC diagnostic pop
@@ -3393,7 +4189,99 @@ void win32_api_init(void) {
     LSW_LOG_INFO("Initialized %zu Win32 API mappings", api_mappings_count);
 }
 
+void* win32_api_get_generic_stub(void) {
+    return (void*)(uintptr_t)generic_stub;
+}
+
+/*
+ * Ordinal-to-name tables for the most common DLLs.
+ * Only well-known, frequently-encountered ordinals are listed.
+ * For any DLL/ordinal pair not found here the generic stub is returned
+ * so that IAT patching still succeeds (the app won't crash on import,
+ * and will only fail if it actually calls the unresolved function).
+ */
+typedef struct {
+    const char* dll_name;
+    uint16_t    ordinal;
+    const char* function_name;
+} lsw_ordinal_entry_t;
+
+static const lsw_ordinal_entry_t ordinal_table[] = {
+    /* ws2_32.dll — documented ordinals (Windows SDK) */
+    {"ws2_32.dll",  1, "bind"},
+    {"ws2_32.dll",  2, "closesocket"},
+    {"ws2_32.dll",  3, "connect"},
+    {"ws2_32.dll",  4, "getpeername"},
+    {"ws2_32.dll",  5, "getsockname"},
+    {"ws2_32.dll",  6, "getsockopt"},
+    {"ws2_32.dll",  7, "htonl"},
+    {"ws2_32.dll",  8, "htons"},
+    {"ws2_32.dll",  9, "ioctlsocket"},
+    {"ws2_32.dll", 10, "inet_addr"},
+    {"ws2_32.dll", 11, "inet_ntoa"},
+    {"ws2_32.dll", 12, "listen"},
+    {"ws2_32.dll", 13, "ntohl"},
+    {"ws2_32.dll", 14, "ntohs"},
+    {"ws2_32.dll", 15, "recv"},
+    {"ws2_32.dll", 16, "recvfrom"},
+    {"ws2_32.dll", 17, "select"},
+    {"ws2_32.dll", 18, "send"},
+    {"ws2_32.dll", 19, "sendto"},
+    {"ws2_32.dll", 20, "setsockopt"},
+    {"ws2_32.dll", 21, "shutdown"},
+    {"ws2_32.dll", 22, "socket"},
+    {"ws2_32.dll", 23, "GetAddrInfoW"},
+    {"ws2_32.dll", 24, "GetNameInfoW"},
+    {"ws2_32.dll", 51, "gethostbyaddr"},
+    {"ws2_32.dll", 52, "gethostbyname"},
+    {"ws2_32.dll", 53, "getprotobyname"},
+    {"ws2_32.dll", 54, "getprotobynumber"},
+    {"ws2_32.dll", 55, "getservbyname"},
+    {"ws2_32.dll", 56, "getservbyport"},
+    {"ws2_32.dll", 57, "gethostname"},
+    {"ws2_32.dll",111, "WSAAsyncGetHostByAddr"},
+    {"ws2_32.dll",112, "WSAAsyncGetHostByName"},
+    {"ws2_32.dll",113, "WSAAsyncGetProtoByName"},
+    {"ws2_32.dll",114, "WSAAsyncGetProtoByNumber"},
+    {"ws2_32.dll",115, "WSAStartup"},
+    {"ws2_32.dll",116, "WSACleanup"},
+    {"ws2_32.dll",117, "WSASetLastError"},
+    {"ws2_32.dll",118, "WSAGetLastError"},
+    /* ntdll.dll — ordinals used by some apps */
+    {"ntdll.dll",   0, "RtlAllocateHeap"},
+    {"ntdll.dll",   2, "RtlFreeHeap"},
+    /* {sentinel} */
+    {NULL, 0, NULL}
+};
+
+void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal) {
+    /* First: walk the ordinal_table to map ordinal → function name */
+    for (int i = 0; ordinal_table[i].dll_name != NULL; i++) {
+        if (strcasecmp(ordinal_table[i].dll_name, dll_name) == 0 &&
+            ordinal_table[i].ordinal == ordinal) {
+            /* Found a name — resolve through the normal table */
+            const char* fn = ordinal_table[i].function_name;
+            void* addr = win32_api_resolve(dll_name, fn);
+            if (addr) {
+                LSW_LOG_DEBUG("Ordinal %s!#%u -> %s -> %p", dll_name, ordinal, fn, addr);
+                return addr;
+            }
+        }
+    }
+    /* Unknown ordinal — caller will use generic_stub */
+    LSW_LOG_WARN("Unknown ordinal %s!#%u — caller will use generic stub", dll_name, ordinal);
+    return NULL;
+}
+
+
+/* Secondary mapping tables from ntdll_api.c and user32_api.c */
+extern const win32_api_mapping_t win32_api_ntdll_mappings[];
+extern const size_t               win32_api_ntdll_mappings_count;
+extern const win32_api_mapping_t win32_api_user32_mappings[];
+extern const size_t               win32_api_user32_mappings_count;
+
 void* win32_api_resolve(const char* dll_name, const char* function_name) {
+    /* Primary table */
     for (size_t i = 0; i < api_mappings_count; i++) {
         if (strcasecmp(api_mappings[i].dll_name, dll_name) == 0 &&
             strcmp(api_mappings[i].function_name, function_name) == 0) {
@@ -3401,9 +4289,24 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
             return api_mappings[i].implementation;
         }
     }
-    
+    /* ntdll secondary table */
+    for (size_t i = 0; i < win32_api_ntdll_mappings_count; i++) {
+        if (strcasecmp(win32_api_ntdll_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_ntdll_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(ntdll) %s!%s -> %p", dll_name, function_name, win32_api_ntdll_mappings[i].implementation);
+            return win32_api_ntdll_mappings[i].implementation;
+        }
+    }
+    /* user32/gdi32 secondary table */
+    for (size_t i = 0; i < win32_api_user32_mappings_count; i++) {
+        if (strcasecmp(win32_api_user32_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_user32_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(user32) %s!%s -> %p", dll_name, function_name, win32_api_user32_mappings[i].implementation);
+            return win32_api_user32_mappings[i].implementation;
+        }
+    }
+
     LSW_LOG_WARN("Could not resolve %s!%s - returning stub", dll_name, function_name);
-    // Cast through uintptr_t to avoid pedantic warning
     return (void*)(uintptr_t)generic_stub;
 }
 

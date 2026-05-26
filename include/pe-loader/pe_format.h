@@ -248,4 +248,41 @@ typedef struct {
     uint32_t AddressOfNameOrdinals;
 } pe_export_directory_t;
 
+// TLS Directory (32-bit)
+// All addresses are VA (virtual addresses) in the mapped image.
+typedef struct {
+    uint32_t StartAddressOfRawData;
+    uint32_t EndAddressOfRawData;
+    uint32_t AddressOfIndex;        // PDWORD — index in TLS array
+    uint32_t AddressOfCallBacks;    // PIMAGE_TLS_CALLBACK* — NULL-terminated list
+    uint32_t SizeOfZeroFill;
+    uint32_t Characteristics;
+} pe_tls_directory32_t;
+
+// TLS Directory (64-bit)
+typedef struct {
+    uint64_t StartAddressOfRawData;
+    uint64_t EndAddressOfRawData;
+    uint64_t AddressOfIndex;
+    uint64_t AddressOfCallBacks;
+    uint32_t SizeOfZeroFill;
+    uint32_t Characteristics;
+} pe_tls_directory64_t;
+
+// TLS Callback prototype: called with (DllHandle, Reason, Reserved)
+// Reason: 1=DLL_PROCESS_ATTACH, 0=DLL_PROCESS_DETACH, 2=DLL_THREAD_ATTACH, 3=DLL_THREAD_DETACH
+typedef void (__attribute__((ms_abi)) *pe_tls_callback_t)(void* dll_handle, uint32_t reason, void* reserved);
+
+// Delay-Load Import Descriptor
+typedef struct {
+    uint32_t Attributes;        // must be 1 (RVA-based)
+    uint32_t DllNameRVA;
+    uint32_t ModuleHandleRVA;   // PHMODULE
+    uint32_t ImportAddressTableRVA;
+    uint32_t ImportNameTableRVA;
+    uint32_t BoundImportAddressTableRVA;
+    uint32_t UnloadInformationTableRVA;
+    uint32_t TimeDateStamp;
+} pe_delay_load_descriptor_t;
+
 #endif // LSW_PE_FORMAT_H
