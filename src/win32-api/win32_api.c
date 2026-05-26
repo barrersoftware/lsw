@@ -6,6 +6,8 @@
  * Win32 API - Function mapping implementation
  */
 
+#define _GNU_SOURCE  /* strdup, wcsdup, readlink, symlink, ftruncate */
+
 #include "win32_api.h"
 #include "win32_teb.h"
 #include "lsw_log.h"
@@ -38,10 +40,38 @@
 #include <sys/statvfs.h>
 #include <sched.h>
 #include <ctype.h>
+#include <sys/wait.h>
+#include <sys/un.h>    /* Unix domain sockets for named pipes */
+#include <malloc.h>   /* malloc_usable_size */
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
 #define LSW_IOCTL_SYSCALL _IOWR(LSW_IOCTL_MAGIC, 5, struct lsw_syscall_request)
+
+/* Forward declarations */
+static void createprocess_win_to_linux(const char* wpath, char* out, size_t outsz);
+
+/* ---- PE module handle ---- */
+#define LSW_PE_HMODULE_MAGIC 0x5045484DU  /* "PEHM" */
+struct lsw_pe_hmodule_s {
+    uint32_t magic;
+    char dll_name[128];
+    void*  image_base;
+    size_t image_size;
+    void*  export_dir;
+    uint32_t export_dir_size;
+};
+typedef struct lsw_pe_hmodule_s lsw_pe_hmodule_t;
+
+/* ---- Named pipe handle ---- */
+#define LSW_PIPE_MAGIC 0x50495045U  /* "PIPE" */
+struct lsw_pipe_s {
+    uint32_t magic;
+    int listen_fd;
+    int client_fd;
+    char path[128];
+};
+typedef struct lsw_pipe_s lsw_pipe_t;
 
 // Code page constants
 #define CP_ACP 0        // ANSI code page
@@ -697,19 +727,37 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
 }
 
 int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
-    if (handle == INVALID_HANDLE_VALUE || !handle) {
-        return 0;
+    if (handle == INVALID_HANDLE_VALUE || !handle) return 0;
+
+    /* Named pipe handle */
+    {
+        lsw_pipe_t* pp = (lsw_pipe_t*)handle;
+        if (pp->magic == LSW_PIPE_MAGIC) {
+            if (pp->client_fd >= 0) { close(pp->client_fd); pp->client_fd = -1; }
+            if (pp->listen_fd >= 0) { close(pp->listen_fd); unlink(pp->path); pp->listen_fd = -1; }
+            pp->magic = 0;
+            return 1;
+        }
     }
-    
-    // Check if it's a file descriptor
+
+    /* PE module handle */
+    {
+        lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)handle;
+        if (pem->magic == LSW_PE_HMODULE_MAGIC) {
+            if (pem->image_base) munmap(pem->image_base, pem->image_size);
+            pem->magic = 0;
+            return 1;
+        }
+    }
+
+    /* Raw file descriptor */
     intptr_t fd = (intptr_t)handle;
     if (fd >= 0 && fd < 1024) {
         close((int)fd);
         LSW_LOG_INFO("CloseHandle: fd=%d", (int)fd);
         return 1;
     }
-    
-    // For other handles (events, etc.), just return success for now
+
     LSW_LOG_INFO("CloseHandle: handle=%p (non-fd)", handle);
     return 1;
 }
@@ -793,16 +841,25 @@ int __attribute__((ms_abi)) lsw_WriteConsoleA(void* handle, const void* buffer, 
 }
 
 int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint32_t bytes_to_write, uint32_t* bytes_written, void* overlapped) {
-    (void)overlapped; // Not used for console I/O
+    (void)overlapped;
     
+    if (!handle || !buffer) { if (bytes_written) *bytes_written = 0; return 0; }
+
+    /* Named pipe handle — write to Unix domain socket fd */
+    {
+        lsw_pipe_t* pp = (lsw_pipe_t*)handle;
+        if (pp->magic == LSW_PIPE_MAGIC) {
+            int pfd = pp->client_fd >= 0 ? pp->client_fd : -1;
+            if (pfd < 0) { if (bytes_written) *bytes_written = 0; return 0; }
+            ssize_t r = write(pfd, buffer, bytes_to_write);
+            if (bytes_written) *bytes_written = r < 0 ? 0 : (uint32_t)r;
+            return r >= 0 ? 1 : 0;
+        }
+    }
+
     LSW_LOG_INFO("WriteFile called: handle=%p, buffer=%p, bytes=%u", handle, buffer, bytes_to_write);
     LSW_LOG_INFO("  Buffer content (first 32 bytes): %.32s", buffer ? (const char*)buffer : "(null)");
     LSW_LOG_INFO("  bytes_written ptr: %p", bytes_written);
-    
-    if (!handle || !buffer) {
-        if (bytes_written) *bytes_written = 0;
-        return 0;
-    }
     
     // If kernel fd is available, route through kernel module
     if (g_kernel_fd >= 0) {
@@ -855,14 +912,23 @@ int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint
 }
 
 int __attribute__((ms_abi)) lsw_ReadFile(void* handle, void* buffer, uint32_t bytes_to_read, uint32_t* bytes_read, void* overlapped) {
-    (void)overlapped; // Not used yet
+    (void)overlapped;
     
-    LSW_LOG_INFO("ReadFile called: handle=%p, buffer=%p, bytes=%u", handle, buffer, bytes_to_read);
-    
-    if (!handle || !buffer) {
-        if (bytes_read) *bytes_read = 0;
-        return 0;
+    if (!handle || !buffer) { if (bytes_read) *bytes_read = 0; return 0; }
+
+    /* Named pipe handle — read from Unix domain socket fd */
+    {
+        lsw_pipe_t* pp = (lsw_pipe_t*)handle;
+        if (pp->magic == LSW_PIPE_MAGIC) {
+            int pfd = pp->client_fd >= 0 ? pp->client_fd : -1;
+            if (pfd < 0) { if (bytes_read) *bytes_read = 0; return 0; }
+            ssize_t r = read(pfd, buffer, bytes_to_read);
+            if (bytes_read) *bytes_read = r < 0 ? 0 : (uint32_t)r;
+            return r >= 0 ? 1 : 0;
+        }
     }
+
+    LSW_LOG_INFO("ReadFile called: handle=%p, buffer=%p, bytes=%u", handle, buffer, bytes_to_read);
     
     // If kernel fd is available, route through kernel module
     if (g_kernel_fd >= 0) {
@@ -2270,8 +2336,34 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
         LSW_LOG_ERROR("WaitForSingleObject: null handle");
         return 0xFFFFFFFF; // WAIT_FAILED
     }
-    
-    // Route through kernel
+
+    /* Check if handle looks like a child PID from CreateProcess */
+    pid_t pid = (pid_t)(uintptr_t)handle;
+    if (pid > 1 && pid < 65536) {
+        int wstatus = 0;
+        if (milliseconds == 0xFFFFFFFF) {
+            /* INFINITE — block until child exits */
+            pid_t r = waitpid(pid, &wstatus, 0);
+            if (r == pid) { LSW_LOG_INFO("WaitForSingleObject: child %d exited", pid); return 0; }
+        } else if (milliseconds == 0) {
+            pid_t r = waitpid(pid, &wstatus, WNOHANG);
+            if (r == pid) return 0;
+            return 0x00000102; /* WAIT_TIMEOUT */
+        } else {
+            /* Poll with exponential backoff up to timeout */
+            uint32_t waited = 0, step = 5;
+            while (waited < milliseconds) {
+                pid_t r = waitpid(pid, &wstatus, WNOHANG);
+                if (r == pid) { LSW_LOG_INFO("WaitForSingleObject: child %d exited", pid); return 0; }
+                usleep(step * 1000);
+                waited += step;
+                if (step < 100) step *= 2;
+            }
+            return 0x00000102; /* WAIT_TIMEOUT */
+        }
+    }
+
+    // Route through kernel for non-process handles
     if (g_kernel_fd >= 0) {
         LSW_LOG_INFO("Routing WaitForSingleObject through kernel!");
         
@@ -2300,6 +2392,60 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
     return 0; // WAIT_OBJECT_0
 }
 
+/*
+ * PE DLL handle table — maps "fake" HMODULE handles to PE images loaded via
+ * the DLL chain loader.  Allows GetProcAddress to look up exported symbols.
+ */
+/* LSW_PE_HMODULE_MAGIC and lsw_pe_hmodule_t defined at top of file */
+
+static lsw_pe_hmodule_t  g_pe_modules[64];
+static int               g_pe_module_count = 0;
+static pthread_mutex_t   g_pe_module_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Return symbol address from a PE export directory */
+static void* pe_hmodule_get_proc(lsw_pe_hmodule_t* mod, const char* name) {
+    if (!mod->export_dir || !name) return NULL;
+    uint8_t* base = (uint8_t*)mod->image_base;
+    /* IMAGE_EXPORT_DIRECTORY offsets */
+    uint32_t* expdir = (uint32_t*)mod->export_dir;
+    uint32_t num_names = expdir[6];     /* NumberOfNames */
+    uint32_t names_rva = expdir[8];     /* AddressOfNames */
+    uint32_t ords_rva  = expdir[9];     /* AddressOfNameOrdinals */
+    uint32_t funcs_rva = expdir[7];     /* AddressOfFunctions */
+    uint32_t* names = (uint32_t*)(base + names_rva);
+    uint16_t* ords  = (uint16_t*)(base + ords_rva);
+    uint32_t* funcs = (uint32_t*)(base + funcs_rva);
+    for (uint32_t i = 0; i < num_names; i++) {
+        const char* ename = (const char*)(base + names[i]);
+        if (strcmp(ename, name) == 0) {
+            uint32_t fn_rva = funcs[ords[i]];
+            return (void*)(base + fn_rva);
+        }
+    }
+    return NULL;
+}
+
+/* Known Win32 system DLL names — return fake handle, GetProcAddress routes to stubs */
+static int is_system_dll(const char* name) {
+    static const char* system_dlls[] = {
+        "kernel32.dll","kernelbase.dll","user32.dll","gdi32.dll",
+        "ntdll.dll","advapi32.dll","shell32.dll","shlwapi.dll",
+        "ole32.dll","oleaut32.dll","comctl32.dll","msvcrt.dll",
+        "ucrtbase.dll","ws2_32.dll","ws2_32","msvcp140.dll",
+        "vcruntime140.dll","vcruntime140_1.dll","msvcp_win.dll",
+        NULL
+    };
+    char lower[128]; size_t n = strlen(name);
+    if (n >= sizeof(lower)) n = sizeof(lower)-1;
+    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)name[i]);
+    lower[n] = '\0';
+    for (int i = 0; system_dlls[i]; i++)
+        if (strcmp(lower, system_dlls[i]) == 0) return 1;
+    return 0;
+}
+
+#define LSW_SYSTEM_HMODULE ((void*)0xDEADBEEF)
+
 void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
 {
     LSW_LOG_INFO("LoadLibraryA called: %s", filename ? filename : "(null)");
@@ -2309,42 +2455,133 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
         return NULL;
     }
     
-    // Convert Windows DLL name to Linux SO name
-    char linux_path[512];
-    
-    // Check if it's a system DLL we're providing
-    if (strcasecmp(filename, "kernel32.dll") == 0 ||
-        strcasecmp(filename, "user32.dll") == 0 ||
-        strcasecmp(filename, "gdi32.dll") == 0) {
-        // These are provided by LSW itself - return a fake handle
-        // The PE loader will map their functions
-        LSW_LOG_INFO("LoadLibraryA: System DLL %s (returning fake handle)", filename);
-        return (void*)0xDEADBEEF;  // Fake handle for system DLLs
+    /* Get just the basename for system-DLL check */
+    const char* base = strrchr(filename, '\\');
+    if (!base) base = strrchr(filename, '/');
+    base = base ? base + 1 : filename;
+
+    /* System DLLs provided by LSW itself */
+    if (is_system_dll(base)) {
+        LSW_LOG_INFO("LoadLibraryA: system DLL %s -> fake handle", base);
+        return LSW_SYSTEM_HMODULE;
     }
     
-    // Try to load as Linux shared library
-    const char* so_name = filename;
-    if (strstr(filename, ".dll") || strstr(filename, ".DLL")) {
-        // Convert foo.dll -> libfoo.so
-        char dll_name[256];
-        strncpy(dll_name, filename, sizeof(dll_name) - 1);
-        char* dot = strrchr(dll_name, '.');
-        if (dot) *dot = '\0';
-        
-        snprintf(linux_path, sizeof(linux_path), "lib%s.so", dll_name);
-        so_name = linux_path;
+    /* If it's a .dll file, try to load it as a PE via the DLL chain loader */
+    const char* ext = strrchr(base, '.');
+    if (ext && strcasecmp(ext, ".dll") == 0) {
+        /* Search for the file on disk using the chain loader search paths */
+        static const char* search_dirs[] = {
+            NULL, /* filled from LSW_SYSTEM32 */
+            "~/.lsw/system32",
+            "~/.wine/drive_c/windows/system32",
+            "/opt/lsw/system32",
+            "/usr/share/lsw/system32",
+            NULL
+        };
+        const char* env_s32 = getenv("LSW_SYSTEM32");
+        search_dirs[0] = env_s32; /* may be NULL — skip */
+
+        char found[512] = {0};
+        /* First check if it's an absolute/relative path that exists directly */
+        {
+            char try[512];
+            createprocess_win_to_linux(filename, try, sizeof(try));
+            if (access(try, R_OK) == 0) strncpy(found, try, sizeof(found)-1);
+        }
+        if (!found[0]) {
+            char lower_base[128];
+            strncpy(lower_base, base, sizeof(lower_base)-1); lower_base[sizeof(lower_base)-1]='\0';
+            for (char* p = lower_base; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+            for (int di = 0; search_dirs[di] && !found[0]; di++) {
+                const char* dir = search_dirs[di];
+                if (!dir) continue;
+                /* Expand ~ */
+                char full_dir[512];
+                if (dir[0] == '~') {
+                    const char* home = getenv("HOME"); if (!home) home = "/root";
+                    snprintf(full_dir, sizeof(full_dir), "%s%s", home, dir + 1);
+                    dir = full_dir;
+                }
+                char try1[512], try2[512];
+                snprintf(try1, sizeof(try1), "%s/%s", dir, base);
+                snprintf(try2, sizeof(try2), "%s/%s", dir, lower_base);
+                if (access(try1, R_OK) == 0) strncpy(found, try1, sizeof(found)-1);
+                else if (access(try2, R_OK) == 0) strncpy(found, try2, sizeof(found)-1);
+            }
+        }
+
+        if (found[0]) {
+            LSW_LOG_INFO("LoadLibraryA: loading PE DLL %s from %s", base, found);
+            /* mmap + parse PE export directory */
+            int fd = open(found, O_RDONLY);
+            if (fd >= 0) {
+                struct stat st; fstat(fd, &st);
+                void* file_data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
+                if (file_data != MAP_FAILED) {
+                    /* Quick PE validity check */
+                    uint8_t* fd8 = (uint8_t*)file_data;
+                    if (fd8[0] == 'M' && fd8[1] == 'Z') {
+                        uint32_t pe_off = *(uint32_t*)(fd8 + 0x3C);
+                        if (pe_off + 4 < (uint32_t)st.st_size &&
+                            fd8[pe_off]=='P' && fd8[pe_off+1]=='E') {
+                            /* Allocate executable copy */
+                            void* image = mmap(NULL, (size_t)st.st_size,
+                                PROT_READ|PROT_WRITE|PROT_EXEC,
+                                MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                            if (image != MAP_FAILED) {
+                                memcpy(image, file_data, (size_t)st.st_size);
+                                munmap(file_data, (size_t)st.st_size);
+                                /* Locate export directory */
+                                uint8_t* b = (uint8_t*)image;
+                                uint32_t pe_off2 = *(uint32_t*)(b + 0x3C);
+                                uint32_t export_rva = *(uint32_t*)(b + pe_off2 + 24 + 112); /* OptHdr+DataDir[0].VirtualAddress */
+                                uint32_t export_sz  = *(uint32_t*)(b + pe_off2 + 24 + 116);
+                                pthread_mutex_lock(&g_pe_module_lock);
+                                int slot = g_pe_module_count < 64 ? g_pe_module_count++ : -1;
+                                pthread_mutex_unlock(&g_pe_module_lock);
+                                if (slot >= 0) {
+                                    lsw_pe_hmodule_t* mod = &g_pe_modules[slot];
+                                    mod->magic = LSW_PE_HMODULE_MAGIC;
+                                    strncpy(mod->dll_name, base, sizeof(mod->dll_name)-1);
+                                    mod->image_base = image;
+                                    mod->image_size = (size_t)st.st_size;
+                                    mod->export_dir = export_rva ? (b + export_rva) : NULL;
+                                    mod->export_dir_size = export_sz;
+                                    LSW_LOG_INFO("LoadLibraryA: PE DLL loaded -> slot %d, base %p", slot, image);
+                                    return (void*)mod;
+                                }
+                            } else {
+                                munmap(file_data, (size_t)st.st_size);
+                            }
+                        }
+                    }
+                    munmap(file_data, (size_t)st.st_size);
+                }
+            }
+        }
+        /* Fall through: no .dll found on disk, warn and return fake handle */
+        LSW_LOG_WARN("LoadLibraryA: %s not found on disk — returning system handle", base);
+        return LSW_SYSTEM_HMODULE;
     }
-    
-    LSW_LOG_INFO("LoadLibraryA: Attempting to load %s as %s", filename, so_name);
-    
-    void* handle = dlopen(so_name, RTLD_NOW | RTLD_LOCAL);
-    
+
+    /* Non-DLL: try dlopen as a Linux shared library */
+    LSW_LOG_INFO("LoadLibraryA: attempting dlopen for %s", filename);
+    void* handle = dlopen(filename, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        /* Try libfoo.so conversion */
+        char so_name[512];
+        char dll_name[256]; strncpy(dll_name, base, sizeof(dll_name)-1);
+        char* dot = strrchr(dll_name, '.'); if (dot) *dot = '\0';
+        snprintf(so_name, sizeof(so_name), "lib%s.so", dll_name);
+        handle = dlopen(so_name, RTLD_NOW | RTLD_LOCAL);
+    }
     if (!handle) {
         LSW_LOG_ERROR("LoadLibraryA: dlopen failed: %s", dlerror());
         return NULL;
     }
-    
-    LSW_LOG_INFO("LoadLibraryA: Successfully loaded %s at %p", so_name, handle);
+    LSW_LOG_INFO("LoadLibraryA: dlopen succeeded -> %p", handle);
     return handle;
 }
 
@@ -2356,27 +2593,36 @@ void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_
         LSW_LOG_ERROR("GetProcAddress: null module");
         return NULL;
     }
-    
     if (!proc_name) {
         LSW_LOG_ERROR("GetProcAddress: null proc_name");
         return NULL;
     }
-    
-    // Check if it's a system DLL fake handle
-    if (module == (void*)0xDEADBEEF) {
-        // System DLL - return NULL, let PE loader handle it
-        LSW_LOG_INFO("GetProcAddress: System DLL function %s (letting PE loader resolve)", proc_name);
+
+    /* PE module handle? */
+    lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)module;
+    if (pem->magic == LSW_PE_HMODULE_MAGIC) {
+        /* First check our Win32 stub tables (highest priority) */
+        void* addr = win32_api_resolve(pem->dll_name, proc_name);
+        if (!addr) addr = pe_hmodule_get_proc(pem, proc_name);
+        if (addr) { LSW_LOG_INFO("GetProcAddress: PE %s!%s -> %p", pem->dll_name, proc_name, addr); }
+        else { LSW_LOG_WARN("GetProcAddress: PE %s!%s not found", pem->dll_name, proc_name); }
+        return addr;
+    }
+
+    /* System fake handle — resolve from our Win32 stubs */
+    if (module == LSW_SYSTEM_HMODULE) {
+        void* addr = win32_api_resolve_any(proc_name);
+        if (addr) { LSW_LOG_INFO("GetProcAddress: system stub %s -> %p", proc_name, addr); return addr; }
+        LSW_LOG_WARN("GetProcAddress: system stub %s not found", proc_name);
         return NULL;
     }
     
-    // Real dlopen handle - use dlsym
+    /* Real dlopen handle */
     void* addr = dlsym(module, proc_name);
-    
     if (!addr) {
         LSW_LOG_WARN("GetProcAddress: dlsym failed: %s", dlerror());
         return NULL;
     }
-    
     LSW_LOG_INFO("GetProcAddress: Found %s at %p", proc_name, addr);
     return addr;
 }
@@ -3380,6 +3626,136 @@ double __attribute__((ms_abi)) lsw_sin(double x)    { return sin(x); }
 double __attribute__((ms_abi)) lsw_cos(double x)    { return cos(x); }
 double __attribute__((ms_abi)) lsw_tan(double x)    { return tan(x); }
 double __attribute__((ms_abi)) lsw_atan2(double y, double x) { return atan2(y, x); }
+double __attribute__((ms_abi)) lsw_atan(double x)  { return atan(x); }
+double __attribute__((ms_abi)) lsw_asin(double x)  { return asin(x); }
+double __attribute__((ms_abi)) lsw_acos(double x)  { return acos(x); }
+double __attribute__((ms_abi)) lsw_log2(double x)  { return log2(x); }
+double __attribute__((ms_abi)) lsw_fmod(double x, double y) { return fmod(x, y); }
+double __attribute__((ms_abi)) lsw_hypot(double x, double y){ return hypot(x, y); }
+double __attribute__((ms_abi)) lsw_ldexp(double x, int exp) { return ldexp(x, exp); }
+double __attribute__((ms_abi)) lsw_frexp(double x, int* e) { return frexp(x, e); }
+double __attribute__((ms_abi)) lsw_modf(double x, double* iptr){ return modf(x, iptr); }
+float  __attribute__((ms_abi)) lsw_sqrtf(float x)  { return sqrtf(x); }
+float  __attribute__((ms_abi)) lsw_sinf(float x)   { return sinf(x); }
+float  __attribute__((ms_abi)) lsw_cosf(float x)   { return cosf(x); }
+float  __attribute__((ms_abi)) lsw_powf(float x, float y) { return powf(x, y); }
+float  __attribute__((ms_abi)) lsw_fabsf(float x)  { return fabsf(x); }
+float  __attribute__((ms_abi)) lsw_floorf(float x) { return floorf(x); }
+float  __attribute__((ms_abi)) lsw_ceilf(float x)  { return ceilf(x); }
+float  __attribute__((ms_abi)) lsw_expf(float x)   { return expf(x); }
+float  __attribute__((ms_abi)) lsw_logf(float x)   { return logf(x); }
+float  __attribute__((ms_abi)) lsw_fmodf(float x, float y) { return fmodf(x, y); }
+
+// Time - localtime/gmtime/mktime
+struct tm* __attribute__((ms_abi)) lsw_localtime(const lsw_time_t* t)
+    { return localtime((const time_t*)t); }
+struct tm* __attribute__((ms_abi)) lsw_gmtime(const lsw_time_t* t)
+    { return gmtime((const time_t*)t); }
+lsw_time_t __attribute__((ms_abi)) lsw_mktime(struct tm* tm_)
+    { return (lsw_time_t)mktime(tm_); }
+char* __attribute__((ms_abi)) lsw_asctime(const struct tm* t) { return asctime(t); }
+char* __attribute__((ms_abi)) lsw_ctime(const lsw_time_t* t) { return ctime((const time_t*)t); }
+size_t __attribute__((ms_abi)) lsw_strftime(char* s, size_t max, const char* fmt, const struct tm* tm_)
+    { return strftime(s, max, fmt, tm_); }
+
+// Environment
+char* __attribute__((ms_abi)) lsw_getenv(const char* n) { return getenv(n); }
+int   __attribute__((ms_abi)) lsw__putenv(const char* s) { return putenv((char*)s); }
+
+// Security/safe string variants (CRT secure versions)
+int __attribute__((ms_abi)) lsw_strcpy_s(char* dst, size_t sz, const char* src) {
+    if (!dst || !sz) return 22; /* EINVAL */
+    strncpy(dst, src, sz); dst[sz-1] = 0; return 0;
+}
+int __attribute__((ms_abi)) lsw_strncpy_s(char* dst, size_t dsz, const char* src, size_t cnt) {
+    if (!dst || !dsz) return 22;
+    size_t n = cnt < dsz-1 ? cnt : dsz-1;
+    memcpy(dst, src, n); dst[n] = 0; return 0;
+}
+int __attribute__((ms_abi)) lsw_strcat_s(char* dst, size_t sz, const char* src) {
+    if (!dst || !sz) return 22;
+    size_t used = strlen(dst);
+    if (used >= sz) return 22;
+    strncat(dst, src, sz - used - 1); return 0;
+}
+int __attribute__((ms_abi)) lsw_sprintf_s(char* dst, size_t sz, const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vsnprintf(dst, sz, fmt, ap); va_end(ap); return r;
+}
+int __attribute__((ms_abi)) lsw_memcpy_s(void* dst, size_t dsz, const void* src, size_t cnt) {
+    if (cnt > dsz) return 22;
+    memcpy(dst, src, cnt); return 0;
+}
+int __attribute__((ms_abi)) lsw_memmove_s(void* dst, size_t dsz, const void* src, size_t cnt) {
+    if (cnt > dsz) return 22;
+    memmove(dst, src, cnt); return 0;
+}
+int __attribute__((ms_abi)) lsw_wcscpy_s(wchar_t* dst, size_t sz, const wchar_t* src) {
+    if (!dst || !sz) return 22;
+    wcsncpy(dst, src, sz); dst[sz-1] = 0; return 0;
+}
+int __attribute__((ms_abi)) lsw_wcscat_s(wchar_t* dst, size_t sz, const wchar_t* src) {
+    if (!dst || !sz) return 22;
+    size_t used = wcslen(dst);
+    if (used >= sz) return 22;
+    wcsncat(dst, src, sz - used - 1); return 0;
+}
+int __attribute__((ms_abi)) lsw_swprintf_s(wchar_t* dst, size_t sz, const wchar_t* fmt, ...) {
+    va_list ap; va_start(ap, fmt); int r = vswprintf(dst, sz, fmt, ap); va_end(ap); return r;
+}
+
+// Wide I/O
+void* __attribute__((ms_abi)) lsw__wfopen(const wchar_t* path, const wchar_t* mode) {
+    char p[512], m[32];
+    wcstombs(p, path, sizeof(p)); wcstombs(m, mode, sizeof(m));
+    return fopen(p, m);
+}
+int __attribute__((ms_abi)) lsw__waccess(const wchar_t* path, int mode) {
+    char p[512]; wcstombs(p, path, sizeof(p)); return access(p, mode);
+}
+int __attribute__((ms_abi)) lsw__wrename(const wchar_t* o, const wchar_t* n_) {
+    char o2[512], n2[512]; wcstombs(o2, o, sizeof(o2)); wcstombs(n2, n_, sizeof(n2));
+    return rename(o2, n2);
+}
+int __attribute__((ms_abi)) lsw__wremove(const wchar_t* path) {
+    char p[512]; wcstombs(p, path, sizeof(p)); return remove(p);
+}
+
+// Aligned allocation
+void* __attribute__((ms_abi)) lsw__aligned_malloc(size_t sz, size_t align) {
+    void* p = NULL; if (posix_memalign(&p, align < sizeof(void*) ? sizeof(void*) : align, sz)) return NULL; return p;
+}
+void  __attribute__((ms_abi)) lsw__aligned_free(void* p) { free(p); }
+void* __attribute__((ms_abi)) lsw__aligned_realloc(void* p, size_t sz, size_t align) {
+    void* n = NULL; if (posix_memalign(&n, align < sizeof(void*) ? sizeof(void*) : align, sz)) return NULL;
+    if (p) { memcpy(n, p, sz); free(p); } return n;
+}
+size_t __attribute__((ms_abi)) lsw__msize(void* p) { return p ? malloc_usable_size(p) : 0; }
+
+// CRT init helpers
+int __attribute__((ms_abi)) lsw__initterm_e(int (**start)(void), int (**end)(void)) {
+    for (int (**fn)(void) = start; fn < end; fn++) if (*fn) { int r = (*fn)(); if (r) return r; }
+    return 0;
+}
+void __attribute__((ms_abi)) lsw___security_init_cookie(void) {}
+void __attribute__((ms_abi)) lsw___security_check_cookie(uintptr_t c) { (void)c; }
+
+// Additional wide string helpers
+size_t __attribute__((ms_abi)) lsw_wcsnlen(const wchar_t* s, size_t max) {
+    size_t n = 0; while (n < max && s[n]) n++; return n;
+}
+int __attribute__((ms_abi)) lsw__wcsicmp(const wchar_t* a, const wchar_t* b) { return wcscasecmp(a, b); }
+int __attribute__((ms_abi)) lsw__wcsnicmp(const wchar_t* a, const wchar_t* b, size_t n) { return wcsncasecmp(a, b, n); }
+/* lsw__stricmp, lsw__strnicmp, lsw__strdup, lsw__wcsdup, lsw__atoi64 defined earlier */
+long long __attribute__((ms_abi)) lsw__strtoi64(const char* s, char** e, int b) { return strtoll(s, e, b); }
+unsigned long long __attribute__((ms_abi)) lsw__strtoui64(const char* s, char** e, int b) { return strtoull(s, e, b); }
+float __attribute__((ms_abi)) lsw_strtof(const char* s, char** e) { return strtof(s, e); }
+/* lsw_strerror defined earlier */
+void  __attribute__((ms_abi)) lsw_perror(const char* s) { perror(s); }
+
+// errno accessor
+int* __attribute__((ms_abi)) lsw__errno(void) { return &errno; }
+int __attribute__((ms_abi)) lsw__get_errno(int* e) { if (e) *e = errno; return 0; }
+int __attribute__((ms_abi)) lsw__set_errno(int v) { errno = v; return 0; }
 
 // ============================================================================
 // SECTION: vcruntime140.dll / api-ms-win-crt-* stubs
@@ -3770,7 +4146,14 @@ int __attribute__((ms_abi)) lsw_IsWow64Process(void* hProcess, int* Wow64Process
 
 // ---- FreeLibrary ----
 int __attribute__((ms_abi)) lsw_FreeLibrary(void* hLibModule) {
-    if (hLibModule) dlclose(hLibModule);
+    if (!hLibModule || hLibModule == LSW_SYSTEM_HMODULE) return 1;
+    lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)hLibModule;
+    if (pem->magic == LSW_PE_HMODULE_MAGIC) {
+        if (pem->image_base) munmap(pem->image_base, pem->image_size);
+        pem->magic = 0;
+        return 1;
+    }
+    dlclose(hLibModule);
     return 1;
 }
 void __attribute__((ms_abi)) lsw_FreeLibraryAndExitThread(void* hLibModule, uint32_t dwExitCode) {
@@ -4205,11 +4588,35 @@ int __attribute__((ms_abi)) lsw_SetCriticalSectionSpinCount(void* lpCriticalSect
 int __attribute__((ms_abi)) lsw_SuspendThread(void* hThread) { (void)hThread; return 0xFFFFFFFF; }
 int __attribute__((ms_abi)) lsw_ResumeThread(void* hThread) { (void)hThread; return 1; }
 int __attribute__((ms_abi)) lsw_TerminateThread(void* hThread, uint32_t dwExitCode) { (void)hThread; (void)dwExitCode; return 1; }
-int __attribute__((ms_abi)) lsw_TerminateProcess(void* hProcess, uint32_t uExitCode) { exit((int)uExitCode); return 1; }
+int __attribute__((ms_abi)) lsw_TerminateProcess(void* hProcess, uint32_t uExitCode) {
+    pid_t pid = (pid_t)(uintptr_t)hProcess;
+    /* If handle looks like a PID (1..65535) send SIGKILL to it */
+    if (pid > 1 && pid < 65536 && pid != getpid()) {
+        kill(pid, SIGKILL);
+        return 1;
+    }
+    exit((int)uExitCode);
+    return 1;
+}
 int __attribute__((ms_abi)) lsw_GetExitCodeThread(void* hThread, uint32_t* lpExitCode) { (void)hThread; if (lpExitCode) *lpExitCode = 0; return 1; }
-int __attribute__((ms_abi)) lsw_GetExitCodeProcess(void* hProcess, uint32_t* lpExitCode) { (void)hProcess; if (lpExitCode) *lpExitCode = 0; return 1; }
+int __attribute__((ms_abi)) lsw_GetExitCodeProcess(void* hProcess, uint32_t* lpExitCode) {
+    pid_t pid = (pid_t)(uintptr_t)hProcess;
+    if (lpExitCode) *lpExitCode = 259; /* STILL_ACTIVE */
+    if (pid > 1 && pid < 65536) {
+        int wstatus = 0;
+        pid_t r = waitpid(pid, &wstatus, WNOHANG);
+        if (r == pid && lpExitCode) {
+            *lpExitCode = WIFEXITED(wstatus) ? (uint32_t)WEXITSTATUS(wstatus) : 1;
+        }
+    }
+    return 1;
+}
 void* __attribute__((ms_abi)) lsw_OpenThread(uint32_t dwDesiredAccess, int bInheritHandle, uint32_t dwThreadId) { (void)dwDesiredAccess; (void)bInheritHandle; (void)dwThreadId; return (void*)0xF001; }
-void* __attribute__((ms_abi)) lsw_OpenProcess(uint32_t dwDesiredAccess, int bInheritHandle, uint32_t dwProcessId) { (void)dwDesiredAccess; (void)bInheritHandle; (void)dwProcessId; return (void*)0xF002; }
+void* __attribute__((ms_abi)) lsw_OpenProcess(uint32_t dwDesiredAccess, int bInheritHandle, uint32_t dwProcessId) {
+    (void)dwDesiredAccess; (void)bInheritHandle;
+    /* Return PID as handle so WaitForSingleObject / TerminateProcess work */
+    return (void*)(uintptr_t)(uint64_t)dwProcessId;
+}
 uint32_t __attribute__((ms_abi)) lsw_GetProcessId(void* Process) { (void)Process; return (uint32_t)getpid(); }
 uint32_t __attribute__((ms_abi)) lsw_GetThreadId(void* Thread) { (void)Thread; return (uint32_t)(uintptr_t)pthread_self(); }
 int __attribute__((ms_abi)) lsw_SetThreadPriority(void* hThread, int nPriority) { (void)hThread; (void)nPriority; return 1; }
@@ -4229,16 +4636,177 @@ int __attribute__((ms_abi)) lsw_CreatePipe(void** hReadPipe, void** hWritePipe, 
     if (hWritePipe) *hWritePipe = (void*)(uintptr_t)(pfd[1] + 1);
     return 1;
 }
-int __attribute__((ms_abi)) lsw_CreateNamedPipeW(const uint16_t* lpName, uint32_t dwOpenMode, uint32_t dwPipeMode, uint32_t nMaxInstances, uint32_t nOutBufferSize, uint32_t nInBufferSize, uint32_t nDefaultTimeOut, void* lpSecurityAttributes) {
-    (void)lpName; (void)dwOpenMode; (void)dwPipeMode; (void)nMaxInstances; (void)nOutBufferSize; (void)nInBufferSize; (void)nDefaultTimeOut; (void)lpSecurityAttributes;
-    return (int)(uintptr_t)0xFFFFFFFF; // INVALID_HANDLE_VALUE
+/*
+ * Named pipe implementation via Unix domain sockets.
+ * \\.\pipe\foo  →  /tmp/lsw-pipes/foo
+ * Pipe handles: server side returns a listening socket fd;
+ * on ConnectNamedPipe we accept() one client.
+ * Client side (OpenFile/CreateFile on \\.\pipe\foo) connects to the socket.
+ */
+/* LSW_PIPE_DIR/MAGIC + lsw_pipe_t defined at top of file */
+#define LSW_PIPE_DIR "/tmp/lsw-pipes"
+
+static lsw_pipe_t g_pipes[64];
+static int        g_pipe_count = 0;
+static pthread_mutex_t g_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Translate \\.\pipe\foo -> /tmp/lsw-pipes/foo */
+static void pipe_win_to_unix(const char* wname, char* out, size_t outsz) {
+    /* Skip \\.\pipe\ prefix */
+    const char* p = wname;
+    if (p[0]=='\\' && p[1]=='\\') {
+        p = strchr(p+2, '\\'); /* skip server part */
+        if (p) p++;
+        if (p && strncasecmp(p, "pipe\\", 5) == 0) p += 5;
+        else if (p && strncasecmp(p, "pipe/", 5) == 0) p += 5;
+    } else if (strncasecmp(p, "\\\\.\\pipe\\", 9) == 0) {
+        p += 9;
+    }
+    if (!p || !*p) p = wname;
+    /* Sanitize: replace backslashes with underscores */
+    char name[64]; snprintf(name, sizeof(name), "%s", p);
+    for (char* c = name; *c; c++) if (*c == '\\' || *c == '/') *c = '_';
+    mkdir(LSW_PIPE_DIR, 0700);
+    snprintf(out, outsz, "%s/%s", LSW_PIPE_DIR, name);
 }
-int __attribute__((ms_abi)) lsw_ConnectNamedPipe(void* hNamedPipe, void* lpOverlapped) { (void)hNamedPipe; (void)lpOverlapped; return 0; }
-int __attribute__((ms_abi)) lsw_DisconnectNamedPipe(void* hNamedPipe) { (void)hNamedPipe; return 1; }
-int __attribute__((ms_abi)) lsw_CallNamedPipeW(const uint16_t* lpNamedPipeName, void* lpInBuffer, uint32_t nInBufferSize, void* lpOutBuffer, uint32_t nOutBufferSize, uint32_t* lpBytesRead, uint32_t nTimeOut) {
-    (void)lpNamedPipeName; (void)lpInBuffer; (void)nInBufferSize; (void)lpOutBuffer; (void)nOutBufferSize; (void)lpBytesRead; (void)nTimeOut;
-    return 0;
+
+static lsw_pipe_t* alloc_pipe(void) {
+    pthread_mutex_lock(&g_pipe_lock);
+    lsw_pipe_t* h = NULL;
+    for (int i = 0; i < 64; i++) {
+        if (g_pipes[i].magic != LSW_PIPE_MAGIC) { h = &g_pipes[i]; break; }
+    }
+    if (h) { memset(h, 0, sizeof(*h)); h->magic = LSW_PIPE_MAGIC; h->listen_fd = -1; h->client_fd = -1; }
+    pthread_mutex_unlock(&g_pipe_lock);
+    return h;
 }
+
+void* __attribute__((ms_abi)) lsw_CreateNamedPipeA(const char* lpName,
+    uint32_t dwOpenMode, uint32_t dwPipeMode, uint32_t nMaxInstances,
+    uint32_t nOutBufferSize, uint32_t nInBufferSize, uint32_t nDefaultTimeOut,
+    void* lpSecurityAttributes)
+{
+    (void)dwOpenMode; (void)dwPipeMode; (void)nMaxInstances;
+    (void)nOutBufferSize; (void)nInBufferSize; (void)nDefaultTimeOut; (void)lpSecurityAttributes;
+    if (!lpName) return (void*)-1;
+
+    lsw_pipe_t* p = alloc_pipe();
+    if (!p) return (void*)-1;
+
+    pipe_win_to_unix(lpName, p->path, sizeof(p->path));
+    unlink(p->path); /* remove stale socket */
+
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) { p->magic = 0; return (void*)-1; }
+
+    struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, p->path, sizeof(addr.sun_path)-1);
+    if (bind(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0 ||
+        listen(sfd, 4) < 0) {
+        close(sfd); p->magic = 0; return (void*)-1;
+    }
+    p->listen_fd = sfd;
+    LSW_LOG_INFO("CreateNamedPipeA: %s -> %s (fd=%d)", lpName, p->path, sfd);
+    return (void*)p;
+}
+
+void* __attribute__((ms_abi)) lsw_CreateNamedPipeW(const uint16_t* lpName,
+    uint32_t dwOpenMode, uint32_t dwPipeMode, uint32_t nMaxInstances,
+    uint32_t nOutBufferSize, uint32_t nInBufferSize, uint32_t nDefaultTimeOut,
+    void* lpSecurityAttributes)
+{
+    char name[256]; wcstombs(name, (const wchar_t*)lpName, sizeof(name));
+    return lsw_CreateNamedPipeA(name, dwOpenMode, dwPipeMode, nMaxInstances,
+        nOutBufferSize, nInBufferSize, nDefaultTimeOut, lpSecurityAttributes);
+}
+
+int __attribute__((ms_abi)) lsw_ConnectNamedPipe(void* hNamedPipe, void* lpOverlapped) {
+    (void)lpOverlapped;
+    lsw_pipe_t* p = (lsw_pipe_t*)hNamedPipe;
+    if (!p || p->magic != LSW_PIPE_MAGIC || p->listen_fd < 0) return 0;
+    int cfd = accept(p->listen_fd, NULL, NULL);
+    if (cfd < 0) return 0;
+    p->client_fd = cfd;
+    LSW_LOG_INFO("ConnectNamedPipe: accepted client fd=%d on %s", cfd, p->path);
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_DisconnectNamedPipe(void* hNamedPipe) {
+    lsw_pipe_t* p = (lsw_pipe_t*)hNamedPipe;
+    if (!p || p->magic != LSW_PIPE_MAGIC) return 1;
+    if (p->client_fd >= 0) { close(p->client_fd); p->client_fd = -1; }
+    return 1;
+}
+
+void* __attribute__((ms_abi)) lsw_OpenNamedPipeA(const char* lpName, uint32_t dwDesiredAccess) {
+    (void)dwDesiredAccess;
+    if (!lpName) return (void*)-1;
+    lsw_pipe_t* p = alloc_pipe();
+    if (!p) return (void*)-1;
+    pipe_win_to_unix(lpName, p->path, sizeof(p->path));
+    int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sfd < 0) { p->magic = 0; return (void*)-1; }
+    struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, p->path, sizeof(addr.sun_path)-1);
+    if (connect(sfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(sfd); p->magic = 0; return (void*)-1;
+    }
+    p->client_fd = sfd; /* client uses client_fd for I/O */
+    LSW_LOG_INFO("OpenNamedPipe(client): %s fd=%d", p->path, sfd);
+    return (void*)p;
+}
+
+int __attribute__((ms_abi)) lsw_WaitNamedPipeA(const char* lpNamedPipeName, uint32_t nTimeOut) {
+    (void)nTimeOut;
+    char path[256]; pipe_win_to_unix(lpNamedPipeName, path, sizeof(path));
+    /* Poll until socket file exists, up to nTimeOut ms */
+    uint32_t waited = 0;
+    uint32_t step = 50;
+    while (access(path, F_OK) != 0) {
+        if (nTimeOut != 0xFFFFFFFF && waited >= nTimeOut) return 0;
+        usleep(step * 1000);
+        waited += step;
+    }
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_WaitNamedPipeW(const uint16_t* n, uint32_t t) {
+    char name[256]; wcstombs(name, (const wchar_t*)n, sizeof(name));
+    return lsw_WaitNamedPipeA(name, t);
+}
+
+/* Read/Write on named pipe handles route through the client_fd */
+static int pipe_handle_fd(void* handle) {
+    lsw_pipe_t* p = (lsw_pipe_t*)handle;
+    if (p && p->magic == LSW_PIPE_MAGIC) {
+        return p->client_fd >= 0 ? p->client_fd : -1;
+    }
+    return -1;
+}
+
+int __attribute__((ms_abi)) lsw_CallNamedPipeW(const uint16_t* lpName,
+    void* lpInBuffer, uint32_t nInBufferSize,
+    void* lpOutBuffer, uint32_t nOutBufferSize,
+    uint32_t* lpBytesRead, uint32_t nTimeOut)
+{
+    char name[256]; wcstombs(name, (const wchar_t*)lpName, sizeof(name));
+    if (!lsw_WaitNamedPipeA(name, nTimeOut)) return 0;
+    void* h = lsw_OpenNamedPipeA(name, 0);
+    if (!h || h == (void*)-1) return 0;
+    uint32_t written = 0;
+    lsw_WriteFile(h, lpInBuffer, nInBufferSize, &written, NULL);
+    uint32_t nread = 0;
+    int r = lsw_ReadFile(h, lpOutBuffer, nOutBufferSize, &nread, NULL);
+    if (lpBytesRead) *lpBytesRead = nread;
+    /* Close the transient handle */
+    lsw_pipe_t* p = (lsw_pipe_t*)h;
+    if (p->client_fd >= 0) close(p->client_fd);
+    p->magic = 0;
+    return r;
+}
+
 
 // ---- Console extra APIs ----
 uint32_t __attribute__((ms_abi)) lsw_GetConsoleCP(void) { return 65001; } // UTF-8
@@ -4310,16 +4878,209 @@ void __attribute__((ms_abi)) lsw_GetStartupInfoA(void* lpStartupInfo) {
 }
 
 // ---- CreateProcess ----
-int __attribute__((ms_abi)) lsw_CreateProcessW(const uint16_t* lpApplicationName, uint16_t* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, uint32_t dwCreationFlags, void* lpEnvironment, const uint16_t* lpCurrentDirectory, void* lpStartupInfo, void* lpProcessInformation) {
-    (void)lpApplicationName; (void)lpCommandLine; (void)lpProcessAttributes; (void)lpThreadAttributes; (void)bInheritHandles; (void)dwCreationFlags; (void)lpEnvironment; (void)lpCurrentDirectory; (void)lpStartupInfo;
-    LSW_LOG_WARN("CreateProcessW: process creation not supported on LSW");
-    if (lpProcessInformation) memset(lpProcessInformation, 0, 24);
+
+/*
+ * Helper: translate a Windows app path to a Linux path for execve.
+ * C:\foo\bar.exe -> $LSW_PREFIX/c/foo/bar.exe  (or as-is if already Linux path)
+ */
+static void createprocess_win_to_linux(const char* wpath, char* out, size_t outsz) {
+    if (!wpath || !*wpath) { out[0] = '\0'; return; }
+    /* Already a Linux absolute path? */
+    if (wpath[0] == '/') { strncpy(out, wpath, outsz-1); out[outsz-1]='\0'; return; }
+    /* Windows drive-letter path: C:\... */
+    if (wpath[1] == ':' && (wpath[2] == '\\' || wpath[2] == '/')) {
+        char drive = (char)tolower((unsigned char)wpath[0]);
+        const char* prefix = getenv("LSW_PREFIX");
+        if (!prefix) prefix = "/root/.lsw/drives";
+        char rest[512]; strncpy(rest, wpath + 3, sizeof(rest)-1); rest[sizeof(rest)-1]='\0';
+        /* replace backslashes */
+        for (char* p = rest; *p; p++) if (*p == '\\') *p = '/';
+        snprintf(out, outsz, "%s/%c/%s", prefix, drive, rest);
+        return;
+    }
+    /* Relative path — use as-is */
+    strncpy(out, wpath, outsz-1); out[outsz-1]='\0';
+    for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+}
+
+/* Find the lsw-pe-loader binary (same directory as this process, or $PATH) */
+static int find_pe_loader(char* out, size_t outsz) {
+    /* Try argv[0] directory first */
+    char self[512]; ssize_t n = readlink("/proc/self/exe", self, sizeof(self)-1);
+    if (n > 0) {
+        self[n] = '\0';
+        char* slash = strrchr(self, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(out, outsz, "%s/lsw-pe-loader", self);
+            if (access(out, X_OK) == 0) return 1;
+        }
+    }
+    /* Installed locations */
+    const char* candidates[] = {
+        "/usr/local/bin/lsw-pe-loader",
+        "/usr/bin/lsw-pe-loader",
+        "/opt/lsw/bin/lsw-pe-loader",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (access(candidates[i], X_OK) == 0) {
+            strncpy(out, candidates[i], outsz-1); out[outsz-1]='\0';
+            return 1;
+        }
+    }
+    /* Try build/bin relative to CWD */
+    snprintf(out, outsz, "build/bin/lsw-pe-loader");
+    if (access(out, X_OK) == 0) return 1;
     return 0;
 }
-int __attribute__((ms_abi)) lsw_CreateProcessA(const char* lpApplicationName, char* lpCommandLine, void* lpProcessAttributes, void* lpThreadAttributes, int bInheritHandles, uint32_t dwCreationFlags, void* lpEnvironment, const char* lpCurrentDirectory, void* lpStartupInfo, void* lpProcessInformation) {
-    (void)lpApplicationName; (void)lpCommandLine; (void)lpProcessAttributes; (void)lpThreadAttributes; (void)bInheritHandles; (void)dwCreationFlags; (void)lpEnvironment; (void)lpCurrentDirectory; (void)lpStartupInfo;
-    if (lpProcessInformation) memset(lpProcessInformation, 0, 24);
-    return 0;
+
+/* Parse command line string into argv array.
+ * Handles quoted tokens.  Caller must free argv[0..n-1] and argv itself. */
+static char** parse_cmdline(const char* cmdline, int* argc_out) {
+    int cap = 16, cnt = 0;
+    char** argv = malloc(cap * sizeof(char*));
+    if (!argv) { *argc_out = 0; return NULL; }
+    const char* p = cmdline;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char tok[4096]; int ti = 0;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') tok[ti++] = *p++;
+            if (*p == '"') p++;
+        } else {
+            while (*p && *p != ' ' && *p != '\t') tok[ti++] = *p++;
+        }
+        tok[ti] = '\0';
+        if (cnt >= cap-1) { cap *= 2; argv = realloc(argv, cap * sizeof(char*)); }
+        argv[cnt++] = strdup(tok);
+    }
+    argv[cnt] = NULL;
+    *argc_out = cnt;
+    return argv;
+}
+
+/* PROCESS_INFORMATION layout (must match Windows ABI exactly) */
+typedef struct {
+    void*    hProcess;
+    void*    hThread;
+    uint32_t dwProcessId;
+    uint32_t dwThreadId;
+} PROCESS_INFORMATION_t;
+
+int __attribute__((ms_abi)) lsw_CreateProcessA(
+    const char* lpApplicationName, char* lpCommandLine,
+    void* lpProcessAttributes, void* lpThreadAttributes,
+    int bInheritHandles, uint32_t dwCreationFlags,
+    void* lpEnvironment, const char* lpCurrentDirectory,
+    void* lpStartupInfo, void* lpProcessInformation)
+{
+    (void)lpProcessAttributes; (void)lpThreadAttributes;
+    (void)bInheritHandles; (void)dwCreationFlags;
+    (void)lpEnvironment; (void)lpStartupInfo;
+
+    if (lpProcessInformation) memset(lpProcessInformation, 0, sizeof(PROCESS_INFORMATION_t));
+
+    /* Determine EXE path */
+    char exe_win[1024] = {0};
+    if (lpApplicationName && *lpApplicationName) {
+        strncpy(exe_win, lpApplicationName, sizeof(exe_win)-1);
+    } else if (lpCommandLine && *lpCommandLine) {
+        /* Extract first token */
+        int argc = 0;
+        char** av = parse_cmdline(lpCommandLine, &argc);
+        if (argc > 0) { strncpy(exe_win, av[0], sizeof(exe_win)-1); free(av[0]); }
+        for (int i = 1; i < argc; i++) free(av[i]);
+        free(av);
+    }
+    if (!exe_win[0]) {
+        LSW_LOG_ERROR("CreateProcessA: no executable specified");
+        return 0;
+    }
+
+    char exe_linux[1024];
+    createprocess_win_to_linux(exe_win, exe_linux, sizeof(exe_linux));
+    LSW_LOG_INFO("CreateProcessA: launching %s (linux: %s)", exe_win, exe_linux);
+
+    /* Find pe-loader */
+    char loader[512];
+    if (!find_pe_loader(loader, sizeof(loader))) {
+        LSW_LOG_ERROR("CreateProcessA: lsw-pe-loader not found");
+        return 0;
+    }
+
+    /* Build argv for pe-loader */
+    char* child_argv[64];
+    int ci = 0;
+    child_argv[ci++] = loader;
+    child_argv[ci++] = exe_linux;
+    /* Pass remaining args from lpCommandLine if application name was separate */
+    char** extra = NULL; int extra_cnt = 0;
+    if (lpApplicationName && lpCommandLine) {
+        extra = parse_cmdline(lpCommandLine, &extra_cnt);
+        /* skip first token if it matches application name */
+        int start = 0;
+        if (extra_cnt > 0 && strcasecmp(extra[0], lpApplicationName) == 0) start = 1;
+        for (int i = start; i < extra_cnt && ci < 62; i++)
+            child_argv[ci++] = extra[i];
+    }
+    child_argv[ci] = NULL;
+
+    /* Change working directory in child if requested */
+    char cwd_linux[1024] = {0};
+    if (lpCurrentDirectory)
+        createprocess_win_to_linux(lpCurrentDirectory, cwd_linux, sizeof(cwd_linux));
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        LSW_LOG_ERROR("CreateProcessA: fork failed: %s", strerror(errno));
+        if (extra) { for (int i = 0; i < extra_cnt; i++) free(extra[i]); free(extra); }
+        return 0;
+    }
+    if (pid == 0) {
+        /* Child */
+        if (cwd_linux[0]) chdir(cwd_linux);
+        execv(loader, child_argv);
+        _exit(127); /* exec failed */
+    }
+    /* Parent */
+    if (extra) { for (int i = 0; i < extra_cnt; i++) free(extra[i]); free(extra); }
+    LSW_LOG_INFO("CreateProcessA: child PID=%d", (int)pid);
+    if (lpProcessInformation) {
+        PROCESS_INFORMATION_t* pi = (PROCESS_INFORMATION_t*)lpProcessInformation;
+        pi->hProcess   = (void*)(uintptr_t)(uint64_t)pid;
+        pi->hThread    = (void*)(uintptr_t)1;
+        pi->dwProcessId = (uint32_t)pid;
+        pi->dwThreadId  = 1;
+    }
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_CreateProcessW(
+    const uint16_t* lpApplicationName, uint16_t* lpCommandLine,
+    void* lpProcessAttributes, void* lpThreadAttributes,
+    int bInheritHandles, uint32_t dwCreationFlags,
+    void* lpEnvironment, const uint16_t* lpCurrentDirectory,
+    void* lpStartupInfo, void* lpProcessInformation)
+{
+    /* Convert wide strings to narrow, then delegate */
+    char appA[1024] = {0}, cmdA[4096] = {0}, cwdA[1024] = {0};
+    if (lpApplicationName)
+        for (int i = 0; lpApplicationName[i] && i < 1023; i++) appA[i] = (char)lpApplicationName[i];
+    if (lpCommandLine)
+        for (int i = 0; lpCommandLine[i] && i < 4095; i++) cmdA[i] = (char)lpCommandLine[i];
+    if (lpCurrentDirectory)
+        for (int i = 0; lpCurrentDirectory[i] && i < 1023; i++) cwdA[i] = (char)lpCurrentDirectory[i];
+    return lsw_CreateProcessA(
+        appA[0] ? appA : NULL,
+        cmdA[0] ? cmdA : NULL,
+        lpProcessAttributes, lpThreadAttributes,
+        bInheritHandles, dwCreationFlags,
+        lpEnvironment,
+        cwdA[0] ? cwdA : NULL,
+        lpStartupInfo, lpProcessInformation);
 }
 
 // ---- Symbolic/Hard links ----
@@ -4783,6 +5544,177 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "sin",          (void*)lsw_sin},
     {"ucrtbase.dll", "cos",          (void*)lsw_cos},
     {"ucrtbase.dll", "exp",          (void*)lsw_exp},
+    /* ucrtbase.dll — extended coverage */
+    {"ucrtbase.dll", "tan",          (void*)lsw_tan},
+    {"ucrtbase.dll", "atan2",        (void*)lsw_atan2},
+    {"ucrtbase.dll", "atan",         (void*)lsw_atan},
+    {"ucrtbase.dll", "asin",         (void*)lsw_asin},
+    {"ucrtbase.dll", "acos",         (void*)lsw_acos},
+    {"ucrtbase.dll", "log",          (void*)lsw_math_log},
+    {"ucrtbase.dll", "log2",         (void*)lsw_log2},
+    {"ucrtbase.dll", "log10",        (void*)lsw_math_log10},
+    {"ucrtbase.dll", "fabs",         (void*)lsw_fabs},
+    {"ucrtbase.dll", "fmod",         (void*)lsw_fmod},
+    {"ucrtbase.dll", "hypot",        (void*)lsw_hypot},
+    {"ucrtbase.dll", "modf",         (void*)lsw_modf},
+    {"ucrtbase.dll", "ldexp",        (void*)lsw_ldexp},
+    {"ucrtbase.dll", "frexp",        (void*)lsw_frexp},
+    {"ucrtbase.dll", "sqrtf",        (void*)lsw_sqrtf},
+    {"ucrtbase.dll", "sinf",         (void*)lsw_sinf},
+    {"ucrtbase.dll", "cosf",         (void*)lsw_cosf},
+    {"ucrtbase.dll", "powf",         (void*)lsw_powf},
+    {"ucrtbase.dll", "fabsf",        (void*)lsw_fabsf},
+    {"ucrtbase.dll", "floorf",       (void*)lsw_floorf},
+    {"ucrtbase.dll", "ceilf",        (void*)lsw_ceilf},
+    {"ucrtbase.dll", "expf",         (void*)lsw_expf},
+    {"ucrtbase.dll", "logf",         (void*)lsw_logf},
+    {"ucrtbase.dll", "fmodf",        (void*)lsw_fmodf},
+    /* ucrtbase.dll — CRT internal functions */
+    {"ucrtbase.dll", "__acrt_iob_func",             (void*)lsw___acrt_iob_func},
+    {"ucrtbase.dll", "__stdio_common_vfprintf",     (void*)lsw___stdio_common_vfprintf},
+    {"ucrtbase.dll", "__stdio_common_vsprintf",     (void*)lsw___stdio_common_vsprintf},
+    {"ucrtbase.dll", "__stdio_common_vsscanf",      (void*)lsw___stdio_common_vsscanf},
+    {"ucrtbase.dll", "__stdio_common_vswprintf",    (void*)lsw___stdio_common_vswprintf},
+    {"ucrtbase.dll", "__stdio_common_vfwprintf",    (void*)lsw___stdio_common_vfwprintf},
+    {"ucrtbase.dll", "_configure_narrow_argv",      (void*)lsw__configure_narrow_argv},
+    {"ucrtbase.dll", "_configure_wide_argv",        (void*)lsw__configure_wide_argv},
+    {"ucrtbase.dll", "_initialize_narrow_environment",(void*)lsw__initialize_narrow_environment},
+    {"ucrtbase.dll", "_initialize_wide_environment",(void*)lsw__initialize_wide_environment},
+    {"ucrtbase.dll", "_initialize_onexit_table",    (void*)lsw__initialize_onexit_table},
+    {"ucrtbase.dll", "_register_onexit_function",   (void*)lsw__register_onexit_function},
+    {"ucrtbase.dll", "_execute_onexit_table",       (void*)lsw__execute_onexit_table},
+    {"ucrtbase.dll", "_crt_atexit",                 (void*)lsw__crt_atexit},
+    {"ucrtbase.dll", "__crt_at_quick_exit",         (void*)lsw___crt_at_quick_exit},
+    {"ucrtbase.dll", "_initterm",                   (void*)lsw__initterm},
+    {"ucrtbase.dll", "_initterm_e",                 (void*)lsw__initterm_e},
+    {"ucrtbase.dll", "__security_init_cookie",      (void*)lsw___security_init_cookie},
+    {"ucrtbase.dll", "__security_check_cookie",     (void*)lsw___security_check_cookie},
+    {"ucrtbase.dll", "__p___argc",                  (void*)lsw___p___argc},
+    {"ucrtbase.dll", "__p___argv",                  (void*)lsw___p___argv},
+    {"ucrtbase.dll", "__p__commode",                (void*)lsw___p__commode},
+    /* ucrtbase.dll — memory/string/time/IO */
+    {"ucrtbase.dll", "malloc",       (void*)lsw_malloc},
+    {"ucrtbase.dll", "free",         (void*)lsw_free},
+    {"ucrtbase.dll", "calloc",       (void*)lsw_calloc},
+    {"ucrtbase.dll", "realloc",      (void*)lsw_realloc},
+    {"ucrtbase.dll", "memcpy",       (void*)lsw_memcpy},
+    {"ucrtbase.dll", "memset",       (void*)lsw_memset},
+    {"ucrtbase.dll", "memmove",      (void*)lsw_memmove},
+    {"ucrtbase.dll", "memcmp",       (void*)lsw_memcmp},
+    {"ucrtbase.dll", "memcpy_s",     (void*)lsw_memcpy_s},
+    {"ucrtbase.dll", "memmove_s",    (void*)lsw_memmove_s},
+    {"ucrtbase.dll", "_msize",       (void*)lsw__msize},
+    {"ucrtbase.dll", "_aligned_malloc",  (void*)lsw__aligned_malloc},
+    {"ucrtbase.dll", "_aligned_free",    (void*)lsw__aligned_free},
+    {"ucrtbase.dll", "_aligned_realloc", (void*)lsw__aligned_realloc},
+    {"ucrtbase.dll", "strlen",       (void*)lsw_strlen},
+    {"ucrtbase.dll", "strcmp",       (void*)lsw_strcmp},
+    {"ucrtbase.dll", "strncmp",      (void*)lsw_strncmp},
+    {"ucrtbase.dll", "strncpy",      (void*)lsw_strncpy},
+    {"ucrtbase.dll", "strncat",      (void*)lsw_strncat},
+    {"ucrtbase.dll", "strchr",       (void*)lsw_strchr},
+    {"ucrtbase.dll", "strrchr",      (void*)lsw_strrchr},
+    {"ucrtbase.dll", "strstr",       (void*)lsw_strstr},
+    {"ucrtbase.dll", "strtoul",      (void*)lsw_strtoul},
+    {"ucrtbase.dll", "strtoll",      (void*)lsw_strtoll},
+    {"ucrtbase.dll", "strtof",       (void*)lsw_strtof},
+    {"ucrtbase.dll", "_strtoi64",    (void*)lsw__strtoi64},
+    {"ucrtbase.dll", "_strtoui64",   (void*)lsw__strtoui64},
+    {"ucrtbase.dll", "_atoi64",      (void*)lsw__atoi64},
+    {"ucrtbase.dll", "_stricmp",     (void*)lsw__stricmp},
+    {"ucrtbase.dll", "_strnicmp",    (void*)lsw__strnicmp},
+    {"ucrtbase.dll", "_strdup",      (void*)lsw__strdup},
+    {"ucrtbase.dll", "strerror",     (void*)lsw_strerror},
+    {"ucrtbase.dll", "perror",       (void*)lsw_perror},
+    {"ucrtbase.dll", "strcpy_s",     (void*)lsw_strcpy_s},
+    {"ucrtbase.dll", "strncpy_s",    (void*)lsw_strncpy_s},
+    {"ucrtbase.dll", "strcat_s",     (void*)lsw_strcat_s},
+    {"ucrtbase.dll", "sprintf_s",    (void*)lsw_sprintf_s},
+    {"ucrtbase.dll", "wcslen",       (void*)lsw_wcslen},
+    {"ucrtbase.dll", "wcscpy",       (void*)lsw_wcscpy},
+    {"ucrtbase.dll", "wcscat",       (void*)lsw_wcscat},
+    {"ucrtbase.dll", "wcscmp",       (void*)lsw_wcscmp},
+    {"ucrtbase.dll", "wcsncmp",      (void*)lsw_wcsncmp},
+    {"ucrtbase.dll", "wcsncpy",      (void*)lsw_wcsncpy},
+    {"ucrtbase.dll", "wcschr",       (void*)lsw_wcschr},
+    {"ucrtbase.dll", "wcsrchr",      (void*)lsw_wcsrchr},
+    {"ucrtbase.dll", "wcsstr",       (void*)lsw_wcsstr},
+    {"ucrtbase.dll", "wcsnlen",      (void*)lsw_wcsnlen},
+    {"ucrtbase.dll", "_wcsicmp",     (void*)lsw__wcsicmp},
+    {"ucrtbase.dll", "_wcsnicmp",    (void*)lsw__wcsnicmp},
+    {"ucrtbase.dll", "_wcsdup",      (void*)lsw__wcsdup},
+    {"ucrtbase.dll", "wcscpy_s",     (void*)lsw_wcscpy_s},
+    {"ucrtbase.dll", "wcscat_s",     (void*)lsw_wcscat_s},
+    {"ucrtbase.dll", "swprintf_s",   (void*)lsw_swprintf_s},
+    {"ucrtbase.dll", "printf",       (void*)lsw_printf},
+    {"ucrtbase.dll", "fprintf",      (void*)lsw_fprintf},
+    {"ucrtbase.dll", "vprintf",      (void*)lsw_vprintf},
+    {"ucrtbase.dll", "vfprintf",     (void*)lsw_vfprintf},
+    {"ucrtbase.dll", "fwrite",       (void*)lsw_fwrite},
+    {"ucrtbase.dll", "fputc",        (void*)lsw_fputc},
+    {"ucrtbase.dll", "fgetc",        (void*)lsw_fgetc},
+    {"ucrtbase.dll", "fgets",        (void*)lsw_fgets},
+    {"ucrtbase.dll", "feof",         (void*)lsw_feof},
+    {"ucrtbase.dll", "ferror",       (void*)lsw_ferror},
+    {"ucrtbase.dll", "fflush",       (void*)lsw_fflush},
+    {"ucrtbase.dll", "rewind",       (void*)lsw_rewind},
+    {"ucrtbase.dll", "puts",         (void*)lsw_puts},
+    {"ucrtbase.dll", "putchar",      (void*)lsw_putchar},
+    {"ucrtbase.dll", "getchar",      (void*)lsw_getchar},
+    {"ucrtbase.dll", "fscanf",       (void*)lsw_fscanf},
+    {"ucrtbase.dll", "_wfopen",      (void*)lsw__wfopen},
+    {"ucrtbase.dll", "_waccess",     (void*)lsw__waccess},
+    {"ucrtbase.dll", "_wrename",     (void*)lsw__wrename},
+    {"ucrtbase.dll", "_wremove",     (void*)lsw__wremove},
+    {"ucrtbase.dll", "time",         (void*)lsw_time},
+    {"ucrtbase.dll", "difftime",     (void*)lsw_difftime},
+    {"ucrtbase.dll", "clock",        (void*)lsw_clock},
+    {"ucrtbase.dll", "localtime",    (void*)lsw_localtime},
+    {"ucrtbase.dll", "gmtime",       (void*)lsw_gmtime},
+    {"ucrtbase.dll", "mktime",       (void*)lsw_mktime},
+    {"ucrtbase.dll", "asctime",      (void*)lsw_asctime},
+    {"ucrtbase.dll", "ctime",        (void*)lsw_ctime},
+    {"ucrtbase.dll", "strftime",     (void*)lsw_strftime},
+    {"ucrtbase.dll", "getenv",       (void*)lsw_getenv},
+    {"ucrtbase.dll", "_putenv",      (void*)lsw__putenv},
+    {"ucrtbase.dll", "exit",         (void*)lsw_exit},
+    {"ucrtbase.dll", "_exit",        (void*)lsw_exit},
+    {"ucrtbase.dll", "abort",        (void*)lsw_abort},
+    {"ucrtbase.dll", "qsort",        (void*)lsw_qsort},
+    {"ucrtbase.dll", "bsearch",      (void*)lsw_bsearch},
+    {"ucrtbase.dll", "_errno",       (void*)lsw__errno},
+    {"ucrtbase.dll", "_get_errno",   (void*)lsw__get_errno},
+    {"ucrtbase.dll", "_set_errno",   (void*)lsw__set_errno},
+    /* msvcr140.dll / msvcp140.dll — VS2015 runtime DLLs */
+    {"msvcr140.dll", "malloc",       (void*)lsw_malloc},
+    {"msvcr140.dll", "free",         (void*)lsw_free},
+    {"msvcr140.dll", "calloc",       (void*)lsw_calloc},
+    {"msvcr140.dll", "realloc",      (void*)lsw_realloc},
+    {"msvcr140.dll", "memcpy",       (void*)lsw_memcpy},
+    {"msvcr140.dll", "memset",       (void*)lsw_memset},
+    {"msvcr140.dll", "strlen",       (void*)lsw_strlen},
+    {"msvcr140.dll", "strcmp",       (void*)lsw_strcmp},
+    {"msvcr140.dll", "printf",       (void*)lsw_printf},
+    {"msvcr140.dll", "fprintf",      (void*)lsw_fprintf},
+    {"msvcr140.dll", "sprintf",      (void*)lsw_sprintf},
+    {"msvcr140.dll", "snprintf",     (void*)lsw_snprintf},
+    {"msvcr140.dll", "exit",         (void*)lsw_exit},
+    {"msvcr140.dll", "abort",        (void*)lsw_abort},
+    {"msvcr140.dll", "fopen",        (void*)lsw_fopen},
+    {"msvcr140.dll", "fclose",       (void*)lsw_fclose},
+    {"msvcr140.dll", "fread",        (void*)lsw_fread},
+    {"msvcr140.dll", "fwrite",       (void*)lsw_fwrite},
+    {"msvcr140.dll", "time",         (void*)lsw_time},
+    {"msvcr140.dll", "localtime",    (void*)lsw_localtime},
+    {"msvcr140.dll", "__acrt_iob_func", (void*)lsw___acrt_iob_func},
+    {"msvcr140.dll", "__stdio_common_vfprintf",(void*)lsw___stdio_common_vfprintf},
+    {"msvcr140.dll", "__stdio_common_vsprintf",(void*)lsw___stdio_common_vsprintf},
+    {"msvcr140.dll", "_initterm",    (void*)lsw__initterm},
+    {"msvcr140.dll", "_initterm_e",  (void*)lsw__initterm_e},
+    {"msvcp140.dll", "malloc",       (void*)lsw_malloc},
+    {"msvcp140.dll", "free",         (void*)lsw_free},
+    {"msvcp_win.dll","malloc",       (void*)lsw_malloc},
+    {"msvcp_win.dll","free",         (void*)lsw_free},
     /* ----------------------------------------------------------------
      * vcruntime140.dll / api-ms-win-crt-* stubs
      * ---------------------------------------------------------------- */
@@ -4989,10 +5921,14 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "SwitchToThread",           (void*)lsw_SwitchToThread},
     {"KERNEL32.dll", "Beep",                     (void*)lsw_Beep},
     {"KERNEL32.dll", "CreatePipe",               (void*)lsw_CreatePipe},
+    {"KERNEL32.dll", "CreateNamedPipeA",         (void*)lsw_CreateNamedPipeA},
     {"KERNEL32.dll", "CreateNamedPipeW",         (void*)lsw_CreateNamedPipeW},
     {"KERNEL32.dll", "ConnectNamedPipe",         (void*)lsw_ConnectNamedPipe},
     {"KERNEL32.dll", "DisconnectNamedPipe",      (void*)lsw_DisconnectNamedPipe},
     {"KERNEL32.dll", "CallNamedPipeW",           (void*)lsw_CallNamedPipeW},
+    {"KERNEL32.dll", "CallNamedPipeA",           (void*)lsw_CallNamedPipeW},
+    {"KERNEL32.dll", "WaitNamedPipeA",           (void*)lsw_WaitNamedPipeA},
+    {"KERNEL32.dll", "WaitNamedPipeW",           (void*)lsw_WaitNamedPipeW},
     {"KERNEL32.dll", "GetConsoleCP",             (void*)lsw_GetConsoleCP},
     {"KERNEL32.dll", "GetConsoleOutputCP",       (void*)lsw_GetConsoleOutputCP},
     {"KERNEL32.dll", "SetConsoleCP",             (void*)lsw_SetConsoleCP},
@@ -5276,6 +6212,44 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
 
     LSW_LOG_WARN("Could not resolve %s!%s - returning stub", dll_name, function_name);
     return (void*)(uintptr_t)generic_stub;
+}
+
+/* Search all tables by function name only — used by GetProcAddress on system handles */
+void* win32_api_resolve_any(const char* function_name) {
+    if (!function_name) return NULL;
+    /* Try with each known system DLL name */
+    static const char* dllnames[] = {
+        "KERNEL32.dll","kernel32.dll","USER32.dll","user32.dll",
+        "GDI32.dll","gdi32.dll","ADVAPI32.dll","advapi32.dll",
+        "ntdll.dll","NTDLL.dll","ws2_32.dll","WS2_32.dll",
+        "shell32.dll","SHELL32.dll","shlwapi.dll","ole32.dll",
+        "oleaut32.dll","comctl32.dll","MSVCRT.dll","msvcrt.dll",
+        "ucrtbase.dll","vcruntime140.dll",
+        NULL
+    };
+    for (int di = 0; dllnames[di]; di++) {
+        /* Only call resolve for non-stub result */
+        for (size_t i = 0; i < api_mappings_count; i++) {
+            if (strcasecmp(api_mappings[i].dll_name, dllnames[di]) == 0 &&
+                strcmp(api_mappings[i].function_name, function_name) == 0)
+                return api_mappings[i].implementation;
+        }
+    }
+    /* Linear search across all secondary tables without DLL filter */
+    #define SEARCH_TABLE(tbl, cnt) \
+        for (size_t i = 0; i < cnt; i++) \
+            if (strcmp(tbl[i].function_name, function_name) == 0) return tbl[i].implementation;
+    SEARCH_TABLE(win32_api_ntdll_mappings,   win32_api_ntdll_mappings_count)
+    SEARCH_TABLE(win32_api_user32_mappings,  win32_api_user32_mappings_count)
+    SEARCH_TABLE(win32_api_shlwapi_mappings, win32_api_shlwapi_mappings_count)
+    SEARCH_TABLE(win32_api_shell32_mappings, win32_api_shell32_mappings_count)
+    SEARCH_TABLE(win32_api_ole32_mappings,   win32_api_ole32_mappings_count)
+    SEARCH_TABLE(win32_api_oleaut32_mappings,win32_api_oleaut32_mappings_count)
+    SEARCH_TABLE(win32_api_comctl32_mappings,win32_api_comctl32_mappings_count)
+    SEARCH_TABLE(win32_api_misc_mappings,    win32_api_misc_mappings_count)
+    SEARCH_TABLE(win32_api_advapi32_mappings,win32_api_advapi32_mappings_count)
+    #undef SEARCH_TABLE
+    return NULL;
 }
 
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count) {

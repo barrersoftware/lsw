@@ -28,6 +28,9 @@ void win32_api_set_kernel_fd(int fd);
 // Resolve a function by DLL and name (returns NULL if not found)
 void* win32_api_resolve(const char* dll_name, const char* function_name);
 
+// Resolve a function by name across all tables (ignores DLL name) — for GetProcAddress
+void* win32_api_resolve_any(const char* function_name);
+
 // Resolve a function by DLL name and ordinal number (returns generic_stub if unknown)
 void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal);
 
