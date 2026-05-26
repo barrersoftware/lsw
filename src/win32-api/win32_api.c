@@ -69,6 +69,14 @@ typedef struct lsw_pe_hmodule_s lsw_pe_hmodule_t;
 
 /* ---- Named pipe handle ---- */
 #define LSW_PIPE_MAGIC 0x50495045U  /* "PIPE" */
+
+/*
+ * IS_TYPED_HANDLE(h) — true only if 'h' could be a heap-allocated typed handle.
+ * Raw file descriptors are small integers (0–1023 typically); malloc pointers on
+ * Linux x86-64 are always ≥ 0x10000 (mmap/heap live above page zero).
+ * Checking this before dereferencing magic prevents SIGSEGV on raw fd handles.
+ */
+#define IS_TYPED_HANDLE(h) ((uintptr_t)(h) >= 0x10000u)
 struct lsw_pipe_s {
     uint32_t magic;
     int listen_fd;
@@ -179,6 +187,102 @@ static int g_kernel_fd = -1;
 
 // Thread-local last Win32 error code (set by SetLastError, read by GetLastError)
 static __thread DWORD g_last_error = 0;
+
+// ============================================================================
+// CRT data-symbol stubs
+// msvcrt.dll exports these as DATA (global variables), not functions.
+// When the PE IAT has an entry for e.g. "__initenv", the loader must write the
+// *address* of a valid char** here, not a code stub.  win32_api_resolve_data()
+// below returns &<static> for each known CRT data symbol.
+// ============================================================================
+static char**          lsw_crt_initenv    = NULL;  /* __initenv   */
+static char**          lsw_crt_environ    = NULL;  /* _environ    */
+static wchar_t**       lsw_crt_wenviron   = NULL;  /* _wenviron   */
+static char*           lsw_crt_acmdln     = NULL;  /* _acmdln     */
+static wchar_t*        lsw_crt_wcmdln     = NULL;  /* _wcmdln     */
+static int             lsw_crt_argc       = 0;     /* __argc      */
+static char**          lsw_crt_argv       = NULL;  /* __argv      */
+static wchar_t**       lsw_crt_wargv      = NULL;  /* __wargv     */
+static wchar_t**       lsw_crt_wenvp      = NULL;  /* __wenvp     */
+static int             lsw_crt_fmode      = 0;     /* _fmode      */
+static int             lsw_crt_commode    = 0;     /* _commode    */
+static unsigned int    lsw_crt_osver      = 0x0A00;/* _osver      */
+static unsigned int    lsw_crt_winver     = 0x0A00;/* _winver     */
+static unsigned int    lsw_crt_winmajor   = 10;    /* _winmajor   */
+static unsigned int    lsw_crt_winminor   = 0;     /* _winminor   */
+
+/* Character classification table stub — 257 entries (index 0 = EOF sentinel) */
+static unsigned short  lsw_crt_pctype[257];
+static unsigned short* lsw_crt_pctype_ptr = lsw_crt_pctype + 1; /* _pctype */
+
+/*
+ * win32_api_resolve_data() — return the *address* of a static variable for
+ * known CRT data-import symbols, or NULL if not a known data symbol.
+ *
+ * The PE loader writes this address directly into the IAT slot so that
+ * Windows CRT startup code that dereferences __imp___initenv etc. works.
+ */
+void* win32_api_resolve_data(const char* dll_name, const char* sym) {
+    (void)dll_name; /* any DLL — most are msvcrt / ucrtbase / api-ms-win-crt-* */
+    if (!sym) return NULL;
+    /* Strip leading underscore variants */
+    const char* s = sym;
+    if (s[0] == '_' && s[1] == '_') s += 2;      /* "__initenv" -> "initenv" */
+    else if (s[0] == '_')           s += 1;       /* "_environ"  -> "environ" */
+
+    if (!strcmp(sym,"__initenv")  || !strcmp(s,"initenv"))  return &lsw_crt_initenv;
+    if (!strcmp(sym,"_environ")   || !strcmp(s,"environ"))  return &lsw_crt_environ;
+    if (!strcmp(sym,"_wenviron")  || !strcmp(s,"wenviron")) return &lsw_crt_wenviron;
+    if (!strcmp(sym,"_acmdln")    || !strcmp(s,"acmdln"))   return &lsw_crt_acmdln;
+    if (!strcmp(sym,"_wcmdln")    || !strcmp(s,"wcmdln"))   return &lsw_crt_wcmdln;
+    if (!strcmp(sym,"__argc")     || !strcmp(s,"argc"))     return &lsw_crt_argc;
+    if (!strcmp(sym,"__argv")     || !strcmp(s,"argv"))     return &lsw_crt_argv;
+    if (!strcmp(sym,"__wargv")    || !strcmp(s,"wargv"))    return &lsw_crt_wargv;
+    if (!strcmp(sym,"__wenvp")    || !strcmp(s,"wenvp"))    return &lsw_crt_wenvp;
+    if (!strcmp(sym,"_fmode")     || !strcmp(s,"fmode"))    return &lsw_crt_fmode;
+    if (!strcmp(sym,"_commode")   || !strcmp(s,"commode"))  return &lsw_crt_commode;
+    if (!strcmp(sym,"_osver")     || !strcmp(s,"osver"))    return &lsw_crt_osver;
+    if (!strcmp(sym,"_winver")    || !strcmp(s,"winver"))   return &lsw_crt_winver;
+    if (!strcmp(sym,"_winmajor")  || !strcmp(s,"winmajor")) return &lsw_crt_winmajor;
+    if (!strcmp(sym,"_winminor")  || !strcmp(s,"winminor")) return &lsw_crt_winminor;
+    if (!strcmp(sym,"_pctype"))                             return &lsw_crt_pctype_ptr;
+    if (!strcmp(sym,"_pwctype"))                            return &lsw_crt_pctype_ptr;
+    return NULL;
+}
+
+/*
+ * win32_crt_data_init() — populate the CRT data stubs from real argc/argv/envp.
+ * Called by win32_set_command_line() after the PE is loaded.
+ */
+void win32_crt_data_init(int argc, char** argv) {
+    lsw_crt_argc = argc;
+    lsw_crt_argv = argv;
+    lsw_crt_initenv = environ;  /* libc's global environ */
+    lsw_crt_environ = environ;
+
+    /* Build command-line string from argv */
+    static char cmdln_buf[4096];
+    cmdln_buf[0] = '\0';
+    for (int i = 0; i < argc; i++) {
+        if (i) strncat(cmdln_buf, " ", sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
+        strncat(cmdln_buf, argv[i], sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
+    }
+    lsw_crt_acmdln = cmdln_buf;
+
+    /* Initialise _pctype with basic ASCII character classification */
+    memset(lsw_crt_pctype, 0, sizeof(lsw_crt_pctype));
+    for (int c = 0; c < 256; c++) {
+        unsigned short v = 0;
+        if (isupper(c))  v |= 0x0001;
+        if (islower(c))  v |= 0x0002;
+        if (isdigit(c))  v |= 0x0004;
+        if (isspace(c))  v |= 0x0008;
+        if (ispunct(c))  v |= 0x0010;
+        if (isblank(c))  v |= 0x0040;
+        if (isalpha(c))  v |= 0x0103;
+        lsw_crt_pctype[c + 1] = v;
+    }
+}
 
 void win32_api_set_kernel_fd(int fd) {
     g_kernel_fd = fd;
@@ -765,7 +869,13 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
     LSW_LOG_WARN("Using userspace fallback for CreateFileA");
     
     int flags_unix = 0;
-    if (access & GENERIC_WRITE) {
+    if ((access & GENERIC_READ) && (access & GENERIC_WRITE)) {
+        if (creation == CREATE_ALWAYS) {
+            flags_unix = O_RDWR | O_CREAT | O_TRUNC;
+        } else {
+            flags_unix = O_RDWR;
+        }
+    } else if (access & GENERIC_WRITE) {
         if (creation == CREATE_ALWAYS) {
             flags_unix = O_WRONLY | O_CREAT | O_TRUNC;
         } else {
@@ -787,6 +897,16 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
 
 int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
     if (handle == INVALID_HANDLE_VALUE || !handle) return 0;
+
+    /* Raw file descriptor — small integer, not a heap struct */
+    if (!IS_TYPED_HANDLE(handle)) {
+        intptr_t fd = (intptr_t)handle;
+        if (fd >= 0 && fd < 1024) {
+            close((int)fd);
+            return 1;
+        }
+        return 0;
+    }
 
     uint32_t magic = *(const uint32_t*)handle;
 
@@ -857,13 +977,6 @@ int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
         return 1;
     }
 
-    /* Raw file descriptor */
-    intptr_t fd = (intptr_t)handle;
-    if (fd >= 0 && fd < 1024) {
-        close((int)fd);
-        return 1;
-    }
-
     LSW_LOG_INFO("CloseHandle: handle=%p (non-fd)", handle);
     return 1;
 }
@@ -884,7 +997,7 @@ void* __attribute__((ms_abi)) lsw_CreateEventA(void* security, int manual_reset,
 int __attribute__((ms_abi)) lsw_SetEvent(void* handle) {
     lsw_event_t* ev = handle;
     if (!ev) return 0;
-    if (ev->magic == LSW_EVENT_MAGIC) {
+    if (IS_TYPED_HANDLE(ev) && ev->magic == LSW_EVENT_MAGIC) {
         pthread_mutex_lock(&ev->lock);
         ev->signaled = 1;
         if (ev->manual_reset) pthread_cond_broadcast(&ev->cond);
@@ -967,7 +1080,7 @@ int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint
     /* Named pipe handle — write to Unix domain socket fd */
     {
         lsw_pipe_t* pp = (lsw_pipe_t*)handle;
-        if (pp->magic == LSW_PIPE_MAGIC) {
+        if (IS_TYPED_HANDLE(pp) && pp->magic == LSW_PIPE_MAGIC) {
             int pfd = pp->client_fd >= 0 ? pp->client_fd : -1;
             if (pfd < 0) { if (bytes_written) *bytes_written = 0; return 0; }
             ssize_t r = write(pfd, buffer, bytes_to_write);
@@ -1038,7 +1151,7 @@ int __attribute__((ms_abi)) lsw_ReadFile(void* handle, void* buffer, uint32_t by
     /* Named pipe handle — read from Unix domain socket fd */
     {
         lsw_pipe_t* pp = (lsw_pipe_t*)handle;
-        if (pp->magic == LSW_PIPE_MAGIC) {
+        if (IS_TYPED_HANDLE(pp) && pp->magic == LSW_PIPE_MAGIC) {
             int pfd = pp->client_fd >= 0 ? pp->client_fd : -1;
             if (pfd < 0) { if (bytes_read) *bytes_read = 0; return 0; }
             ssize_t r = read(pfd, buffer, bytes_to_read);
@@ -1128,7 +1241,15 @@ uint32_t __attribute__((ms_abi)) lsw_GetFileSize(void* handle, uint32_t* file_si
         }
     }
     
-    // Fallback: shouldn't reach here with kernel mode
+    // Fallback: use fstat on raw fd
+    {
+        int fd = (int)(intptr_t)handle;
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            if (file_size_high) *file_size_high = (uint32_t)((uint64_t)st.st_size >> 32);
+            return (uint32_t)(st.st_size & 0xFFFFFFFF);
+        }
+    }
     if (file_size_high) *file_size_high = 0;
     return 0xFFFFFFFF;
 }
@@ -1175,7 +1296,18 @@ uint32_t __attribute__((ms_abi)) lsw_SetFilePointer(void* handle, int32_t distan
         }
     }
     
-    // Fallback
+    // Fallback: use lseek on raw fd
+    {
+        int fd = (int)(intptr_t)handle;
+        int whence = SEEK_SET;
+        if (move_method == 1) whence = SEEK_CUR;
+        else if (move_method == 2) whence = SEEK_END;
+        off_t new_pos = lseek(fd, (off_t)offset, whence);
+        if (new_pos != (off_t)-1) {
+            if (distance_to_move_high) *distance_to_move_high = (int32_t)(new_pos >> 32);
+            return (uint32_t)(new_pos & 0xFFFFFFFF);
+        }
+    }
     return 0xFFFFFFFF;
 }
 
@@ -2787,7 +2919,7 @@ void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_
 
     /* PE module handle? */
     lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)module;
-    if (pem->magic == LSW_PE_HMODULE_MAGIC) {
+    if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
         /* First check our Win32 stub tables (highest priority) */
         void* addr = win32_api_resolve(pem->dll_name, proc_name);
         if (!addr) addr = pe_hmodule_get_proc(pem, proc_name);
@@ -2855,6 +2987,7 @@ void __attribute__((ms_abi)) lsw_ExitProcess(DWORD exit_code) {
 #define WSAEINPROGRESS          10036
 #define WSAECONNREFUSED         10061
 #define WSAEHOSTUNREACH         10065
+#define WSAHOST_NOT_FOUND       11001
 
 // Winsock version
 #define MAKEWORD(a,b)           ((WORD)(((BYTE)(a))|(((WORD)((BYTE)(b)))<<8)))
@@ -2878,10 +3011,10 @@ struct sockaddr_in_win {
     short sin_family;
     unsigned short sin_port;
     struct {
-        unsigned long s_addr;
+        uint32_t s_addr;   /* must be exactly 4 bytes — use uint32_t not unsigned long */
     } sin_addr;
     char sin_zero[8];
-};
+} __attribute__((packed));
 
 // Last Winsock error (thread-local would be better, but keeping it simple)
 static int g_last_wsa_error = 0;
@@ -3067,6 +3200,31 @@ unsigned long __attribute__((ms_abi)) lsw_ntohl(unsigned long netlong) {
 unsigned long __attribute__((ms_abi)) lsw_inet_addr(const char* cp) {
     if (!cp) return INADDR_NONE;
     return inet_addr(cp);
+}
+
+/* Windows hostent struct layout */
+typedef struct {
+    char*  h_name;
+    char** h_aliases;
+    short  h_addrtype;
+    short  h_length;
+    char** h_addr_list;
+} lsw_hostent_t;
+
+// ws2_32.dll!gethostbyname — synchronous DNS lookup
+lsw_hostent_t* __attribute__((ms_abi)) lsw_gethostbyname(const char* name) {
+    if (!name) { g_last_wsa_error = WSAEFAULT; return NULL; }
+    struct hostent* h = gethostbyname(name);
+    if (!h) { g_last_wsa_error = WSAHOST_NOT_FOUND; return NULL; }
+    /* Return POSIX hostent — layout is identical to Windows hostent */
+    return (lsw_hostent_t*)h;
+}
+
+// ws2_32.dll!gethostbyaddr
+lsw_hostent_t* __attribute__((ms_abi)) lsw_gethostbyaddr(const char* addr, int len, int type) {
+    struct hostent* h = gethostbyaddr(addr, len, type);
+    if (!h) { g_last_wsa_error = WSAHOST_NOT_FOUND; return NULL; }
+    return (lsw_hostent_t*)h;
 }
 
 // ============================================================================
@@ -3396,6 +3554,13 @@ typedef struct {
     uint8_t  wProductType;
     uint8_t  wReserved;
 } OSVERSIONINFOEXW_WIN;
+
+// KERNEL32.dll!GetVersion
+uint32_t __attribute__((ms_abi)) lsw_GetVersion(void) {
+    /* Returns: low byte = major, next byte = minor, high word = build */
+    LSW_LOG_INFO("GetVersion called");
+    return (uint32_t)((19041u << 16) | (0u << 8) | 10u);  /* Windows 10.0 Build 19041 */
+}
 
 // KERNEL32.dll!GetVersionExW
 int __attribute__((ms_abi)) lsw_GetVersionExW(OSVERSIONINFOEXW_WIN* info) {
@@ -4298,7 +4463,7 @@ void* __attribute__((ms_abi)) lsw_OpenMutexA(uint32_t access, int inherit, const
 int __attribute__((ms_abi)) lsw_ReleaseMutex(void* h) {
     if (!h) return 0;
     lsw_mutex_t* m = (lsw_mutex_t*)h;
-    if (m->magic == LSW_MUTEX_MAGIC) {
+    if (IS_TYPED_HANDLE(m) && m->magic == LSW_MUTEX_MAGIC) {
         m->owned = 0;
         m->owner = (pthread_t)0;
         pthread_mutex_unlock(&m->mutex);
@@ -4330,7 +4495,7 @@ void* __attribute__((ms_abi)) lsw_CreateSemaphoreW(void* attrs, long init, long 
 int __attribute__((ms_abi)) lsw_ReleaseSemaphore(void* h, long count, long* prev) {
     if (!h) return 0;
     lsw_semaphore_t* s = (lsw_semaphore_t*)h;
-    if (s->magic == LSW_SEMA_MAGIC) {
+    if (IS_TYPED_HANDLE(s) && s->magic == LSW_SEMA_MAGIC) {
         if (prev) { int v = 0; sem_getvalue(&s->sem, &v); *prev = (long)v; }
         for (long i = 0; i < count; i++) sem_post(&s->sem);
         return 1;
@@ -4679,7 +4844,7 @@ int __attribute__((ms_abi)) lsw_IsWow64Process(void* hProcess, int* Wow64Process
 int __attribute__((ms_abi)) lsw_FreeLibrary(void* hLibModule) {
     if (!hLibModule || hLibModule == LSW_SYSTEM_HMODULE) return 1;
     lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)hLibModule;
-    if (pem->magic == LSW_PE_HMODULE_MAGIC) {
+    if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
         if (pem->image_base) munmap(pem->image_base, pem->image_size);
         pem->magic = 0;
         return 1;
@@ -5311,7 +5476,7 @@ int __attribute__((ms_abi)) lsw_WaitNamedPipeW(const uint16_t* n, uint32_t t) {
 /* Read/Write on named pipe handles route through the client_fd */
 static int pipe_handle_fd(void* handle) {
     lsw_pipe_t* p = (lsw_pipe_t*)handle;
-    if (p && p->magic == LSW_PIPE_MAGIC) {
+    if (p && IS_TYPED_HANDLE(p) && p->magic == LSW_PIPE_MAGIC) {
         return p->client_fd >= 0 ? p->client_fd : -1;
     }
     return -1;
@@ -5873,6 +6038,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ws2_32.dll", "ntohs", (void*)lsw_ntohs},
     {"ws2_32.dll", "ntohl", (void*)lsw_ntohl},
     {"ws2_32.dll", "inet_addr", (void*)lsw_inet_addr},
+    {"ws2_32.dll", "gethostbyname", (void*)lsw_gethostbyname},
+    {"ws2_32.dll", "gethostbyaddr", (void*)lsw_gethostbyaddr},
     
     // KERNEL32.dll - continued
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
@@ -5932,6 +6099,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetTickCount", (void*)lsw_GetTickCount},
     {"KERNEL32.dll", "GetTickCount64", (void*)lsw_GetTickCount64},
     {"KERNEL32.dll", "GetSystemInfo", (void*)lsw_GetSystemInfo},
+    {"KERNEL32.dll", "GetVersion", (void*)lsw_GetVersion},
+    {"KERNEL32.dll", "GetVersionExA", (void*)lsw_GetVersionExW},
     {"KERNEL32.dll", "GetVersionExW", (void*)lsw_GetVersionExW},
     {"KERNEL32.dll", "IsDebuggerPresent", (void*)lsw_IsDebuggerPresent},
     {"KERNEL32.dll", "DecodePointer", (void*)lsw_DecodePointer},

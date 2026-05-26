@@ -660,8 +660,15 @@ bool pe_resolve_imports(pe_image_t* image) {
                 continue;
             }
             
-            // Resolve the function — stubs first, then real DLL chain
-            void* func_addr = resolve_import_with_dll_chain(dll_name, func_name);
+            // Resolve the function — data symbols first, then stubs, then DLL chain
+            void* func_addr = win32_api_resolve_data(dll_name, func_name);
+            if (func_addr) {
+                iat[i] = (uint64_t)func_addr;
+                func_count++;
+                LSW_LOG_DEBUG("    ✓ %s (data) -> %p", func_name, func_addr);
+            } else {
+                func_addr = resolve_import_with_dll_chain(dll_name, func_name);
+            }
             if (func_addr) {
                 iat[i] = (uint64_t)func_addr;
                 func_count++;
@@ -968,58 +975,48 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
         return -1;
     }
     
-    LSW_LOG_INFO("🚀 Executing PE image via kernel module...");
+    LSW_LOG_INFO("🚀 Executing PE image...");
     LSW_LOG_INFO("Entry point: %p", image->entry_point);
     
-    // Open kernel device
+    // Open kernel device — fall back to userspace-only mode if unavailable
     int kernel_fd = lsw_kernel_open();
-    if (kernel_fd < 0) {
-        LSW_LOG_ERROR("Failed to open kernel device /dev/lsw");
-        LSW_LOG_ERROR("Make sure the LSW kernel module is loaded: sudo insmod kernel-module/lsw.ko");
-        return -1;
+    int kernel_available = (kernel_fd >= 0);
+    
+    if (!kernel_available) {
+        LSW_LOG_WARN("Kernel device /dev/lsw not available — running in userspace-only mode");
+        LSW_LOG_WARN("(Load the kernel module for full ring-0 integration: sudo insmod kernel-module/lsw.ko)");
+    } else {
+        // Prepare PE info for kernel
+        struct lsw_pe_info pe_info;
+        memset(&pe_info, 0, sizeof(pe_info));
+        pe_info.pid = getpid();
+        pe_info.base_address = (uint64_t)image->image_base;
+        pe_info.entry_point = (uint64_t)image->entry_point;
+        pe_info.image_size = image->image_size;
+        pe_info.is_64bit = image->pe.is_64bit ? 1 : 0;
+        
+        const char* exe_path = (argc > 0 && argv && argv[0]) ? argv[0] : "unknown.exe";
+        strncpy(pe_info.executable_path, exe_path, sizeof(pe_info.executable_path) - 1);
+        
+        LSW_LOG_INFO("Registering PE with kernel (PID=%u base=0x%lx entry=0x%lx)",
+                     pe_info.pid, pe_info.base_address, pe_info.entry_point);
+        
+        int ret = lsw_kernel_register_pe(kernel_fd, &pe_info);
+        if (ret < 0) {
+            LSW_LOG_WARN("Failed to register PE with kernel — continuing in userspace-only mode");
+            lsw_kernel_close(kernel_fd);
+            kernel_fd = -1;
+            kernel_available = 0;
+        } else {
+            LSW_LOG_INFO("✅ PE registered with kernel successfully");
+            ret = lsw_kernel_execute_pe(kernel_fd, pe_info.pid);
+            if (ret < 0) {
+                LSW_LOG_WARN("Kernel execute_pe failed — continuing in userspace-only mode");
+            } else {
+                LSW_LOG_INFO("✅ Kernel acknowledged execution request");
+            }
+        }
     }
-    
-    // Prepare PE info for kernel
-    struct lsw_pe_info pe_info;
-    memset(&pe_info, 0, sizeof(pe_info));
-    pe_info.pid = getpid();
-    pe_info.base_address = (uint64_t)image->image_base;
-    pe_info.entry_point = (uint64_t)image->entry_point;
-    pe_info.image_size = image->image_size;
-    pe_info.is_64bit = image->pe.is_64bit ? 1 : 0;
-    
-    // Get executable path from argv or use placeholder
-    const char* exe_path = (argc > 0 && argv && argv[0]) ? argv[0] : "unknown.exe";
-    strncpy(pe_info.executable_path, exe_path, sizeof(pe_info.executable_path) - 1);
-    
-    LSW_LOG_INFO("Registering PE with kernel:");
-    LSW_LOG_INFO("  PID: %u", pe_info.pid);
-    LSW_LOG_INFO("  Base: 0x%lx", pe_info.base_address);
-    LSW_LOG_INFO("  Entry: 0x%lx", pe_info.entry_point);
-    LSW_LOG_INFO("  Size: 0x%x", pe_info.image_size);
-    LSW_LOG_INFO("  Arch: %s", pe_info.is_64bit ? "64-bit" : "32-bit");
-    
-    // Register PE with kernel
-    int ret = lsw_kernel_register_pe(kernel_fd, &pe_info);
-    if (ret < 0) {
-        LSW_LOG_ERROR("Failed to register PE with kernel");
-        lsw_kernel_close(kernel_fd);
-        return -1;
-    }
-    
-    LSW_LOG_INFO("✅ PE registered with kernel successfully");
-    
-    // Execute PE in kernel
-    LSW_LOG_INFO("🚀 Requesting kernel to execute PE...");
-    ret = lsw_kernel_execute_pe(kernel_fd, pe_info.pid);
-    if (ret < 0) {
-        LSW_LOG_ERROR("Failed to execute PE in kernel");
-        lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
-        lsw_kernel_close(kernel_fd);
-        return -1;
-    }
-    
-    LSW_LOG_INFO("✅ Kernel acknowledged execution request");
     
     // NOW: Actually jump to the PE entry point in userspace!
     LSW_LOG_INFO("🚀 Jumping to PE entry point: 0x%lx", (unsigned long)image->entry_point);
@@ -1041,8 +1038,7 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     LSW_LOG_INFO("Setting up Windows environment (TEB/PEB)...");
     if (win32_teb_init() != 0) {
         LSW_LOG_ERROR("Failed to initialize TEB/PEB");
-        lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
-        lsw_kernel_close(kernel_fd);
+        if (kernel_available) lsw_kernel_close(kernel_fd);
         return -1;
     }
     
@@ -1063,20 +1059,23 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     LSW_LOG_INFO("Image base: 0x%lx, Size: 0x%x", 
                  (unsigned long)image->image_base, image->image_size);
     
-    // Give Win32 APIs access to kernel fd for syscalls
+    // Give Win32 APIs access to kernel fd for syscalls (or -1 in userspace mode)
     win32_api_set_kernel_fd(kernel_fd);
     
     // This is where we actually execute Windows code on Linux!
-    // The PE entry point expects proper Windows environment
-    LSW_LOG_INFO("🚀 Executing PE with kernel syscall routing enabled!");
+    if (kernel_available) {
+        LSW_LOG_INFO("🚀 Executing PE with kernel syscall routing enabled!");
+    } else {
+        LSW_LOG_INFO("🚀 Executing PE in userspace-only mode!");
+    }
     exit_code = entry_func();
     
     LSW_LOG_INFO("✅ PE execution returned: exit_code=%d", exit_code);
-    LSW_LOG_INFO("Ring-3 → Ring-0 → Ring-3 → PE EXECUTION → Ring-3 complete!");
     
     // Cleanup
-    lsw_kernel_unregister_pe(kernel_fd, pe_info.pid);
-    lsw_kernel_close(kernel_fd);
+    if (kernel_available) {
+        lsw_kernel_close(kernel_fd);
+    }
     
     return exit_code;
 }

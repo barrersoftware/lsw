@@ -7,6 +7,7 @@
  */
 
 #include "win32_teb.h"
+#include "win32_api.h"
 #include "lsw_log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -155,6 +156,9 @@ void win32_set_command_line(int argc, char** argv) {
     current_params->MaximumLength = total_len + 1;
     
     LSW_LOG_INFO("Command line set: '%s'", command_line_buffer);
+
+    /* Populate CRT data stubs so __initenv / __argc / __argv etc. work */
+    win32_crt_data_init(argc, argv);
 }
 
 const char* win32_get_command_line(void) {

@@ -43,12 +43,26 @@ int main(void)
     }
     printf("  ✅ Socket created: %lu\n\n", (unsigned long)sock);
     
-    // Test 3: Connect to example.com:80
+    // Test 3: Resolve and connect to example.com:80
     printf("Test 3: Connecting to example.com:80...\n");
-    server.sin_family = AF_INET;
-    server.sin_port = htons(80);
-    server.sin_addr.s_addr = inet_addr("93.184.215.14"); // example.com IP
-    memset(server.sin_zero, 0, sizeof(server.sin_zero));
+    {
+        struct hostent* he = gethostbyname("example.com");
+        if (!he) {
+            printf("  ❌ gethostbyname() failed: %d\n", WSAGetLastError());
+            closesocket(sock);
+            WSACleanup();
+            return 1;
+        }
+        server.sin_family = AF_INET;
+        server.sin_port = htons(80);
+        server.sin_addr.s_addr = *(unsigned long*)he->h_addr_list[0];
+        memset(server.sin_zero, 0, sizeof(server.sin_zero));
+        printf("  Resolved: %d.%d.%d.%d\n",
+               (int)(server.sin_addr.s_addr & 0xff),
+               (int)((server.sin_addr.s_addr >> 8) & 0xff),
+               (int)((server.sin_addr.s_addr >> 16) & 0xff),
+               (int)((server.sin_addr.s_addr >> 24) & 0xff));
+    }
     
     result = connect(sock, (struct sockaddr*)&server, sizeof(server));
     if (result == SOCKET_ERROR) {

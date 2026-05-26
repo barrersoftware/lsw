@@ -37,6 +37,15 @@ void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal);
 // Get the address of the generic (do-nothing) stub — used for unresolved ordinals
 void* win32_api_get_generic_stub(void);
 
+// Resolve a DATA-export symbol (global variable) from msvcrt/ucrtbase.
+// Returns the *address* of a static variable stub, or NULL if not a known data symbol.
+// The PE import resolver calls this BEFORE falling back to function-stub resolution.
+void* win32_api_resolve_data(const char* dll_name, const char* sym);
+
+// Populate CRT data stubs (__argc, __argv, _environ, _acmdln, _pctype ...) from
+// the real process argc/argv.  Called after win32_set_command_line().
+void win32_crt_data_init(int argc, char** argv);
+
 // Get all API mappings
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count);
 
