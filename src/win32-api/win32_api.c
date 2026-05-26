@@ -41,8 +41,12 @@
 #include <sched.h>
 #include <ctype.h>
 #include <sys/wait.h>
-#include <sys/un.h>    /* Unix domain sockets for named pipes */
-#include <malloc.h>   /* malloc_usable_size */
+#include <sys/un.h>      /* Unix domain sockets for named pipes */
+#include <malloc.h>      /* malloc_usable_size */
+#include <semaphore.h>   /* sem_t — for CreateSemaphore */
+#include <sys/timerfd.h> /* timerfd_create — for waitable timers */
+#include <poll.h>        /* poll — for IOCP wait */
+#include <setjmp.h>      /* longjmp — for C++ exception delivery */
 
 // ioctl command  
 #define LSW_IOCTL_MAGIC 'L'
@@ -72,6 +76,65 @@ struct lsw_pipe_s {
     char path[128];
 };
 typedef struct lsw_pipe_s lsw_pipe_t;
+
+/* ---- Synchronization handle types ---- */
+#define LSW_EVENT_MAGIC   0x45564E54U  /* "EVNT" */
+#define LSW_MUTEX_MAGIC   0x4D555458U  /* "MUTX" */
+#define LSW_SEMA_MAGIC    0x53454D41U  /* "SEMA" */
+#define LSW_TIMER_MAGIC   0x54494D52U  /* "TIMR" */
+#define LSW_IOCP_MAGIC    0x494F4350U  /* "IOCP" */
+#define LSW_TPWORK_MAGIC  0x54505744U  /* "TPWD" */
+
+typedef struct {
+    uint32_t magic;       /* LSW_EVENT_MAGIC */
+    int manual_reset;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    volatile int signaled;
+} lsw_event_t;
+
+typedef struct {
+    uint32_t magic;       /* LSW_MUTEX_MAGIC */
+    pthread_mutex_t mutex;
+    volatile pthread_t owner;
+    volatile int owned;
+} lsw_mutex_t;
+
+typedef struct {
+    uint32_t magic;       /* LSW_SEMA_MAGIC */
+    sem_t    sem;
+    long     max_count;
+} lsw_semaphore_t;
+
+typedef struct {
+    uint32_t magic;       /* LSW_TIMER_MAGIC */
+    int      timerfd;
+    int32_t  period_ms;
+    int      manual_reset;
+} lsw_timer_t;
+
+typedef struct lsw_completion_s {
+    uint32_t   error;
+    uint32_t   bytes;
+    uintptr_t  key;
+    void      *overlapped;
+    struct lsw_completion_s *next;
+} lsw_completion_t;
+
+typedef struct {
+    uint32_t          magic;      /* LSW_IOCP_MAGIC */
+    int               wakefd[2];  /* pipe: [0]=read [1]=write */
+    pthread_mutex_t   lock;
+    lsw_completion_t *head;
+    lsw_completion_t *tail;
+} lsw_iocp_t;
+
+typedef void (__attribute__((ms_abi)) *lsw_tp_callback_fn)(void*,void*,void*);
+typedef struct {
+    uint32_t          magic;      /* LSW_TPWORK_MAGIC */
+    lsw_tp_callback_fn callback;
+    void             *context;
+} lsw_tp_work_t;
 
 // Code page constants
 #define CP_ACP 0        // ANSI code page
@@ -462,10 +525,6 @@ int __attribute__((ms_abi)) lsw__onexit(void* func) {
     return 0;
 }
 
-void* __attribute__((ms_abi)) lsw___C_specific_handler(void) {
-    // Exception handler - stub
-    return NULL;
-}
 
 int* __attribute__((ms_abi)) lsw___lc_codepage_func(void) {
     static int codepage = 437; // OEM US
@@ -729,32 +788,79 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
 int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
     if (handle == INVALID_HANDLE_VALUE || !handle) return 0;
 
+    uint32_t magic = *(const uint32_t*)handle;
+
     /* Named pipe handle */
-    {
+    if (magic == LSW_PIPE_MAGIC) {
         lsw_pipe_t* pp = (lsw_pipe_t*)handle;
-        if (pp->magic == LSW_PIPE_MAGIC) {
-            if (pp->client_fd >= 0) { close(pp->client_fd); pp->client_fd = -1; }
-            if (pp->listen_fd >= 0) { close(pp->listen_fd); unlink(pp->path); pp->listen_fd = -1; }
-            pp->magic = 0;
-            return 1;
-        }
+        if (pp->client_fd >= 0) { close(pp->client_fd); pp->client_fd = -1; }
+        if (pp->listen_fd >= 0) { close(pp->listen_fd); unlink(pp->path); pp->listen_fd = -1; }
+        pp->magic = 0;
+        free(pp);
+        return 1;
     }
 
     /* PE module handle */
-    {
+    if (magic == LSW_PE_HMODULE_MAGIC) {
         lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)handle;
-        if (pem->magic == LSW_PE_HMODULE_MAGIC) {
-            if (pem->image_base) munmap(pem->image_base, pem->image_size);
-            pem->magic = 0;
-            return 1;
-        }
+        if (pem->image_base) munmap(pem->image_base, pem->image_size);
+        pem->magic = 0;
+        return 1;
+    }
+
+    /* Event handle */
+    if (magic == LSW_EVENT_MAGIC) {
+        lsw_event_t* ev = (lsw_event_t*)handle;
+        pthread_mutex_destroy(&ev->lock);
+        pthread_cond_destroy(&ev->cond);
+        ev->magic = 0;
+        free(ev);
+        return 1;
+    }
+
+    /* Mutex handle */
+    if (magic == LSW_MUTEX_MAGIC) {
+        lsw_mutex_t* m = (lsw_mutex_t*)handle;
+        pthread_mutex_destroy(&m->mutex);
+        m->magic = 0;
+        free(m);
+        return 1;
+    }
+
+    /* Semaphore handle */
+    if (magic == LSW_SEMA_MAGIC) {
+        lsw_semaphore_t* s = (lsw_semaphore_t*)handle;
+        sem_destroy(&s->sem);
+        s->magic = 0;
+        free(s);
+        return 1;
+    }
+
+    /* Waitable timer handle */
+    if (magic == LSW_TIMER_MAGIC) {
+        lsw_timer_t* t = (lsw_timer_t*)handle;
+        if (t->timerfd >= 0) close(t->timerfd);
+        t->magic = 0;
+        free(t);
+        return 1;
+    }
+
+    /* IOCP handle */
+    if (magic == LSW_IOCP_MAGIC) {
+        lsw_iocp_t* io = (lsw_iocp_t*)handle;
+        close(io->wakefd[0]); close(io->wakefd[1]);
+        pthread_mutex_destroy(&io->lock);
+        lsw_completion_t* c = io->head;
+        while (c) { lsw_completion_t* n = c->next; free(c); c = n; }
+        io->magic = 0;
+        free(io);
+        return 1;
     }
 
     /* Raw file descriptor */
     intptr_t fd = (intptr_t)handle;
     if (fd >= 0 && fd < 1024) {
         close((int)fd);
-        LSW_LOG_INFO("CloseHandle: fd=%d", (int)fd);
         return 1;
     }
 
@@ -764,17 +870,30 @@ int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
 
 // Synchronization functions
 void* __attribute__((ms_abi)) lsw_CreateEventA(void* security, int manual_reset, int initial_state, const char* name) {
-    (void)security; (void)manual_reset; (void)initial_state; (void)name;
-    // Simple stub - return a fake handle
-    static int event_counter = 1000;
-    void* handle = (void*)(intptr_t)(event_counter++);
-    LSW_LOG_INFO("CreateEventA: name=%s -> handle=%p", name ? name : "(null)", handle);
-    return handle;
+    (void)security; (void)name;
+    lsw_event_t* ev = calloc(1, sizeof(lsw_event_t));
+    ev->magic = LSW_EVENT_MAGIC;
+    ev->manual_reset = manual_reset;
+    pthread_mutex_init(&ev->lock, NULL);
+    pthread_cond_init(&ev->cond, NULL);
+    ev->signaled = initial_state ? 1 : 0;
+    LSW_LOG_INFO("CreateEventA: name=%s -> %p", name ? name : "(null)", ev);
+    return ev;
 }
 
 int __attribute__((ms_abi)) lsw_SetEvent(void* handle) {
-    LSW_LOG_INFO("SetEvent: handle=%p", handle);
-    return 1; // Success
+    lsw_event_t* ev = handle;
+    if (!ev) return 0;
+    if (ev->magic == LSW_EVENT_MAGIC) {
+        pthread_mutex_lock(&ev->lock);
+        ev->signaled = 1;
+        if (ev->manual_reset) pthread_cond_broadcast(&ev->cond);
+        else                  pthread_cond_signal(&ev->cond);
+        pthread_mutex_unlock(&ev->lock);
+        return 1;
+    }
+    LSW_LOG_INFO("SetEvent: handle=%p (unknown type)", handle);
+    return 1; /* best effort */
 }
 
 // Process functions
@@ -2330,66 +2449,134 @@ void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
 
 uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t milliseconds)
 {
-    LSW_LOG_INFO("WaitForSingleObject called: handle=%p, timeout=%u", handle, milliseconds);
-    
-    if (!handle) {
-        LSW_LOG_ERROR("WaitForSingleObject: null handle");
-        return 0xFFFFFFFF; // WAIT_FAILED
+    if (!handle) return 0xFFFFFFFF; /* WAIT_FAILED */
+
+    /* ---- Typed handle dispatch ---- */
+    uint32_t magic = *(const uint32_t*)handle;
+
+    if (magic == LSW_EVENT_MAGIC) {
+        lsw_event_t* ev = handle;
+        pthread_mutex_lock(&ev->lock);
+        if (milliseconds == 0xFFFFFFFF) {
+            while (!ev->signaled)
+                pthread_cond_wait(&ev->cond, &ev->lock);
+        } else if (milliseconds == 0) {
+            if (!ev->signaled) {
+                pthread_mutex_unlock(&ev->lock);
+                return 0x00000102; /* WAIT_TIMEOUT */
+            }
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += milliseconds / 1000;
+            ts.tv_nsec += (milliseconds % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            while (!ev->signaled) {
+                if (pthread_cond_timedwait(&ev->cond, &ev->lock, &ts) != 0)
+                    break;
+            }
+            if (!ev->signaled) {
+                pthread_mutex_unlock(&ev->lock);
+                return 0x00000102;
+            }
+        }
+        if (!ev->manual_reset) ev->signaled = 0; /* auto-reset */
+        pthread_mutex_unlock(&ev->lock);
+        return 0; /* WAIT_OBJECT_0 */
     }
 
-    /* Check if handle looks like a child PID from CreateProcess */
+    if (magic == LSW_MUTEX_MAGIC) {
+        lsw_mutex_t* m = handle;
+        int r;
+        if (milliseconds == 0xFFFFFFFF) {
+            r = pthread_mutex_lock(&m->mutex);
+        } else if (milliseconds == 0) {
+            r = pthread_mutex_trylock(&m->mutex);
+            if (r != 0) return 0x00000102;
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += milliseconds / 1000;
+            ts.tv_nsec += (milliseconds % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            r = pthread_mutex_timedlock(&m->mutex, &ts);
+            if (r != 0) return 0x00000102;
+        }
+        if (r == 0) { m->owner = pthread_self(); m->owned = 1; }
+        return (r == 0) ? 0 : 0xFFFFFFFF;
+    }
+
+    if (magic == LSW_SEMA_MAGIC) {
+        lsw_semaphore_t* s = handle;
+        if (milliseconds == 0xFFFFFFFF) {
+            return (sem_wait(&s->sem) == 0) ? 0 : 0xFFFFFFFF;
+        } else if (milliseconds == 0) {
+            return (sem_trywait(&s->sem) == 0) ? 0 : 0x00000102;
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += milliseconds / 1000;
+            ts.tv_nsec += (milliseconds % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            return (sem_timedwait(&s->sem, &ts) == 0) ? 0 : 0x00000102;
+        }
+    }
+
+    if (magic == LSW_TIMER_MAGIC) {
+        lsw_timer_t* t = handle;
+        if (t->timerfd < 0) return 0xFFFFFFFF;
+        struct pollfd pfd = { .fd = t->timerfd, .events = POLLIN };
+        int r = poll(&pfd, 1, (milliseconds == 0xFFFFFFFF) ? -1 : (int)milliseconds);
+        if (r > 0) {
+            uint64_t expirations;
+            read(t->timerfd, &expirations, sizeof(expirations));
+            return 0;
+        }
+        return (r == 0) ? 0x00000102 : 0xFFFFFFFF;
+    }
+
+    /* ---- Process handle (PID) ---- */
     pid_t pid = (pid_t)(uintptr_t)handle;
     if (pid > 1 && pid < 65536) {
         int wstatus = 0;
         if (milliseconds == 0xFFFFFFFF) {
-            /* INFINITE — block until child exits */
             pid_t r = waitpid(pid, &wstatus, 0);
-            if (r == pid) { LSW_LOG_INFO("WaitForSingleObject: child %d exited", pid); return 0; }
+            if (r == pid) return 0;
         } else if (milliseconds == 0) {
             pid_t r = waitpid(pid, &wstatus, WNOHANG);
             if (r == pid) return 0;
-            return 0x00000102; /* WAIT_TIMEOUT */
+            return 0x00000102;
         } else {
-            /* Poll with exponential backoff up to timeout */
             uint32_t waited = 0, step = 5;
             while (waited < milliseconds) {
                 pid_t r = waitpid(pid, &wstatus, WNOHANG);
-                if (r == pid) { LSW_LOG_INFO("WaitForSingleObject: child %d exited", pid); return 0; }
+                if (r == pid) return 0;
                 usleep(step * 1000);
                 waited += step;
                 if (step < 100) step *= 2;
             }
-            return 0x00000102; /* WAIT_TIMEOUT */
+            return 0x00000102;
         }
     }
 
-    // Route through kernel for non-process handles
+    /* ---- Kernel path ---- */
     if (g_kernel_fd >= 0) {
-        LSW_LOG_INFO("Routing WaitForSingleObject through kernel!");
-        
         struct lsw_syscall_request req;
         memset(&req, 0, sizeof(req));
         req.syscall_number = LSW_SYSCALL_NtWaitForSingleObject;
         req.arg_count = 3;
         req.args[0] = (uint64_t)(uintptr_t)handle;
-        req.args[1] = 0;  // Alertable = FALSE
+        req.args[1] = 0;
         req.args[2] = milliseconds;
-        
-        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
-            uint32_t result = (uint32_t)req.return_value;
-            LSW_LOG_INFO("WaitForSingleObject: result=%u (0=WAIT_OBJECT_0)", result);
-            return result;
-        } else {
-            LSW_LOG_ERROR("Kernel ioctl failed for WaitForSingleObject: %s", strerror(errno));
-        }
+        if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0)
+            return (uint32_t)req.return_value;
     }
-    
-    // Fallback: basic sleep (not ideal but works for testing)
-    LSW_LOG_WARN("WaitForSingleObject: using sleep fallback");
-    if (milliseconds != 0xFFFFFFFF) {  // Not INFINITE
-        usleep(milliseconds * 1000);
-    }
-    return 0; // WAIT_OBJECT_0
+
+    /* Fallback sleep */
+    LSW_LOG_WARN("WaitForSingleObject(%p, %u): unknown handle type, fallback sleep", handle, milliseconds);
+    if (milliseconds != 0xFFFFFFFF)
+        usleep(milliseconds * 1000UL);
+    return 0;
 }
 
 /*
@@ -3238,30 +3425,42 @@ void* __attribute__((ms_abi)) lsw_EncodePointer(void* ptr) {
 }
 
 // KERNEL32.dll!FormatMessageA — minimal stub returning empty string
+// KERNEL32.dll!FormatMessageA — translate system error codes via strerror
 uint32_t __attribute__((ms_abi)) lsw_FormatMessageA(
     uint32_t flags, const void* source, uint32_t message_id,
     uint32_t language_id, char* buffer, uint32_t size, void* args)
 {
-    (void)flags; (void)source; (void)language_id; (void)args;
-    LSW_LOG_WARN("FormatMessageA(0x%x, msg=0x%x) stub", flags, message_id);
-    if (buffer && size > 0) {
+    (void)source; (void)language_id; (void)args;
+    if (!buffer || size == 0) return 0;
+    if (flags & 0x1000) { /* FORMAT_MESSAGE_FROM_SYSTEM */
+        const char* msg = strerror((int)message_id);
+        if (!msg) snprintf(buffer, size, "Error %u (0x%x)", message_id, message_id);
+        else       snprintf(buffer, size, "%s", msg);
+    } else {
         snprintf(buffer, size, "Error 0x%x", message_id);
-        return (uint32_t)strlen(buffer);
     }
-    return 0;
+    return (uint32_t)strlen(buffer);
 }
 
-// KERNEL32.dll!FormatMessageW — minimal stub
+// KERNEL32.dll!FormatMessageW
 uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
     uint32_t flags, const void* source, uint32_t message_id,
     uint32_t language_id, uint16_t* buffer, uint32_t size, void* args)
 {
-    (void)flags; (void)source; (void)language_id; (void)args;
-    LSW_LOG_WARN("FormatMessageW(0x%x, msg=0x%x) stub", flags, message_id);
-    if (buffer && size > 0) {
-        buffer[0] = 0;
+    (void)source; (void)language_id; (void)args;
+    if (!buffer || size == 0) return 0;
+    char tmp[512];
+    if (flags & 0x1000) {
+        const char* msg = strerror((int)message_id);
+        if (!msg) snprintf(tmp, sizeof(tmp), "Error %u", message_id);
+        else       snprintf(tmp, sizeof(tmp), "%s", msg);
+    } else {
+        snprintf(tmp, sizeof(tmp), "Error 0x%x", message_id);
     }
-    return 0;
+    uint32_t len = (uint32_t)strlen(tmp);
+    if (len >= size) len = size - 1;
+    for (uint32_t i = 0; i <= len; i++) buffer[i] = (uint16_t)tmp[i];
+    return len;
 }
 
 // ---- SRW Locks (use pthread_mutex_t as a simple approximation) ----
@@ -3328,28 +3527,26 @@ int __attribute__((ms_abi)) lsw_FlsSetValue(uint32_t index, void* value) {
 // ---- CreateMutexW ----
 void* __attribute__((ms_abi)) lsw_CreateMutexW(void* attrs, int initial_owner, const uint16_t* name) {
     (void)attrs; (void)name;
-    pthread_mutex_t* m = malloc(sizeof(pthread_mutex_t));
+    lsw_mutex_t* m = calloc(1, sizeof(lsw_mutex_t));
     if (!m) return NULL;
-    pthread_mutex_init(m, NULL);
-    if (initial_owner) pthread_mutex_lock(m);
+    m->magic = LSW_MUTEX_MAGIC;
+    pthread_mutex_init(&m->mutex, NULL);
+    if (initial_owner) {
+        pthread_mutex_lock(&m->mutex);
+        m->owner = pthread_self();
+        m->owned = 1;
+    }
     LSW_LOG_INFO("CreateMutexW -> %p", (void*)m);
     return (void*)m;
 }
 
 // ---- CreateEventW ----
-// Implemented as a pthread condvar + mutex pair
-typedef struct {
-    pthread_mutex_t mtx;
-    pthread_cond_t  cond;
-    int             signaled;
-    int             manual_reset;
-} lsw_event_t;
-
 void* __attribute__((ms_abi)) lsw_CreateEventW(void* attrs, int manual_reset, int initial_state, const uint16_t* name) {
     (void)attrs; (void)name;
-    lsw_event_t* ev = malloc(sizeof(lsw_event_t));
+    lsw_event_t* ev = calloc(1, sizeof(lsw_event_t));
     if (!ev) return NULL;
-    pthread_mutex_init(&ev->mtx, NULL);
+    ev->magic = LSW_EVENT_MAGIC;
+    pthread_mutex_init(&ev->lock, NULL);
     pthread_cond_init(&ev->cond, NULL);
     ev->signaled = initial_state;
     ev->manual_reset = manual_reset;
@@ -3829,10 +4026,27 @@ void __attribute__((ms_abi)) lsw___crt_at_quick_exit(void* fn) { (void)fn; }
 void* __attribute__((ms_abi)) lsw___std_type_info_destroy_list(void* p) { (void)p; return NULL; }
 
 // C++ exception helpers (vcruntime)
+// Thread-local storage for the last thrown C++ exception
+static __thread void* tls_cxx_exception_obj  = NULL;
+static __thread void* tls_cxx_exception_type = NULL;
+
 void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* type) {
-    (void)obj; (void)type;
-    LSW_LOG_ERROR("_CxxThrowException called — C++ exceptions not supported; aborting");
-    abort();
+    tls_cxx_exception_obj  = obj;
+    tls_cxx_exception_type = type;
+    LSW_LOG_ERROR("_CxxThrowException: obj=%p type=%p — calling exit(1)", obj, type);
+    exit(1);
+}
+
+// __CxxFrameHandler3 — called by MSVC exception filter logic; always continue search
+int __attribute__((ms_abi)) lsw___CxxFrameHandler3(void* a, void* b, void* c, void* d) {
+    (void)a; (void)b; (void)c; (void)d;
+    return 0; /* ExceptionContinueSearch */
+}
+
+// __C_specific_handler — SEH handler for functions compiled with /EHa
+int __attribute__((ms_abi)) lsw___C_specific_handler(void* a, void* b, void* c, void* d) {
+    (void)a; (void)b; (void)c; (void)d;
+    return 0; /* ExceptionContinueSearch */
 }
 
 // ============================================================================
@@ -3953,8 +4167,26 @@ uint32_t __attribute__((ms_abi)) lsw_GetFileType(void* h) {
 int __attribute__((ms_abi)) lsw_DuplicateHandle(
     void* hsrcproc, void* hsrc, void* hdstproc, void** hdst,
     uint32_t access, int inherit, uint32_t opts) {
-    (void)hsrcproc; (void)hsrc; (void)hdstproc; (void)access; (void)inherit; (void)opts;
-    if (hdst) *hdst = hsrc; // shallow dup
+    (void)hsrcproc; (void)hdstproc; (void)access; (void)inherit;
+#define DUPLICATE_CLOSE_SOURCE 0x1
+    if (!hdst) {
+        if ((opts & DUPLICATE_CLOSE_SOURCE) && hsrc)
+            lsw_CloseHandle(hsrc);
+        return 1;
+    }
+    /* Try fd dup for file descriptor handles */
+    intptr_t fd = (intptr_t)hsrc;
+    if (fd >= 0 && fd < 65536) {
+        int nfd = dup((int)fd);
+        if (nfd >= 0) {
+            *hdst = (void*)(intptr_t)nfd;
+            if (opts & DUPLICATE_CLOSE_SOURCE) close((int)fd);
+            return 1;
+        }
+    }
+    /* For typed handles just alias; caller must not double-free */
+    *hdst = hsrc;
+    if (opts & DUPLICATE_CLOSE_SOURCE) lsw_CloseHandle(hsrc);
     return 1;
 }
 void __attribute__((ms_abi)) lsw_OutputDebugStringA(const char* s) {
@@ -4048,10 +4280,15 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForMultipleObjects(
 // CreateMutexA — same as CreateMutexW but accepts ASCII name
 void* __attribute__((ms_abi)) lsw_CreateMutexA(void* attrs, int initial_owner, const char* name) {
     (void)attrs; (void)name;
-    pthread_mutex_t* m = malloc(sizeof(pthread_mutex_t));
+    lsw_mutex_t* m = calloc(1, sizeof(lsw_mutex_t));
     if (!m) return NULL;
-    pthread_mutex_init(m, NULL);
-    if (initial_owner) pthread_mutex_lock(m);
+    m->magic = LSW_MUTEX_MAGIC;
+    pthread_mutex_init(&m->mutex, NULL);
+    if (initial_owner) {
+        pthread_mutex_lock(&m->mutex);
+        m->owner = pthread_self();
+        m->owned = 1;
+    }
     return (void*)m;
 }
 // OpenMutex stubs
@@ -4060,35 +4297,329 @@ void* __attribute__((ms_abi)) lsw_OpenMutexA(uint32_t access, int inherit, const
 }
 int __attribute__((ms_abi)) lsw_ReleaseMutex(void* h) {
     if (!h) return 0;
-    pthread_mutex_t* m = (pthread_mutex_t*)h;
-    return (pthread_mutex_unlock(m) == 0) ? 1 : 0;
+    lsw_mutex_t* m = (lsw_mutex_t*)h;
+    if (m->magic == LSW_MUTEX_MAGIC) {
+        m->owned = 0;
+        m->owner = (pthread_t)0;
+        pthread_mutex_unlock(&m->mutex);
+        return 1;
+    }
+    /* Legacy: raw pthread_mutex_t* */
+    return (pthread_mutex_unlock((pthread_mutex_t*)h) == 0) ? 1 : 0;
 }
 
-// CreateSemaphoreA/W, OpenSemaphoreA, ReleaseSemaphore (backed by sem_t)
-#include <semaphore.h>
+// CreateSemaphoreA/W, OpenSemaphoreA, ReleaseSemaphore (backed by lsw_semaphore_t)
 void* __attribute__((ms_abi)) lsw_CreateSemaphoreA(void* attrs, long init, long max, const char* name) {
-    (void)attrs; (void)max; (void)name;
-    sem_t* s = malloc(sizeof(sem_t));
+    (void)attrs; (void)name;
+    lsw_semaphore_t* s = calloc(1, sizeof(lsw_semaphore_t));
     if (!s) return NULL;
-    sem_init(s, 0, (unsigned int)init);
+    s->magic = LSW_SEMA_MAGIC;
+    s->max_count = max;
+    sem_init(&s->sem, 0, (unsigned int)init);
     return (void*)s;
 }
 void* __attribute__((ms_abi)) lsw_CreateSemaphoreW(void* attrs, long init, long max, const uint16_t* name) {
-    (void)attrs; (void)max; (void)name;
-    sem_t* s = malloc(sizeof(sem_t));
+    (void)attrs; (void)name;
+    lsw_semaphore_t* s = calloc(1, sizeof(lsw_semaphore_t));
     if (!s) return NULL;
-    sem_init(s, 0, (unsigned int)init);
+    s->magic = LSW_SEMA_MAGIC;
+    s->max_count = max;
+    sem_init(&s->sem, 0, (unsigned int)init);
     return (void*)s;
 }
 int __attribute__((ms_abi)) lsw_ReleaseSemaphore(void* h, long count, long* prev) {
     if (!h) return 0;
-    sem_t* s = (sem_t*)h;
-    if (prev) { int v = 0; sem_getvalue(s, &v); *prev = v; }
-    for (long i = 0; i < count; i++) sem_post(s);
+    lsw_semaphore_t* s = (lsw_semaphore_t*)h;
+    if (s->magic == LSW_SEMA_MAGIC) {
+        if (prev) { int v = 0; sem_getvalue(&s->sem, &v); *prev = (long)v; }
+        for (long i = 0; i < count; i++) sem_post(&s->sem);
+        return 1;
+    }
+    /* Legacy raw sem_t* */
+    sem_t* raw = (sem_t*)h;
+    if (prev) { int v = 0; sem_getvalue(raw, &v); *prev = (long)v; }
+    for (long i = 0; i < count; i++) sem_post(raw);
     return 1;
 }
 
-// InitOnceExecuteOnce — simple spinlock-style stub
+// KERNEL32.dll!ResetEvent
+int __attribute__((ms_abi)) lsw_ResetEvent(void* h) {
+    if (!h) return 0;
+    lsw_event_t* ev = (lsw_event_t*)h;
+    if (ev->magic != LSW_EVENT_MAGIC) return 0;
+    pthread_mutex_lock(&ev->lock);
+    ev->signaled = 0;
+    pthread_mutex_unlock(&ev->lock);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Condition Variables
+// ---------------------------------------------------------------------------
+void __attribute__((ms_abi)) lsw_InitializeConditionVariable(void** cv) {
+    if (!cv) return;
+    pthread_cond_t* c = calloc(1, sizeof(pthread_cond_t));
+    pthread_cond_init(c, NULL);
+    *cv = c;
+}
+
+void __attribute__((ms_abi)) lsw_WakeConditionVariable(void** cv) {
+    if (!cv || !*cv) return;
+    pthread_cond_signal((pthread_cond_t*)*cv);
+}
+
+void __attribute__((ms_abi)) lsw_WakeAllConditionVariable(void** cv) {
+    if (!cv || !*cv) return;
+    pthread_cond_broadcast((pthread_cond_t*)*cv);
+}
+
+int __attribute__((ms_abi)) lsw_SleepConditionVariableCS(void** cv, void* cs, uint32_t ms) {
+    if (!cv || !*cv || !cs) return 0;
+    pthread_cond_t* c = (pthread_cond_t*)*cv;
+    pthread_mutex_t* m = (pthread_mutex_t*)cs;
+    if (ms == 0xFFFFFFFF) {
+        return (pthread_cond_wait(c, m) == 0) ? 1 : 0;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += ms / 1000;
+    ts.tv_nsec += (ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    int r = pthread_cond_timedwait(c, m, &ts);
+    if (r == ETIMEDOUT) { /* SetLastError(ERROR_TIMEOUT) */ return 0; }
+    return (r == 0) ? 1 : 0;
+}
+
+int __attribute__((ms_abi)) lsw_SleepConditionVariableSRW(void** cv, void** srw, uint32_t ms, uint32_t flags) {
+    /* SRW in shared mode (CONDITION_VARIABLE_LOCKMODE_SHARED=1) needs read unlock/lock
+       but we store them as plain mutexes, so just treat same as CS */
+    (void)flags;
+    return lsw_SleepConditionVariableCS(cv, srw ? *srw : NULL, ms);
+}
+
+// ---------------------------------------------------------------------------
+// Waitable Timers
+// ---------------------------------------------------------------------------
+void* __attribute__((ms_abi)) lsw_CreateWaitableTimerW(void* sec, int manual, const uint16_t* name) {
+    (void)sec; (void)manual; (void)name;
+    lsw_timer_t* t = calloc(1, sizeof(lsw_timer_t));
+    t->magic = LSW_TIMER_MAGIC;
+    t->manual_reset = manual;
+    t->timerfd = timerfd_create(CLOCK_REALTIME, TFD_CLOEXEC | TFD_NONBLOCK);
+    return t;
+}
+void* __attribute__((ms_abi)) lsw_CreateWaitableTimerA(void* sec, int manual, const char* name) {
+    (void)name; return lsw_CreateWaitableTimerW(sec, manual, NULL);
+}
+void* __attribute__((ms_abi)) lsw_CreateWaitableTimerExW(void* sec, const uint16_t* name, uint32_t flags, uint32_t access) {
+    (void)access;
+    int manual = (flags & 1) ? 1 : 0; /* CREATE_WAITABLE_TIMER_MANUAL_RESET=1 */
+    return lsw_CreateWaitableTimerW(sec, manual, name);
+}
+void* __attribute__((ms_abi)) lsw_OpenWaitableTimerW(uint32_t access, int inherit, const uint16_t* name) {
+    (void)access; (void)inherit; (void)name; return NULL; /* named timers not supported */
+}
+
+int __attribute__((ms_abi)) lsw_SetWaitableTimer(void* h, const int64_t* due, int period_ms,
+                                                   void* apc, void* apc_arg, int resume) {
+    (void)apc; (void)apc_arg; (void)resume;
+    if (!h) return 0;
+    lsw_timer_t* t = (lsw_timer_t*)h;
+    if (t->magic != LSW_TIMER_MAGIC || t->timerfd < 0) return 0;
+    struct itimerspec its = {0};
+    int64_t d = due ? *due : 0;
+    if (d < 0) {
+        /* Relative time in 100ns units */
+        int64_t ns = (-d) * 100;
+        its.it_value.tv_sec  = ns / 1000000000LL;
+        its.it_value.tv_nsec = ns % 1000000000LL;
+    } else if (d > 0) {
+        /* Absolute FILETIME: 100ns since 1601-01-01 */
+        /* Convert to Unix epoch: subtract 116444736000000000 (100ns units) */
+        int64_t unix_ns = (d - 116444736000000000LL) * 100;
+        its.it_value.tv_sec  = unix_ns / 1000000000LL;
+        its.it_value.tv_nsec = unix_ns % 1000000000LL;
+    } else {
+        /* due==NULL or 0: fire immediately */
+        its.it_value.tv_nsec = 1;
+    }
+    if (period_ms > 0) {
+        its.it_interval.tv_sec  = period_ms / 1000;
+        its.it_interval.tv_nsec = (period_ms % 1000) * 1000000L;
+    }
+    return (timerfd_settime(t->timerfd, (d > 0) ? TFD_TIMER_ABSTIME : 0, &its, NULL) == 0) ? 1 : 0;
+}
+
+int __attribute__((ms_abi)) lsw_CancelWaitableTimer(void* h) {
+    if (!h) return 0;
+    lsw_timer_t* t = (lsw_timer_t*)h;
+    if (t->magic != LSW_TIMER_MAGIC || t->timerfd < 0) return 0;
+    struct itimerspec its = {0};
+    return (timerfd_settime(t->timerfd, 0, &its, NULL) == 0) ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// IOCP — I/O Completion Ports
+// ---------------------------------------------------------------------------
+void* __attribute__((ms_abi)) lsw_CreateIoCompletionPort(void* file_handle, void* existing_port,
+                                                           uintptr_t completion_key, uint32_t threads) {
+    (void)file_handle; (void)completion_key; (void)threads;
+    if (existing_port) return existing_port; /* associate file — we ignore it */
+    lsw_iocp_t* io = calloc(1, sizeof(lsw_iocp_t));
+    io->magic = LSW_IOCP_MAGIC;
+    pthread_mutex_init(&io->lock, NULL);
+    pipe(io->wakefd);
+    return io;
+}
+
+int __attribute__((ms_abi)) lsw_PostQueuedCompletionStatus(void* port, uint32_t bytes,
+                                                             uintptr_t key, void* overlapped) {
+    if (!port) return 0;
+    lsw_iocp_t* io = (lsw_iocp_t*)port;
+    if (io->magic != LSW_IOCP_MAGIC) return 0;
+    lsw_completion_t* c = calloc(1, sizeof(lsw_completion_t));
+    c->bytes = bytes; c->key = key; c->overlapped = overlapped;
+    pthread_mutex_lock(&io->lock);
+    c->next = NULL;
+    if (io->tail) io->tail->next = c; else io->head = c;
+    io->tail = c;
+    pthread_mutex_unlock(&io->lock);
+    uint8_t wake = 1;
+    write(io->wakefd[1], &wake, 1);
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_GetQueuedCompletionStatus(void* port, uint32_t* bytes,
+                                                            uintptr_t* key, void** overlapped,
+                                                            uint32_t ms) {
+    if (!port) return 0;
+    lsw_iocp_t* io = (lsw_iocp_t*)port;
+    if (io->magic != LSW_IOCP_MAGIC) return 0;
+    struct pollfd pfd = { .fd = io->wakefd[0], .events = POLLIN };
+    int r = poll(&pfd, 1, (ms == 0xFFFFFFFF) ? -1 : (int)ms);
+    if (r <= 0) return 0; /* timeout or error */
+    uint8_t dummy;
+    read(io->wakefd[0], &dummy, 1);
+    pthread_mutex_lock(&io->lock);
+    lsw_completion_t* c = io->head;
+    if (c) {
+        io->head = c->next;
+        if (!io->head) io->tail = NULL;
+    }
+    pthread_mutex_unlock(&io->lock);
+    if (!c) return 0;
+    if (bytes)      *bytes      = c->bytes;
+    if (key)        *key        = c->key;
+    if (overlapped) *overlapped = c->overlapped;
+    free(c);
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_GetQueuedCompletionStatusEx(void* port, void* entries,
+                                                              uint32_t count, uint32_t* removed,
+                                                              uint32_t ms, int alertable) {
+    (void)alertable;
+    /* Simple single-entry version */
+    typedef struct { uintptr_t key; void* overlapped; uintptr_t internal; uint32_t bytes; } OVERLAPPED_ENTRY;
+    OVERLAPPED_ENTRY* ents = (OVERLAPPED_ENTRY*)entries;
+    uint32_t got = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        int r = lsw_GetQueuedCompletionStatus(port, &ents[i].bytes, &ents[i].key, &ents[i].overlapped,
+                                               (i == 0) ? ms : 0);
+        if (!r) break;
+        got++;
+    }
+    if (removed) *removed = got;
+    return got > 0 ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Thread Pool API
+// ---------------------------------------------------------------------------
+typedef struct lsw_tp_work_s {
+    uint32_t magic;           /* LSW_TPWORK_MAGIC */
+    void* callback;           /* PTP_WORK_CALLBACK  (ms_abi) */
+    void* callback_param;
+    pthread_t thread;
+    int submitted;
+} lsw_tp_work_impl_t;
+
+static void* _tp_work_thread(void* arg) {
+    lsw_tp_work_impl_t* w = (lsw_tp_work_impl_t*)arg;
+    typedef void (__attribute__((ms_abi)) *cb_t)(void*, void*, void*);
+    cb_t cb = (cb_t)(uintptr_t)w->callback;
+    if (cb) cb(NULL, w->callback_param, w);
+    return NULL;
+}
+
+void* __attribute__((ms_abi)) lsw_CreateThreadpoolWork(void* callback, void* param, void* env) {
+    (void)env;
+    lsw_tp_work_impl_t* w = calloc(1, sizeof(lsw_tp_work_impl_t));
+    w->magic = LSW_TPWORK_MAGIC;
+    w->callback = callback;
+    w->callback_param = param;
+    return w;
+}
+
+void __attribute__((ms_abi)) lsw_SubmitThreadpoolWork(void* work) {
+    lsw_tp_work_impl_t* w = (lsw_tp_work_impl_t*)work;
+    if (!w || w->magic != LSW_TPWORK_MAGIC) return;
+    w->submitted = 1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&w->thread, &attr, _tp_work_thread, w);
+    pthread_attr_destroy(&attr);
+}
+
+void __attribute__((ms_abi)) lsw_WaitForThreadpoolWorkCallbacks(void* work, int cancel) {
+    (void)cancel;
+    /* For detached threads we can't join — just yield briefly */
+    usleep(10000);
+}
+
+void __attribute__((ms_abi)) lsw_CloseThreadpoolWork(void* work) {
+    lsw_tp_work_impl_t* w = (lsw_tp_work_impl_t*)work;
+    if (!w || w->magic != LSW_TPWORK_MAGIC) return;
+    w->magic = 0;
+    free(w);
+}
+
+void* __attribute__((ms_abi)) lsw_CreateThreadpool(void* env) {
+    (void)env; return (void*)(uintptr_t)0x1; /* dummy pool */
+}
+void __attribute__((ms_abi)) lsw_CloseThreadpool(void* pool) { (void)pool; }
+void __attribute__((ms_abi)) lsw_SetThreadpoolThreadMaximum(void* pool, uint32_t max) { (void)pool; (void)max; }
+void __attribute__((ms_abi)) lsw_SetThreadpoolThreadMinimum(void* pool, uint32_t min) { (void)pool; (void)min; }
+
+// Thread pool timer (simple timerfd-backed)
+void* __attribute__((ms_abi)) lsw_CreateThreadpoolTimer(void* callback, void* param, void* env) {
+    (void)env;
+    lsw_tp_work_impl_t* w = calloc(1, sizeof(lsw_tp_work_impl_t));
+    w->magic = LSW_TPWORK_MAGIC;
+    w->callback = callback;
+    w->callback_param = param;
+    return w;
+}
+void __attribute__((ms_abi)) lsw_SetThreadpoolTimer(void* timer, const void* ft, uint32_t ms_period, uint32_t ms_window) {
+    (void)ft; (void)ms_period; (void)ms_window;
+    /* Fire immediately via SubmitThreadpoolWork */
+    lsw_SubmitThreadpoolWork(timer);
+}
+void __attribute__((ms_abi)) lsw_WaitForThreadpoolTimerCallbacks(void* timer, int cancel) { lsw_WaitForThreadpoolWorkCallbacks(timer, cancel); }
+void __attribute__((ms_abi)) lsw_CloseThreadpoolTimer(void* timer)  { lsw_CloseThreadpoolWork(timer); }
+int  __attribute__((ms_abi)) lsw_IsThreadpoolTimerSet(void* timer)  { lsw_tp_work_impl_t* w = timer; return w && w->submitted; }
+
+void* __attribute__((ms_abi)) lsw_CreateThreadpoolIo(void* file, void* callback, void* param, void* env) {
+    (void)file; (void)env;
+    lsw_tp_work_impl_t* w = calloc(1, sizeof(lsw_tp_work_impl_t));
+    w->magic = LSW_TPWORK_MAGIC; w->callback = callback; w->callback_param = param;
+    return w;
+}
+void __attribute__((ms_abi)) lsw_StartThreadpoolIo(void* io)           { (void)io; }
+void __attribute__((ms_abi)) lsw_CancelThreadpoolIo(void* io)          { (void)io; }
+void __attribute__((ms_abi)) lsw_WaitForThreadpoolIoCallbacks(void* io, int cancel) { lsw_WaitForThreadpoolWorkCallbacks(io, cancel); }
+void __attribute__((ms_abi)) lsw_CloseThreadpoolIo(void* io)           { lsw_CloseThreadpoolWork(io); }
 int __attribute__((ms_abi)) lsw_InitOnceExecuteOnce(
     void* once, void* initfn, void* param, void** ctx) {
     // Call initfn unconditionally (no real once guarantee, but correct for most uses)
@@ -5738,6 +6269,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"vcruntime140.dll", "__crt_at_quick_exit",          (void*)lsw___crt_at_quick_exit},
     {"vcruntime140.dll", "__std_type_info_destroy_list", (void*)lsw___std_type_info_destroy_list},
     {"vcruntime140.dll", "_CxxThrowException",           (void*)lsw__CxxThrowException},
+    {"vcruntime140.dll", "__CxxFrameHandler3",           (void*)lsw___CxxFrameHandler3},
+    {"vcruntime140.dll", "__C_specific_handler",         (void*)lsw___C_specific_handler},
+    {"ntdll.dll",        "__C_specific_handler",         (void*)lsw___C_specific_handler},
+    {"ntdll.dll",        "__CxxFrameHandler3",           (void*)lsw___CxxFrameHandler3},
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__acrt_iob_func",          (void*)lsw___acrt_iob_func},
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vfprintf",  (void*)lsw___stdio_common_vfprintf},
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsprintf",  (void*)lsw___stdio_common_vsprintf},
@@ -5816,6 +6351,44 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "CreateSemaphoreA",         (void*)lsw_CreateSemaphoreA},
     {"KERNEL32.dll", "CreateSemaphoreW",         (void*)lsw_CreateSemaphoreW},
     {"KERNEL32.dll", "ReleaseSemaphore",         (void*)lsw_ReleaseSemaphore},
+    {"KERNEL32.dll", "ResetEvent",               (void*)lsw_ResetEvent},
+    /* Condition variables */
+    {"KERNEL32.dll", "InitializeConditionVariable",   (void*)lsw_InitializeConditionVariable},
+    {"KERNEL32.dll", "WakeConditionVariable",          (void*)lsw_WakeConditionVariable},
+    {"KERNEL32.dll", "WakeAllConditionVariable",       (void*)lsw_WakeAllConditionVariable},
+    {"KERNEL32.dll", "SleepConditionVariableCS",       (void*)lsw_SleepConditionVariableCS},
+    {"KERNEL32.dll", "SleepConditionVariableSRW",      (void*)lsw_SleepConditionVariableSRW},
+    /* Waitable timers */
+    {"KERNEL32.dll", "CreateWaitableTimerA",     (void*)lsw_CreateWaitableTimerA},
+    {"KERNEL32.dll", "CreateWaitableTimerW",     (void*)lsw_CreateWaitableTimerW},
+    {"KERNEL32.dll", "CreateWaitableTimerExW",   (void*)lsw_CreateWaitableTimerExW},
+    {"KERNEL32.dll", "OpenWaitableTimerW",       (void*)lsw_OpenWaitableTimerW},
+    {"KERNEL32.dll", "SetWaitableTimer",         (void*)lsw_SetWaitableTimer},
+    {"KERNEL32.dll", "CancelWaitableTimer",      (void*)lsw_CancelWaitableTimer},
+    /* IOCP */
+    {"KERNEL32.dll", "CreateIoCompletionPort",        (void*)lsw_CreateIoCompletionPort},
+    {"KERNEL32.dll", "PostQueuedCompletionStatus",     (void*)lsw_PostQueuedCompletionStatus},
+    {"KERNEL32.dll", "GetQueuedCompletionStatus",      (void*)lsw_GetQueuedCompletionStatus},
+    {"KERNEL32.dll", "GetQueuedCompletionStatusEx",    (void*)lsw_GetQueuedCompletionStatusEx},
+    /* Thread pool */
+    {"KERNEL32.dll", "CreateThreadpoolWork",           (void*)lsw_CreateThreadpoolWork},
+    {"KERNEL32.dll", "SubmitThreadpoolWork",            (void*)lsw_SubmitThreadpoolWork},
+    {"KERNEL32.dll", "WaitForThreadpoolWorkCallbacks",  (void*)lsw_WaitForThreadpoolWorkCallbacks},
+    {"KERNEL32.dll", "CloseThreadpoolWork",             (void*)lsw_CloseThreadpoolWork},
+    {"KERNEL32.dll", "CreateThreadpool",                (void*)lsw_CreateThreadpool},
+    {"KERNEL32.dll", "CloseThreadpool",                 (void*)lsw_CloseThreadpool},
+    {"KERNEL32.dll", "SetThreadpoolThreadMaximum",      (void*)lsw_SetThreadpoolThreadMaximum},
+    {"KERNEL32.dll", "SetThreadpoolThreadMinimum",      (void*)lsw_SetThreadpoolThreadMinimum},
+    {"KERNEL32.dll", "CreateThreadpoolTimer",           (void*)lsw_CreateThreadpoolTimer},
+    {"KERNEL32.dll", "SetThreadpoolTimer",              (void*)lsw_SetThreadpoolTimer},
+    {"KERNEL32.dll", "WaitForThreadpoolTimerCallbacks", (void*)lsw_WaitForThreadpoolTimerCallbacks},
+    {"KERNEL32.dll", "CloseThreadpoolTimer",            (void*)lsw_CloseThreadpoolTimer},
+    {"KERNEL32.dll", "IsThreadpoolTimerSet",            (void*)lsw_IsThreadpoolTimerSet},
+    {"KERNEL32.dll", "CreateThreadpoolIo",              (void*)lsw_CreateThreadpoolIo},
+    {"KERNEL32.dll", "StartThreadpoolIo",               (void*)lsw_StartThreadpoolIo},
+    {"KERNEL32.dll", "CancelThreadpoolIo",              (void*)lsw_CancelThreadpoolIo},
+    {"KERNEL32.dll", "WaitForThreadpoolIoCallbacks",    (void*)lsw_WaitForThreadpoolIoCallbacks},
+    {"KERNEL32.dll", "CloseThreadpoolIo",               (void*)lsw_CloseThreadpoolIo},
     {"KERNEL32.dll", "InitOnceExecuteOnce",      (void*)lsw_InitOnceExecuteOnce},
     {"KERNEL32.dll", "SetHandleInformation",     (void*)lsw_SetHandleInformation},
     {"KERNEL32.dll", "GetHandleInformation",     (void*)lsw_GetHandleInformation},

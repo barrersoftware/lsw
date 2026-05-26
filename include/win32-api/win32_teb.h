@@ -11,41 +11,67 @@
 
 #include <stdint.h>
 
-// Minimal TEB (Thread Environment Block) structure
-// Located at %gs:0 on x64, %fs:0 on x86
-typedef struct {
-    void* ExceptionList;              // 0x00
-    void* StackBase;                   // 0x08
-    void* StackLimit;                  // 0x10
-    void* SubSystemTib;                // 0x18
-    void* FiberData;                   // 0x20
-    void* ArbitraryUserPointer;        // 0x28
-    void* Self;                        // 0x30 - Points to itself
-    void* EnvironmentPointer;          // 0x38
-    uint64_t ProcessId;                // 0x40
-    uint64_t ThreadId;                 // 0x48
-    void* ActiveRpcHandle;             // 0x50
-    void* ThreadLocalStoragePointer;   // 0x58
-    void* ProcessEnvironmentBlock;     // 0x60 - PEB pointer
-    uint32_t LastErrorValue;           // 0x68 - GetLastError value
-    uint32_t CountOfOwnedCriticalSections; // 0x6C
-    void* CsrClientThread;             // 0x70
-    void* Win32ThreadInfo;             // 0x78
-    uint32_t User32Reserved[26];       // 0x80
-    uint32_t UserReserved[5];          // 0xE8
-    void* WOW32Reserved;               // 0xFC / 0x100
-    uint32_t CurrentLocale;            // 0x104
-    uint32_t FpSoftwareStatusRegister; // 0x108
-    void* ReservedForDebuggerInstrumentation[16]; // 0x10C
-    void* SystemReserved1[30];         // 0x18C
-    void* PlaceholderCompatibilityMode; // 0x280
-    void* PlaceholderReserved[3];      // 0x288
-    void* TlsSlots[64];                // 0x1480 - TLS storage
-    void* TlsLinks[2];                 // 0x1680
-    void* Vdm;                         // 0x1690
-    void* ReservedForNtRpc;            // 0x1698
-    void* DbgSsReserved[2];            // 0x16A0
+/*
+ * Windows x64 TEB layout (Thread Environment Block).
+ * Critical offsets that Windows apps read directly via gs:offset:
+ *   gs:0x030  NtTib.Self          → pointer to this TEB
+ *   gs:0x060  ProcessEnvironmentBlock (PEB*)
+ *   gs:0x068  LastErrorValue      (GetLastError)
+ *   gs:0x1480 TlsSlots[64]        (TlsGetValue / TlsSetValue)
+ *
+ * Padding between 0x110 and 0x1480 fills the real TEB fields we
+ * do not need to expose individually (SystemReserved, GdiHandles, etc.)
+ */
+typedef struct __attribute__((packed)) {
+    /* NT_TIB — 0x000..0x037 */
+    void*    ExceptionList;              // 0x000
+    void*    StackBase;                  // 0x008
+    void*    StackLimit;                 // 0x010
+    void*    SubSystemTib;               // 0x018
+    void*    FiberData;                  // 0x020
+    void*    ArbitraryUserPointer;       // 0x028
+    void*    Self;                       // 0x030 ← gs:0x30 = TEB*
+
+    /* TEB fields — 0x038..0x06f */
+    void*    EnvironmentPointer;         // 0x038
+    uint64_t ProcessId;                  // 0x040
+    uint64_t ThreadId;                   // 0x048
+    void*    ActiveRpcHandle;            // 0x050
+    void*    ThreadLocalStoragePointer;  // 0x058
+    void*    ProcessEnvironmentBlock;    // 0x060 ← gs:0x60 = PEB*
+    uint32_t LastErrorValue;             // 0x068 ← gs:0x68 = GetLastError
+    uint32_t CountOfOwnedCriticalSections; // 0x06c
+
+    /* 0x070..0x0ff */
+    void*    CsrClientThread;            // 0x070
+    void*    Win32ThreadInfo;            // 0x078
+    uint32_t User32Reserved[26];         // 0x080  (26*4 = 0x68) → 0x0e8
+    uint32_t UserReserved[5];            // 0x0e8  (5*4  = 0x14) → 0x0fc
+    uint8_t  _pad_0fc[4];               // 0x0fc  align next ptr to 0x100
+    void*    WOW32Reserved;              // 0x100
+    uint32_t CurrentLocale;              // 0x108
+    uint32_t FpSoftwareStatusRegister;   // 0x10c
+
+    /* 0x110..0x147f  — bulk padding to reach TlsSlots */
+    uint8_t  _pad_110[0x1480 - 0x110];  // 0x1370 bytes
+
+    /* TLS — 0x1480..0x167f */
+    void*    TlsSlots[64];               // 0x1480  (64*8 = 0x200) → 0x1680
+    void*    TlsLinks[2];                // 0x1680
+    void*    Vdm;                        // 0x1690
+    void*    ReservedForNtRpc;           // 0x1698
+    void*    DbgSsReserved[2];           // 0x16a0
 } win32_teb_t;
+
+/* Verify the offsets that Windows apps depend on at compile time. */
+_Static_assert(__builtin_offsetof(win32_teb_t, Self)
+               == 0x030, "TEB.Self must be at 0x030");
+_Static_assert(__builtin_offsetof(win32_teb_t, ProcessEnvironmentBlock)
+               == 0x060, "TEB.PEB must be at 0x060");
+_Static_assert(__builtin_offsetof(win32_teb_t, LastErrorValue)
+               == 0x068, "TEB.LastError must be at 0x068");
+_Static_assert(__builtin_offsetof(win32_teb_t, TlsSlots)
+               == 0x1480, "TEB.TlsSlots must be at 0x1480");
 
 // Minimal PEB (Process Environment Block) structure  
 typedef struct {

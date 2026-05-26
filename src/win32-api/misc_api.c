@@ -190,6 +190,76 @@ uint32_t LSW_MSABI lsw_GetNetworkParams(void* pFixedInfo, uint32_t* pOutBufLen) 
 uint32_t LSW_MSABI lsw_NotifyAddrChange(void* Handle, void* overlapped) { (void)Handle; (void)overlapped; return 0; }
 int LSW_MSABI lsw_CancelIPChangeNotify(void* overlapped) { (void)overlapped; return 1; }
 
+// ---- DirectX stubs -------------------------------------------------------
+// d3d9
+void* LSW_MSABI lsw_Direct3DCreate9(uint32_t sdk_version) { (void)sdk_version; return NULL; }
+int32_t LSW_MSABI lsw_Direct3DCreate9Ex(uint32_t sdk_version, void** ppD3D) { (void)sdk_version; if (ppD3D) *ppD3D = NULL; return E_NOTIMPL; }
+void* LSW_MSABI lsw_Direct3DCreate8(uint32_t sdk_version) { (void)sdk_version; return NULL; }
+
+// d3d11
+int32_t LSW_MSABI lsw_D3D11CreateDevice(void* adapter, int driver_type, void* sw, uint32_t flags,
+    const void* feature_levels, uint32_t num_fl, uint32_t sdk_version, void** device, void* fl_out, void** ctx) {
+    (void)adapter; (void)driver_type; (void)sw; (void)flags;
+    (void)feature_levels; (void)num_fl; (void)sdk_version;
+    if (device) *device = NULL; if (ctx) *ctx = NULL;
+    return E_NOTIMPL;
+}
+int32_t LSW_MSABI lsw_D3D11CreateDeviceAndSwapChain(void* adapter, int driver_type, void* sw,
+    uint32_t flags, const void* feature_levels, uint32_t num_fl, uint32_t sdk_version,
+    const void* swap_chain_desc, void** swap_chain, void** device, void* fl_out, void** ctx) {
+    (void)adapter; (void)driver_type; (void)sw; (void)flags;
+    (void)feature_levels; (void)num_fl; (void)sdk_version; (void)swap_chain_desc;
+    if (swap_chain) *swap_chain = NULL; if (device) *device = NULL; if (ctx) *ctx = NULL;
+    return E_NOTIMPL;
+}
+
+// d3d12
+int32_t LSW_MSABI lsw_D3D12CreateDevice(void* adapter, int minimum_fl, const void* riid, void** ppDevice) {
+    (void)adapter; (void)minimum_fl; (void)riid; if (ppDevice) *ppDevice = NULL; return E_NOTIMPL;
+}
+int32_t LSW_MSABI lsw_D3D12GetDebugInterface(const void* riid, void** ppDebug) { (void)riid; if (ppDebug) *ppDebug = NULL; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_D3D12SerializeRootSignature(const void* pRootSignature, int Version, void** ppBlob, void** ppError) {
+    (void)pRootSignature; (void)Version; if (ppBlob) *ppBlob = NULL; if (ppError) *ppError = NULL; return E_NOTIMPL;
+}
+int32_t LSW_MSABI lsw_D3D12EnableExperimentalFeatures(uint32_t numFeatures, const void* pIIDs, void* pConfigurations, uint32_t* pConfigurationSizes) {
+    (void)numFeatures; (void)pIIDs; (void)pConfigurations; (void)pConfigurationSizes; return E_NOTIMPL;
+}
+
+// dxgi
+int32_t LSW_MSABI lsw_CreateDXGIFactory(const void* riid, void** ppFactory)  { (void)riid; if (ppFactory) *ppFactory = NULL; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_CreateDXGIFactory1(const void* riid, void** ppFactory) { (void)riid; if (ppFactory) *ppFactory = NULL; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_CreateDXGIFactory2(uint32_t flags, const void* riid, void** ppFactory) { (void)flags; (void)riid; if (ppFactory) *ppFactory = NULL; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_DXGIDeclareAdapterRemovalSupport(void) { return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_DXGIGetDebugInterface1(uint32_t flags, const void* riid, void** pDebug) { (void)flags; (void)riid; if (pDebug) *pDebug = NULL; return E_NOTIMPL; }
+
+// d3dcompiler_47
+int32_t LSW_MSABI lsw_D3DCompile(const void* pSrcData, size_t SrcDataSize, const char* pSourceName,
+    const void* pDefines, void* pInclude, const char* pEntrypoint, const char* pTarget,
+    uint32_t Flags1, uint32_t Flags2, void** ppCode, void** ppErrors) {
+    (void)pSrcData; (void)SrcDataSize; (void)pSourceName; (void)pDefines; (void)pInclude;
+    (void)pEntrypoint; (void)pTarget; (void)Flags1; (void)Flags2;
+    if (ppCode) *ppCode = NULL; if (ppErrors) *ppErrors = NULL; return E_NOTIMPL;
+}
+int32_t LSW_MSABI lsw_D3DReflect(const void* pSrcData, size_t SrcDataSize, const void* pInterface, void** ppReflector) {
+    (void)pSrcData; (void)SrcDataSize; (void)pInterface; if (ppReflector) *ppReflector = NULL; return E_NOTIMPL;
+}
+int32_t LSW_MSABI lsw_D3DDisassemble(const void* pSrcData, size_t SrcDataSize, uint32_t Flags,
+    const char* szComments, void** ppDisassembly) {
+    (void)pSrcData; (void)SrcDataSize; (void)Flags; (void)szComments; if (ppDisassembly) *ppDisassembly = NULL; return E_NOTIMPL;
+}
+
+// XInput
+int32_t LSW_MSABI lsw_XInputGetState(uint32_t userIndex, void* pState) { (void)userIndex; if (pState) memset(pState, 0, 32); return 0x48F /*ERROR_DEVICE_NOT_CONNECTED*/; }
+int32_t LSW_MSABI lsw_XInputSetState(uint32_t userIndex, void* pVibration) { (void)userIndex; (void)pVibration; return 0x48F; }
+int32_t LSW_MSABI lsw_XInputGetCapabilities(uint32_t userIndex, uint32_t flags, void* pCapabilities) { (void)userIndex; (void)flags; (void)pCapabilities; return 0x48F; }
+void    LSW_MSABI lsw_XInputEnable(int enable) { (void)enable; }
+
+// dsound
+int32_t LSW_MSABI lsw_DirectSoundCreate(const void* lpGuid, void** ppDS, void* pUnkOuter) { (void)lpGuid; if (ppDS) *ppDS = NULL; (void)pUnkOuter; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_DirectSoundCreate8(const void* lpGuid, void** ppDS, void* pUnkOuter) { (void)lpGuid; if (ppDS) *ppDS = NULL; (void)pUnkOuter; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_DirectSoundEnumerateW(void* pDSEnumCallback, void* pContext) { (void)pDSEnumCallback; (void)pContext; return E_NOTIMPL; }
+int32_t LSW_MSABI lsw_DirectSoundCaptureCreate8(const void* lpGuid, void** ppDSC, void* pUnkOuter) { (void)lpGuid; if (ppDSC) *ppDSC = NULL; (void)pUnkOuter; return E_NOTIMPL; }
+
 const win32_api_mapping_t win32_api_misc_mappings[] = {
     MAP("uxtheme.dll", "OpenThemeData", lsw_OpenThemeData),
     MAP("uxtheme.dll", "OpenThemeDataEx", lsw_OpenThemeDataEx),
@@ -346,6 +416,42 @@ const win32_api_mapping_t win32_api_misc_mappings[] = {
     MAP("iphlpapi.dll", "GetNetworkParams", lsw_GetNetworkParams),
     MAP("iphlpapi.dll", "NotifyAddrChange", lsw_NotifyAddrChange),
     MAP("iphlpapi.dll", "CancelIPChangeNotify", lsw_CancelIPChangeNotify),
+    /* DirectX */
+    MAP("d3d9.dll",     "Direct3DCreate9",              lsw_Direct3DCreate9),
+    MAP("d3d9.dll",     "Direct3DCreate9Ex",             lsw_Direct3DCreate9Ex),
+    MAP("d3d8.dll",     "Direct3DCreate8",               lsw_Direct3DCreate8),
+    MAP("d3d11.dll",    "D3D11CreateDevice",             lsw_D3D11CreateDevice),
+    MAP("d3d11.dll",    "D3D11CreateDeviceAndSwapChain", lsw_D3D11CreateDeviceAndSwapChain),
+    MAP("d3d12.dll",    "D3D12CreateDevice",             lsw_D3D12CreateDevice),
+    MAP("d3d12.dll",    "D3D12GetDebugInterface",        lsw_D3D12GetDebugInterface),
+    MAP("d3d12.dll",    "D3D12SerializeRootSignature",   lsw_D3D12SerializeRootSignature),
+    MAP("d3d12.dll",    "D3D12EnableExperimentalFeatures", lsw_D3D12EnableExperimentalFeatures),
+    MAP("dxgi.dll",     "CreateDXGIFactory",             lsw_CreateDXGIFactory),
+    MAP("dxgi.dll",     "CreateDXGIFactory1",            lsw_CreateDXGIFactory1),
+    MAP("dxgi.dll",     "CreateDXGIFactory2",            lsw_CreateDXGIFactory2),
+    MAP("dxgi.dll",     "DXGIDeclareAdapterRemovalSupport", lsw_DXGIDeclareAdapterRemovalSupport),
+    MAP("dxgi.dll",     "DXGIGetDebugInterface1",        lsw_DXGIGetDebugInterface1),
+    MAP("d3dcompiler_47.dll", "D3DCompile",              lsw_D3DCompile),
+    MAP("d3dcompiler_47.dll", "D3DReflect",              lsw_D3DReflect),
+    MAP("d3dcompiler_47.dll", "D3DDisassemble",          lsw_D3DDisassemble),
+    MAP("d3dcompiler_46.dll", "D3DCompile",              lsw_D3DCompile),
+    MAP("d3dcompiler_43.dll", "D3DCompile",              lsw_D3DCompile),
+    /* XInput */
+    MAP("xinput1_4.dll",    "XInputGetState",       lsw_XInputGetState),
+    MAP("xinput1_4.dll",    "XInputSetState",       lsw_XInputSetState),
+    MAP("xinput1_4.dll",    "XInputGetCapabilities", lsw_XInputGetCapabilities),
+    MAP("xinput1_4.dll",    "XInputEnable",         lsw_XInputEnable),
+    MAP("xinput1_3.dll",    "XInputGetState",       lsw_XInputGetState),
+    MAP("xinput1_3.dll",    "XInputSetState",       lsw_XInputSetState),
+    MAP("xinput1_3.dll",    "XInputGetCapabilities", lsw_XInputGetCapabilities),
+    MAP("xinput1_3.dll",    "XInputEnable",         lsw_XInputEnable),
+    MAP("xinput9_1_0.dll",  "XInputGetState",       lsw_XInputGetState),
+    MAP("xinput9_1_0.dll",  "XInputSetState",       lsw_XInputSetState),
+    /* DirectSound */
+    MAP("dsound.dll",   "DirectSoundCreate",         lsw_DirectSoundCreate),
+    MAP("dsound.dll",   "DirectSoundCreate8",        lsw_DirectSoundCreate8),
+    MAP("dsound.dll",   "DirectSoundEnumerateW",     lsw_DirectSoundEnumerateW),
+    MAP("dsound.dll",   "DirectSoundCaptureCreate8", lsw_DirectSoundCaptureCreate8),
     {NULL, NULL, NULL}
 };
 
