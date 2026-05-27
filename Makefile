@@ -6,7 +6,7 @@
 
 # Compiler settings
 CC := gcc
-CFLAGS := -Wall -Wextra -std=c11 -pedantic -O2 -fPIC
+CFLAGS := -Wall -Wextra -std=c11 -pedantic -O2 -fPIC -fno-omit-frame-pointer
 INCLUDES := -Iinclude -Iinclude/shared -Iinclude/pe-loader -Iinclude/win32-api
 DEBUG_FLAGS := -g -DDEBUG
 

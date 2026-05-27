@@ -3,10 +3,248 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <wchar.h>
 #include <time.h>
+#include <arpa/inet.h>
 #include "../../include/shared/lsw_log.h"
 #include "../../include/win32-api/win32_api.h"
+
+/* Forward declaration for SetLastError in win32_api.c */
+extern void __attribute__((ms_abi)) lsw_SetLastError(uint32_t code);
+
+/* ---- UTF-16LE → UTF-8 path conversion ---- */
+static void vi_u16_to_u8(const uint16_t *src, char *dst, int maxbytes) {
+    int n = 0;
+    for (; *src && n < maxbytes - 4; src++) {
+        uint32_t c = *src;
+        if (c < 0x80) {
+            dst[n++] = (char)c;
+        } else if (c < 0x800) {
+            dst[n++] = (char)(0xC0 | (c >> 6));
+            dst[n++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            dst[n++] = (char)(0xE0 | (c >> 12));
+            dst[n++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            dst[n++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    dst[n] = '\0';
+}
+
+/* ---- Little-endian helpers for PE/version-info parsing ---- */
+static uint16_t vi_r16(const uint8_t *p, uint32_t off) {
+    return (uint16_t)(p[off] | ((uint16_t)p[off + 1] << 8));
+}
+static uint32_t vi_r32(const uint8_t *p, uint32_t off) {
+    return (uint32_t)(p[off] | ((uint32_t)p[off+1]<<8) |
+                     ((uint32_t)p[off+2]<<16) | ((uint32_t)p[off+3]<<24));
+}
+
+/* ---- PE .rsrc RT_VERSION reader ---- */
+
+/* Read the RT_VERSION resource from a PE file.
+ * Returns a malloc'd copy of the VS_VERSION_INFO data on success.
+ * Sets *out_size to the data length.
+ * Returns NULL on failure (file not found, no resource, etc.). */
+static uint8_t *pe_read_version_resource(const char *path, uint32_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long fsz = ftell(f);
+    rewind(f);
+    if (fsz <= 0 || fsz > 64 * 1024 * 1024) { fclose(f); return NULL; }
+
+    uint8_t *raw = (uint8_t *)malloc((size_t)fsz);
+    if (!raw) { fclose(f); return NULL; }
+    if ((long)fread(raw, 1, (size_t)fsz, f) != fsz) { free(raw); fclose(f); return NULL; }
+    fclose(f);
+
+#define PE_SAFE(x) do { if ((uint32_t)(x) > (uint32_t)fsz) goto pe_fail; } while(0)
+
+    PE_SAFE(0x40);
+    if (vi_r16(raw, 0) != 0x5A4D) goto pe_fail; /* MZ */
+    uint32_t pe_off = vi_r32(raw, 0x3C);
+    PE_SAFE(pe_off + 4 + 20 + 2); /* at least coff header */
+    if (vi_r32(raw, pe_off) != 0x00004550) goto pe_fail; /* PE\0\0 */
+
+    uint16_t nsections = vi_r16(raw, pe_off + 6);
+    uint16_t opt_size  = vi_r16(raw, pe_off + 20);
+    uint32_t opt_off   = pe_off + 4 + 20; /* optional header start */
+    PE_SAFE(opt_off + 2);
+
+    uint16_t magic = vi_r16(raw, opt_off);
+    uint32_t rsrc_dd_off;
+    if      (magic == 0x020B) rsrc_dd_off = opt_off + 128; /* PE32+: DataDir[2] at +128 */
+    else if (magic == 0x010B) rsrc_dd_off = opt_off + 112; /* PE32:  DataDir[2] at +112 */
+    else goto pe_fail;
+
+    PE_SAFE(rsrc_dd_off + 8);
+    uint32_t rsrc_rva  = vi_r32(raw, rsrc_dd_off);
+    uint32_t rsrc_sz   = vi_r32(raw, rsrc_dd_off + 4);
+    if (!rsrc_rva || !rsrc_sz) goto pe_fail;
+
+    /* Locate section containing rsrc_rva */
+    uint32_t sec_tbl = opt_off + opt_size;
+    uint32_t rsrc_raw_off = 0;
+    for (uint16_t i = 0; i < nsections; i++) {
+        uint32_t s = sec_tbl + (uint32_t)i * 40;
+        PE_SAFE(s + 40);
+        uint32_t s_vaddr = vi_r32(raw, s + 12);
+        uint32_t s_vsz   = vi_r32(raw, s + 16);
+        uint32_t s_raw   = vi_r32(raw, s + 20);
+        if (rsrc_rva >= s_vaddr && rsrc_rva < s_vaddr + s_vsz) {
+            rsrc_raw_off = s_raw + (rsrc_rva - s_vaddr);
+            break;
+        }
+    }
+    if (!rsrc_raw_off) goto pe_fail;
+    PE_SAFE(rsrc_raw_off + rsrc_sz);
+
+    uint8_t *rsrc = raw + rsrc_raw_off;
+
+    /* Level 1: root directory — find type 16 (RT_VERSION) subdir */
+    uint16_t n_named = vi_r16(rsrc, 12);
+    uint16_t n_id    = vi_r16(rsrc, 14);
+    uint32_t type_dir = 0;
+    for (uint16_t i = n_named; i < (uint16_t)(n_named + n_id); i++) {
+        uint32_t e = 16 + (uint32_t)i * 8;
+        PE_SAFE(rsrc_raw_off + e + 8);
+        uint32_t eid = vi_r32(rsrc, e) & 0x7FFFFFFFu;
+        uint32_t eval = vi_r32(rsrc, e + 4);
+        if (eid == 16 && (eval & 0x80000000u)) {
+            type_dir = eval & 0x7FFFFFFFu;
+            break;
+        }
+    }
+    if (!type_dir) goto pe_fail;
+
+    /* Level 2: name directory — take first entry (subdir) */
+    PE_SAFE(rsrc_raw_off + type_dir + 16 + 8);
+    uint32_t name_entry = type_dir + 16;
+    uint32_t v2 = vi_r32(rsrc, name_entry + 4);
+    if (!(v2 & 0x80000000u)) goto pe_fail;
+    uint32_t lang_dir = v2 & 0x7FFFFFFFu;
+
+    /* Level 3: language directory — take first entry (data leaf) */
+    PE_SAFE(rsrc_raw_off + lang_dir + 16 + 8);
+    uint32_t lang_entry = lang_dir + 16;
+    uint32_t v3 = vi_r32(rsrc, lang_entry + 4);
+    if (v3 & 0x80000000u) goto pe_fail; /* must be leaf */
+
+    /* IMAGE_RESOURCE_DATA_ENTRY: RVA, Size, CodePage, Reserved */
+    PE_SAFE(rsrc_raw_off + v3 + 16);
+    uint32_t data_rva  = vi_r32(rsrc, v3);
+    uint32_t data_size = vi_r32(rsrc, v3 + 4);
+    if (!data_size) goto pe_fail;
+
+    /* Convert data_rva to raw file offset */
+    uint32_t data_raw = 0;
+    for (uint16_t i = 0; i < nsections; i++) {
+        uint32_t s = sec_tbl + (uint32_t)i * 40;
+        uint32_t sv = vi_r32(raw, s + 12);
+        uint32_t ss = vi_r32(raw, s + 16);
+        uint32_t sr = vi_r32(raw, s + 20);
+        if (data_rva >= sv && data_rva < sv + ss) {
+            data_raw = sr + (data_rva - sv);
+            break;
+        }
+    }
+    if (!data_raw) goto pe_fail;
+    PE_SAFE(data_raw + data_size);
+
+    uint8_t *result = (uint8_t *)malloc(data_size);
+    if (!result) goto pe_fail;
+    memcpy(result, raw + data_raw, data_size);
+    *out_size = data_size;
+    free(raw);
+    return result;
+
+pe_fail:
+    free(raw);
+    return NULL;
+#undef PE_SAFE
+}
+
+/* ---- Single-slot version info cache ---- */
+static struct {
+    char    path[512];
+    uint8_t *data;
+    uint32_t size;
+} s_vi_cache;
+
+/* Ensure cache is populated for the given path. Returns 1 on success, 0 on failure. */
+static int vi_ensure_cached(const char *path) {
+    if (s_vi_cache.data && strcmp(s_vi_cache.path, path) == 0)
+        return 1;
+    uint32_t sz = 0;
+    uint8_t *d = pe_read_version_resource(path, &sz);
+    if (!d) return 0;
+    free(s_vi_cache.data);
+    strncpy(s_vi_cache.path, path, sizeof(s_vi_cache.path) - 1);
+    s_vi_cache.path[sizeof(s_vi_cache.path) - 1] = '\0';
+    s_vi_cache.data = d;
+    s_vi_cache.size = sz;
+    return 1;
+}
+
+/* ---- VS_VERSION_INFO block navigator ---- */
+
+/* Find a child block by UTF-16LE name inside a VS_VERSION_INFO block.
+ * block/block_size: the parent block
+ * name: null-terminated UTF-16LE name to search for (case-insensitive)
+ * Returns pointer to child block on success, sets *child_len, else NULL. */
+static const uint8_t *vi_find_child(const uint8_t *block, uint32_t block_size,
+                                     const uint16_t *name, uint32_t *child_len) {
+    if (block_size < 6) return NULL;
+    uint16_t wLen = vi_r16(block, 0);
+    if (wLen > block_size) wLen = (uint16_t)block_size;
+
+    uint16_t wValLen = vi_r16(block, 2);
+
+    /* Skip header (6 bytes) + key string (null-terminated UTF-16LE) + DWORD padding */
+    uint32_t off = 6;
+    while (off + 2 <= wLen && vi_r16(block, off) != 0) off += 2;
+    off += 2; /* null terminator */
+    off = (off + 3) & ~3u; /* align to DWORD */
+
+    /* Skip binary value (if any) + DWORD padding */
+    if (wValLen > 0) {
+        off += wValLen;
+        off = (off + 3) & ~3u;
+    }
+
+    /* Iterate child blocks */
+    while (off + 6 <= wLen) {
+        uint16_t cLen = vi_r16(block, off);
+        if (cLen < 6 || off + cLen > wLen) break;
+
+        /* Compare child key name (case-insensitive UTF-16LE) */
+        uint32_t key_off = off + 6;
+        const uint16_t *n = name;
+        int match = 1;
+        for (;;) {
+            if (key_off + 2 > off + cLen) { match = 0; break; }
+            uint16_t c1 = vi_r16(block, key_off);
+            uint16_t c2 = *n;
+            uint16_t u1 = (c1 >= 'a' && c1 <= 'z') ? (uint16_t)(c1 - 32) : c1;
+            uint16_t u2 = (c2 >= 'a' && c2 <= 'z') ? (uint16_t)(c2 - 32) : c2;
+            if (u1 != u2) { match = 0; break; }
+            if (c1 == 0) break; /* both null-terminated → matched */
+            key_off += 2;
+            n++;
+        }
+        if (match) {
+            *child_len = cLen;
+            return block + off;
+        }
+        /* Advance to next child, DWORD-aligned */
+        uint32_t next = off + cLen;
+        off = (next + 3) & ~3u;
+    }
+    return NULL;
+}
 
 typedef int BOOL;
 typedef uint32_t DWORD;
@@ -104,14 +342,171 @@ int LSW_MSABI lsw_ImmRegisterWordW(void* hKL, const uint16_t* lpszReading, uint3
 uint32_t LSW_MSABI lsw_ImmEnumRegisterWordW(void* hKL, void* lpfnEnumProc, const uint16_t* lpszReading, uint32_t dwStyle, const uint16_t* lpszRegister, void* lpData) { (void)hKL; (void)lpfnEnumProc; (void)lpszReading; (void)dwStyle; (void)lpszRegister; (void)lpData; return 0; }
 uint32_t LSW_MSABI lsw_ImmGetRegisterWordStyleW(void* hKL, uint32_t nItem, void* lpStyleBuf) { (void)hKL; (void)nItem; (void)lpStyleBuf; return 0; }
 
-uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeW(const uint16_t* lptstrFilename, uint32_t* lpdwHandle) { (void)lptstrFilename; if (lpdwHandle) *lpdwHandle = 0; return 0; }
-uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeA(const char* lptstrFilename, uint32_t* lpdwHandle) { (void)lptstrFilename; if (lpdwHandle) *lpdwHandle = 0; return 0; }
-int LSW_MSABI lsw_GetFileVersionInfoW(const uint16_t* lptstrFilename, uint32_t dwHandle, uint32_t dwLen, void* lpData) { (void)lptstrFilename; (void)dwHandle; (void)dwLen; (void)lpData; return 0; }
-int LSW_MSABI lsw_GetFileVersionInfoA(const char* lptstrFilename, uint32_t dwHandle, uint32_t dwLen, void* lpData) { (void)lptstrFilename; (void)dwHandle; (void)dwLen; (void)lpData; return 0; }
-int LSW_MSABI lsw_VerQueryValueW(const void* pBlock, const uint16_t* lpSubBlock, void** lplpBuffer, uint32_t* puLen) { (void)pBlock; (void)lpSubBlock; if (lplpBuffer) *lplpBuffer = NULL; if (puLen) *puLen = 0; return 0; }
-int LSW_MSABI lsw_VerQueryValueA(const void* pBlock, const char* lpSubBlock, void** lplpBuffer, uint32_t* puLen) { (void)pBlock; (void)lpSubBlock; if (lplpBuffer) *lplpBuffer = NULL; if (puLen) *puLen = 0; return 0; }
-int LSW_MSABI lsw_GetFileVersionInfoExW(uint32_t dwFlags, const uint16_t* lpwstrFilename, uint32_t dwHandle, uint32_t dwLen, void* lpData) { (void)dwFlags; (void)lpwstrFilename; (void)dwHandle; (void)dwLen; (void)lpData; return 0; }
-uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeExW(uint32_t dwFlags, const uint16_t* lpwstrFilename, uint32_t* lpdwHandle) { (void)dwFlags; (void)lpwstrFilename; if (lpdwHandle) *lpdwHandle = 0; return 0; }
+/* ---- VERSION.dll implementation ---- */
+
+uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeExW(uint32_t dwFlags,
+                                                   const uint16_t *lpwstrFilename,
+                                                   uint32_t *lpdwHandle) {
+    (void)dwFlags;
+    if (lpdwHandle) *lpdwHandle = 0;
+    if (!lpwstrFilename) { lsw_SetLastError(87); return 0; }
+
+    char path[512];
+    vi_u16_to_u8(lpwstrFilename, path, sizeof(path));
+
+    if (!vi_ensure_cached(path)) {
+        /* ERROR_RESOURCE_TYPE_NOT_FOUND = 1813 */
+        lsw_SetLastError(1813);
+        LSW_LOG_INFO("GetFileVersionInfoSizeExW(%s) -> 0 (resource not found)", path);
+        return 0;
+    }
+    LSW_LOG_INFO("GetFileVersionInfoSizeExW(%s) -> %u", path, s_vi_cache.size);
+    return s_vi_cache.size;
+}
+
+uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeW(const uint16_t *lptstrFilename,
+                                                uint32_t *lpdwHandle) {
+    return lsw_GetFileVersionInfoSizeExW(0, lptstrFilename, lpdwHandle);
+}
+
+uint32_t LSW_MSABI lsw_GetFileVersionInfoSizeA(const char *lptstrFilename,
+                                                uint32_t *lpdwHandle) {
+    (void)lptstrFilename;
+    if (lpdwHandle) *lpdwHandle = 0;
+    lsw_SetLastError(1813);
+    return 0;
+}
+
+int LSW_MSABI lsw_GetFileVersionInfoExW(uint32_t dwFlags,
+                                         const uint16_t *lpwstrFilename,
+                                         uint32_t dwHandle, uint32_t dwLen,
+                                         void *lpData) {
+    (void)dwFlags; (void)dwHandle;
+    if (!lpwstrFilename || !lpData || !dwLen) { lsw_SetLastError(87); return 0; }
+
+    char path[512];
+    vi_u16_to_u8(lpwstrFilename, path, sizeof(path));
+
+    if (!vi_ensure_cached(path)) { lsw_SetLastError(1813); return 0; }
+
+    uint32_t copy = (dwLen < s_vi_cache.size) ? dwLen : s_vi_cache.size;
+    memcpy(lpData, s_vi_cache.data, copy);
+    LSW_LOG_INFO("GetFileVersionInfoExW(%s, len=%u) -> 1", path, dwLen);
+    return 1;
+}
+
+int LSW_MSABI lsw_GetFileVersionInfoW(const uint16_t *lptstrFilename,
+                                       uint32_t dwHandle, uint32_t dwLen,
+                                       void *lpData) {
+    return lsw_GetFileVersionInfoExW(0, lptstrFilename, dwHandle, dwLen, lpData);
+}
+
+int LSW_MSABI lsw_GetFileVersionInfoA(const char *lptstrFilename,
+                                       uint32_t dwHandle, uint32_t dwLen,
+                                       void *lpData) {
+    (void)lptstrFilename; (void)dwHandle; (void)dwLen; (void)lpData;
+    lsw_SetLastError(1813);
+    return 0;
+}
+
+int LSW_MSABI lsw_VerQueryValueW(const void *pBlock, const uint16_t *lpSubBlock,
+                                  void **lplpBuffer, uint32_t *puLen) {
+    if (!pBlock || !lpSubBlock || !lplpBuffer || !puLen) return 0;
+    *lplpBuffer = NULL;
+    *puLen = 0;
+
+    /* Log sub-block query for debugging */
+    {
+        char sub_utf8[256];
+        vi_u16_to_u8(lpSubBlock, sub_utf8, sizeof(sub_utf8));
+        LSW_LOG_INFO("VerQueryValueW(sub='%s')", sub_utf8);
+    }
+
+    const uint8_t *b = (const uint8_t *)pBlock;
+    uint16_t wLen = vi_r16(b, 0);
+    const uint16_t *sub = lpSubBlock;
+
+    if (sub[0] != (uint16_t)'\\') return 0;
+    sub++;
+
+    if (sub[0] == 0) {
+        /* Root query "\\" → return VS_FIXEDFILEINFO */
+        uint16_t wValLen = vi_r16(b, 2);
+        if (wValLen == 0) return 0;
+        uint32_t off = 6;
+        while (off + 2 <= wLen && vi_r16(b, off) != 0) off += 2;
+        off += 2;
+        off = (off + 3) & ~3u;
+        if (off + wValLen > wLen) return 0;
+        *lplpBuffer = (void *)(b + off);
+        *puLen = wValLen;
+        return 1;
+    }
+
+    /* Walk the path components: e.g. "VarFileInfo\Translation" */
+    const uint8_t *cur = b;
+    uint32_t cur_sz = wLen;
+
+    while (sub[0] != 0) {
+        /* Extract component name up to next '\\' or end */
+        uint16_t comp[128];
+        int clen = 0;
+        while (sub[clen] != 0 && sub[clen] != (uint16_t)'\\' && clen < 127) {
+            comp[clen] = sub[clen];
+            clen++;
+        }
+        comp[clen] = 0;
+
+        uint32_t child_len = 0;
+        const uint8_t *child = vi_find_child(cur, cur_sz, comp, &child_len);
+        if (!child) return 0;
+
+        sub += clen;
+        if (sub[0] == (uint16_t)'\\') sub++;
+
+        if (sub[0] == 0) {
+            /* Reached the target block — return its value or block itself */
+            uint16_t child_val_len = vi_r16(child, 2);
+            if (child_val_len > 0) {
+                /* Navigate to value within child */
+                uint32_t off = 6;
+                uint32_t cl = child_len;
+                while (off + 2 <= cl && vi_r16(child, off) != 0) off += 2;
+                off += 2;
+                off = (off + 3) & ~3u;
+                if (off + child_val_len > cl) return 0;
+                *lplpBuffer = (void *)(child + off);
+                *puLen = child_val_len;
+                {
+                    const uint8_t *vp = (const uint8_t *)*lplpBuffer;
+                    LSW_LOG_DEBUG("VerQueryValueW -> ptr=%p off_in_block=%u len=%u bytes=[%02x %02x %02x %02x %02x %02x %02x %02x]",
+                        *lplpBuffer, (unsigned)(child + off - b),
+                        child_val_len,
+                        vp[0], vp[1],
+                        child_val_len > 2 ? vp[2] : 0, child_val_len > 3 ? vp[3] : 0,
+                        child_val_len > 4 ? vp[4] : 0, child_val_len > 5 ? vp[5] : 0,
+                        child_val_len > 6 ? vp[6] : 0, child_val_len > 7 ? vp[7] : 0);
+                }
+            } else {
+                *lplpBuffer = (void *)child;
+                *puLen = child_len;
+                LSW_LOG_INFO("VerQueryValueW -> block ptr=%p off=%u len=%u", *lplpBuffer, (unsigned)(child - b), child_len);
+            }
+            return 1;
+        }
+        cur    = child;
+        cur_sz = child_len;
+    }
+    return 0;
+}
+
+int LSW_MSABI lsw_VerQueryValueA(const void *pBlock, const char *lpSubBlock,
+                                  void **lplpBuffer, uint32_t *puLen) {
+    (void)pBlock; (void)lpSubBlock;
+    if (lplpBuffer) *lplpBuffer = NULL;
+    if (puLen) *puLen = 0;
+    return 0;
+}
 uint32_t LSW_MSABI lsw_VerFindFileW(uint32_t uFlags, const uint16_t* szFileName, const uint16_t* szWinDir, const uint16_t* szAppDir, uint16_t* szCurDir, uint32_t* lpuCurDirLen, uint16_t* szDestDir, uint32_t* lpuDestDirLen) { (void)uFlags; (void)szFileName; (void)szWinDir; (void)szAppDir; (void)szCurDir; (void)lpuCurDirLen; (void)szDestDir; (void)lpuDestDirLen; return 0; }
 uint32_t LSW_MSABI lsw_VerInstallFileW(uint32_t uFlags, const uint16_t* szSrcFileName, const uint16_t* szDestFileName, const uint16_t* szSrcDir, const uint16_t* szDestDir, const uint16_t* szCurDir, uint16_t* szTmpFile, uint32_t* lpuTmpFileLen) { (void)uFlags; (void)szSrcFileName; (void)szDestFileName; (void)szSrcDir; (void)szDestDir; (void)szCurDir; (void)szTmpFile; (void)lpuTmpFileLen; return 0; }
 
@@ -179,7 +574,96 @@ int LSW_MSABI lsw_WTSSendMessageW(void* hServer, uint32_t SessionId, uint16_t* p
 int LSW_MSABI lsw_ProcessIdToSessionId(uint32_t dwProcessId, uint32_t* pSessionId) { (void)dwProcessId; if (pSessionId) *pSessionId = 0; return 1; }
 
 uint32_t LSW_MSABI lsw_GetAdaptersInfo(void* pAdapterInfo, uint32_t* pOutBufLen) { (void)pAdapterInfo; if (pOutBufLen) *pOutBufLen = 0; return 111; }
-uint32_t LSW_MSABI lsw_GetAdaptersAddresses(uint32_t Family, uint32_t Flags, void* Reserved, void* AdapterAddresses, uint32_t* SizePointer) { (void)Family; (void)Flags; (void)Reserved; (void)AdapterAddresses; if (SizePointer) *SizePointer = 0; return 111; }
+/* GetAdaptersAddresses: forward to win32_api.c real implementation */
+extern uint32_t __attribute__((ms_abi)) lsw_GetAdaptersAddresses_real(uint32_t Family, uint32_t Flags, void* Reserved, uint8_t* AdapterAddresses, uint32_t* SizePointer);
+uint32_t LSW_MSABI lsw_GetAdaptersAddresses(uint32_t Family, uint32_t Flags, void* Reserved, void* AdapterAddresses, uint32_t* SizePointer) {
+    return lsw_GetAdaptersAddresses_real(Family, Flags, Reserved, (uint8_t*)AdapterAddresses, SizePointer);
+}
+
+/* --- IPHLPAPI: interface conversion stubs --- */
+static int lsw_misc_ascii_to_u16(const char* src, uint16_t* dst, int maxchars) {
+    int n = 0;
+    while (*src && n < maxchars - 1) dst[n++] = (uint16_t)(unsigned char)*src++;
+    if (n < maxchars) dst[n] = 0;
+    return n;
+}
+uint32_t LSW_MSABI lsw_ConvertLengthToIpv4Mask(uint32_t maskLen, uint32_t* mask) {
+    if (maskLen > 32) { if (mask) *mask = 0xffffffff; return 87; }
+    uint32_t m = maskLen == 0 ? 0 : (~0u << (32 - maskLen));
+    if (mask) *mask = htonl(m);
+    return 0;
+}
+uint32_t LSW_MSABI lsw_GetCurrentThreadCompartmentId(void) { return 0; }
+uint32_t LSW_MSABI lsw_SetCurrentThreadCompartmentId(uint32_t id) { (void)id; return 0; }
+uint32_t LSW_MSABI lsw_ConvertInterfaceIndexToLuid(uint32_t idx, void* luid) {
+    if (luid) { memset(luid, 0, 8); *(uint32_t*)((uint8_t*)luid + 4) = idx; } return 0;
+}
+uint32_t LSW_MSABI lsw_ConvertInterfaceLuidToGuid(const void* luid, void* guid) {
+    (void)luid; if (guid) memset(guid, 0, 16); return 0;
+}
+uint32_t LSW_MSABI lsw_ConvertInterfaceLuidToNameW(const void* luid, wchar_t* ifname, size_t len) {
+    (void)luid;
+    if (ifname && len > 0) lsw_misc_ascii_to_u16("eth0", (uint16_t*)ifname, (int)len);
+    return 0;
+}
+uint32_t LSW_MSABI lsw_ConvertGuidToStringW(const void* guid, wchar_t* buf, uint32_t len) {
+    (void)guid;
+    if (buf && len > 0) lsw_misc_ascii_to_u16("{00000000-0000-0000-0000-000000000000}", (uint16_t*)buf, (int)len);
+    return 0;
+}
+uint32_t LSW_MSABI lsw_GetInterfaceDnsSettings(void* adapter, void* settings) {
+    (void)adapter; (void)settings; return 0;
+}
+void LSW_MSABI lsw_FreeInterfaceDnsSettings(void* settings) { (void)settings; }
+
+/* --- NSI (Network Store Interface) stubs — Windows internal --- */
+#define LSW_NSI_NOT_SUPPORTED 50
+uint32_t LSW_MSABI lsw_NsiAllocateAndGetTable(uint32_t a, void* b, void* c, uint32_t d,
+    void* e, uint32_t f, void* g, uint32_t h, void* i, uint32_t j, uint32_t* k, uint32_t l) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)l;
+    if (k) *k = 0; return LSW_NSI_NOT_SUPPORTED;
+}
+uint32_t LSW_MSABI lsw_NsiFreeTable(void* a, void* b, void* c, void* d) { (void)a;(void)b;(void)c;(void)d; return 0; }
+uint32_t LSW_MSABI lsw_NsiGetAllParameters(uint32_t a, void* b, uint32_t c, void* d,
+    uint32_t e, void* f, uint32_t g, void* h, uint32_t i) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i; return LSW_NSI_NOT_SUPPORTED;
+}
+uint32_t LSW_MSABI lsw_NsiSetAllParameters(uint32_t a, uint32_t b, void* c, uint32_t d,
+    void* e, uint32_t f, void* g, uint32_t h) {
+    (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h; return LSW_NSI_NOT_SUPPORTED;
+}
+
+/* --- DNSAPI stubs --- */
+void* LSW_MSABI lsw_DnsQueryConfigAllocEx(uint32_t cfg, uint32_t* sz, void* ctx) {
+    (void)cfg; if (sz) *sz = 0; (void)ctx; return NULL;
+}
+void LSW_MSABI lsw_DnsFree(void* ptr, uint32_t type) { (void)ptr; (void)type; }
+void* LSW_MSABI lsw_DnsGetCacheRecords(void) { return NULL; }
+uint32_t LSW_MSABI lsw_DnsFlushResolverCache(void) { return 1; }
+uint32_t LSW_MSABI lsw_DnsResolverOp(uint32_t a, void* b, void* c) {
+    (void)a;(void)b;(void)c; return LSW_NSI_NOT_SUPPORTED;
+}
+void* LSW_MSABI lsw_DnsGetDdrInfo(void* a, uint32_t b, uint32_t* c) {
+    (void)a;(void)b; if (c) *c = 0; return NULL;
+}
+void LSW_MSABI lsw_DnsFreeConfigStructure(void* p, uint32_t t) { (void)p;(void)t; }
+
+/* --- DHCP stubs --- */
+uint32_t LSW_MSABI lsw_DhcpAcquireParameters(void* a) { (void)a; return LSW_NSI_NOT_SUPPORTED; }
+uint32_t LSW_MSABI lsw_DhcpReleaseParameters(void* a) { (void)a; return LSW_NSI_NOT_SUPPORTED; }
+uint32_t LSW_MSABI lsw_DhcpHandlePnPEvent(uint32_t a, uint32_t b, void* c, uint32_t d, void* e) {
+    (void)a;(void)b;(void)c;(void)d;(void)e; return LSW_NSI_NOT_SUPPORTED;
+}
+uint32_t LSW_MSABI lsw_DhcpEnumClasses(uint32_t a, uint32_t b, void* c) {
+    (void)a;(void)b;(void)c; return LSW_NSI_NOT_SUPPORTED;
+}
+uint32_t LSW_MSABI lsw_Dhcpv6AcquireParameters(void* a, void* b, void* c) {
+    (void)a;(void)b;(void)c; return LSW_NSI_NOT_SUPPORTED;
+}
+uint32_t LSW_MSABI lsw_Dhcpv6ReleaseParameters(void* a) { (void)a; return LSW_NSI_NOT_SUPPORTED; }
+uint32_t LSW_MSABI lsw_Dhcpv6IsEnabled(uint32_t a) { (void)a; return 0; }
+uint32_t LSW_MSABI lsw_Dhcpv6GetUserClasses(void* a, void* b) { (void)a;(void)b; return LSW_NSI_NOT_SUPPORTED; }
+uint32_t LSW_MSABI lsw_Dhcpv6SetUserClass(void* a, void* b, void* c) { (void)a;(void)b;(void)c; return LSW_NSI_NOT_SUPPORTED; }
 uint32_t LSW_MSABI lsw_GetIfTable(void* pIfTable, uint32_t* pdwSize, int bOrder) { (void)pIfTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
 uint32_t LSW_MSABI lsw_GetIpAddrTable(void* pIpAddrTable, uint32_t* pdwSize, int bOrder) { (void)pIpAddrTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
 uint32_t LSW_MSABI lsw_GetIpForwardTable(void* pIpForwardTable, uint32_t* pdwSize, int bOrder) { (void)pIpForwardTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
@@ -416,6 +900,38 @@ const win32_api_mapping_t win32_api_misc_mappings[] = {
     MAP("iphlpapi.dll", "GetNetworkParams", lsw_GetNetworkParams),
     MAP("iphlpapi.dll", "NotifyAddrChange", lsw_NotifyAddrChange),
     MAP("iphlpapi.dll", "CancelIPChangeNotify", lsw_CancelIPChangeNotify),
+    MAP("iphlpapi.dll", "ConvertLengthToIpv4Mask", lsw_ConvertLengthToIpv4Mask),
+    MAP("iphlpapi.dll", "ConvertInterfaceIndexToLuid", lsw_ConvertInterfaceIndexToLuid),
+    MAP("iphlpapi.dll", "ConvertInterfaceLuidToGuid", lsw_ConvertInterfaceLuidToGuid),
+    MAP("iphlpapi.dll", "ConvertInterfaceLuidToNameW", lsw_ConvertInterfaceLuidToNameW),
+    MAP("iphlpapi.dll", "ConvertGuidToStringW", lsw_ConvertGuidToStringW),
+    MAP("iphlpapi.dll", "GetCurrentThreadCompartmentId", lsw_GetCurrentThreadCompartmentId),
+    MAP("iphlpapi.dll", "SetCurrentThreadCompartmentId", lsw_SetCurrentThreadCompartmentId),
+    MAP("iphlpapi.dll", "GetInterfaceDnsSettings", lsw_GetInterfaceDnsSettings),
+    MAP("iphlpapi.dll", "FreeInterfaceDnsSettings", lsw_FreeInterfaceDnsSettings),
+    /* NSI.dll */
+    MAP("nsi.dll", "NsiAllocateAndGetTable", lsw_NsiAllocateAndGetTable),
+    MAP("nsi.dll", "NsiFreeTable", lsw_NsiFreeTable),
+    MAP("nsi.dll", "NsiGetAllParameters", lsw_NsiGetAllParameters),
+    MAP("nsi.dll", "NsiSetAllParameters", lsw_NsiSetAllParameters),
+    /* DNSAPI.dll */
+    MAP("dnsapi.dll", "DnsQueryConfigAllocEx", lsw_DnsQueryConfigAllocEx),
+    MAP("dnsapi.dll", "DnsFree", lsw_DnsFree),
+    MAP("dnsapi.dll", "DnsGetCacheRecords", lsw_DnsGetCacheRecords),
+    MAP("dnsapi.dll", "DnsFlushResolverCache", lsw_DnsFlushResolverCache),
+    MAP("dnsapi.dll", "DnsResolverOp", lsw_DnsResolverOp),
+    MAP("dnsapi.dll", "DnsGetDdrInfo", lsw_DnsGetDdrInfo),
+    MAP("dnsapi.dll", "DnsFreeConfigStructure", lsw_DnsFreeConfigStructure),
+    /* DHCPCSVC.dll / DHCPCSVC6.dll */
+    MAP("dhcpcsvc.dll",  "DhcpAcquireParameters",  lsw_DhcpAcquireParameters),
+    MAP("dhcpcsvc.dll",  "DhcpReleaseParameters",  lsw_DhcpReleaseParameters),
+    MAP("dhcpcsvc.dll",  "DhcpHandlePnPEvent",     lsw_DhcpHandlePnPEvent),
+    MAP("dhcpcsvc.dll",  "DhcpEnumClasses",         lsw_DhcpEnumClasses),
+    MAP("dhcpcsvc6.dll", "Dhcpv6AcquireParameters", lsw_Dhcpv6AcquireParameters),
+    MAP("dhcpcsvc6.dll", "Dhcpv6ReleaseParameters", lsw_Dhcpv6ReleaseParameters),
+    MAP("dhcpcsvc6.dll", "Dhcpv6IsEnabled",         lsw_Dhcpv6IsEnabled),
+    MAP("dhcpcsvc6.dll", "Dhcpv6GetUserClasses",    lsw_Dhcpv6GetUserClasses),
+    MAP("dhcpcsvc6.dll", "Dhcpv6SetUserClass",      lsw_Dhcpv6SetUserClass),
     /* DirectX */
     MAP("d3d9.dll",     "Direct3DCreate9",              lsw_Direct3DCreate9),
     MAP("d3d9.dll",     "Direct3DCreate9Ex",             lsw_Direct3DCreate9Ex),

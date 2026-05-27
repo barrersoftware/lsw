@@ -466,6 +466,7 @@ bool pe_load_image(pe_image_t* image, const char* filepath) {
     LSW_LOG_INFO("Entry point: %p (RVA: 0x%08x)", image->entry_point, entry_rva);
     
     // Initialize Win32 API
+    lsw_set_exe_path(filepath);
     win32_api_init();
     
     // Resolve imports
@@ -631,52 +632,70 @@ bool pe_resolve_imports(pe_image_t* image) {
             LSW_LOG_INFO("  DLL: %s", dll_name);
         dll_count++;
         
-        // Get the Import Address Table (IAT)
-        uint64_t* iat = (uint64_t*)((uint8_t*)image->image_base + import_desc->ImportAddressTableRVA);
-        uint64_t* ilt = (uint64_t*)((uint8_t*)image->image_base + 
-                                     (import_desc->ImportLookupTableRVA ? import_desc->ImportLookupTableRVA : import_desc->ImportAddressTableRVA));
-        
-        // Resolve each function
-        for (int i = 0; ilt[i] != 0; i++) {
+        // Get the Import Address Table (IAT) — entry width depends on PE32 vs PE64
+        uint32_t ilt_rva = import_desc->ImportLookupTableRVA
+                           ? import_desc->ImportLookupTableRVA
+                           : import_desc->ImportAddressTableRVA;
+        void* ilt_base = (uint8_t*)image->image_base + ilt_rva;
+        void* iat_base = (uint8_t*)image->image_base + import_desc->ImportAddressTableRVA;
+
+        // Resolve each function — handle PE32 (4-byte) and PE64 (8-byte) entries
+        for (int i = 0; ; i++) {
+            uint64_t entry, ordinal_flag;
+            if (image->pe.is_64bit) {
+                entry        = ((uint64_t*)ilt_base)[i];
+                ordinal_flag = PE_ORDINAL_FLAG64;
+            } else {
+                uint32_t e32 = ((uint32_t*)ilt_base)[i];
+                if (e32 == 0) break;
+                entry        = (uint64_t)e32;
+                ordinal_flag = PE_ORDINAL_FLAG32;
+            }
+            if (entry == 0) break;
+
             const char* func_name = NULL;
-            
+
             // Check if import by name or ordinal
-            if (!(ilt[i] & PE_ORDINAL_FLAG64)) {
-                // Import by name
-                pe_import_by_name_t* import_name = (pe_import_by_name_t*)((uint8_t*)image->image_base + ilt[i]);
+            if (!(entry & ordinal_flag)) {
+                // Import by name (RVA points to pe_import_by_name_t)
+                pe_import_by_name_t* import_name = (pe_import_by_name_t*)((uint8_t*)image->image_base + (uint32_t)entry);
                 func_name = (const char*)import_name->Name;
             } else {
-                // Import by ordinal — extract 16-bit ordinal and resolve
-                uint16_t ordinal = (uint16_t)(ilt[i] & 0xFFFF);
+                // Import by ordinal — low 16 bits are the ordinal
+                uint16_t ordinal = (uint16_t)(entry & 0xFFFF);
                 void* func_addr = win32_api_resolve_ordinal(dll_name, ordinal);
                 if (func_addr) {
-                    iat[i] = (uint64_t)func_addr;
-                    func_count++;
                     LSW_LOG_DEBUG("    ✓ %s!#%u -> %p", dll_name, ordinal, func_addr);
                 } else {
                     LSW_LOG_WARN("    ✗ %s!#%u (ordinal) - using generic stub", dll_name, ordinal);
-                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                    func_addr = win32_api_get_generic_stub();
                 }
+                // Write resolved address into the IAT — width matches PE bitness
+                if (image->pe.is_64bit) {
+                    ((uint64_t*)iat_base)[i] = (uint64_t)func_addr;
+                } else {
+                    ((uint32_t*)iat_base)[i] = (uint32_t)(uintptr_t)func_addr;
+                }
+                func_count++;
                 continue;
             }
-            
+
             // Resolve the function — data symbols first, then stubs, then DLL chain
             void* func_addr = win32_api_resolve_data(dll_name, func_name);
-            if (func_addr) {
-                iat[i] = (uint64_t)func_addr;
-                func_count++;
-                LSW_LOG_DEBUG("    ✓ %s (data) -> %p", func_name, func_addr);
-            } else {
+            if (!func_addr)
                 func_addr = resolve_import_with_dll_chain(dll_name, func_name);
-            }
             if (func_addr) {
-                iat[i] = (uint64_t)func_addr;
-                func_count++;
                 LSW_LOG_DEBUG("    ✓ %s -> %p", func_name, func_addr);
             } else {
                 LSW_LOG_WARN("    ✗ %s!%s - unresolved, using stub", dll_name, func_name);
-                iat[i] = (uint64_t)win32_api_get_generic_stub();
+                func_addr = win32_api_get_generic_stub();
             }
+            if (image->pe.is_64bit) {
+                ((uint64_t*)iat_base)[i] = (uint64_t)func_addr;
+            } else {
+                ((uint32_t*)iat_base)[i] = (uint32_t)(uintptr_t)func_addr;
+            }
+            func_count++;
         }
         
         import_desc++;
@@ -794,37 +813,52 @@ bool pe_resolve_delay_imports(pe_image_t* image) {
             continue;
         }
 
-        uint64_t* iat = (uint64_t*)(base + desc->ImportAddressTableRVA);
-        uint64_t* int_tbl = (uint64_t*)(base + desc->ImportNameTableRVA);
+        uint64_t delay_ordinal_flag = image->pe.is_64bit ? PE_ORDINAL_FLAG64 : PE_ORDINAL_FLAG32;
+        uint32_t int_rva = desc->ImportNameTableRVA;
+        uint32_t iat_rva = desc->ImportAddressTableRVA;
+        void* int_base = base + int_rva;
+        void* iat_base_dl = base + iat_rva;
 
-        for (int i = 0; int_tbl[i] != 0; i++) {
+        for (int i = 0; ; i++) {
+            uint64_t entry;
+            if (image->pe.is_64bit) {
+                entry = ((uint64_t*)int_base)[i];
+            } else {
+                uint32_t e32 = ((uint32_t*)int_base)[i];
+                if (e32 == 0) break;
+                entry = (uint64_t)e32;
+            }
+            if (entry == 0) break;
+
             total_funcs++;
             void* addr = NULL;
-            if (int_tbl[i] & PE_ORDINAL_FLAG64) {
-                uint16_t ord = (uint16_t)(int_tbl[i] & 0xFFFF);
+            if (entry & delay_ordinal_flag) {
+                uint16_t ord = (uint16_t)(entry & 0xFFFF);
                 addr = win32_api_resolve_ordinal(dll_name, ord);
                 if (!addr) addr = resolve_import_with_dll_chain(dll_name, NULL);
                 if (addr) {
-                    iat[i] = (uint64_t)addr;
                     resolved++;
                     LSW_LOG_DEBUG("    ✓ %s!#%u (delay) -> %p", dll_name, ord, addr);
                 } else {
-                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                    addr = win32_api_get_generic_stub();
                     LSW_LOG_WARN("    ✗ %s!#%u (delay-ord) - stub", dll_name, ord);
                 }
             } else {
-                pe_import_by_name_t* ibn =
-                    (pe_import_by_name_t*)(base + (uint32_t)int_tbl[i]);
+                pe_import_by_name_t* ibn = (pe_import_by_name_t*)(base + (uint32_t)entry);
                 const char* fn = (const char*)ibn->Name;
                 addr = resolve_import_with_dll_chain(dll_name, fn);
                 if (addr) {
-                    iat[i] = (uint64_t)addr;
                     resolved++;
                     LSW_LOG_DEBUG("    ✓ %s!%s (delay) -> %p", dll_name, fn, addr);
                 } else {
-                    iat[i] = (uint64_t)win32_api_get_generic_stub();
+                    addr = win32_api_get_generic_stub();
                     LSW_LOG_WARN("    ✗ %s!%s (delay) - stub", dll_name, fn);
                 }
+            }
+            if (image->pe.is_64bit) {
+                ((uint64_t*)iat_base_dl)[i] = (uint64_t)addr;
+            } else {
+                ((uint32_t*)iat_base_dl)[i] = (uint32_t)(uintptr_t)addr;
             }
         }
         desc++;
@@ -1061,6 +1095,19 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     
     // Give Win32 APIs access to kernel fd for syscalls (or -1 in userspace mode)
     win32_api_set_kernel_fd(kernel_fd);
+    
+    // Register .pdata section so _CxxThrowException can dispatch C++ exceptions
+    {
+        pe_section_header_t* pdata_sec = pe_get_section(&image->pe, ".pdata");
+        if (pdata_sec) {
+            void* pdata_va = (uint8_t*)image->image_base + pdata_sec->VirtualAddress;
+            win32_api_set_pe_image_info((uint64_t)image->image_base,
+                                        pdata_va,
+                                        pdata_sec->VirtualSize);
+        } else {
+            LSW_LOG_WARN("[pe_loader] .pdata section not found; C++ exceptions disabled");
+        }
+    }
     
     // This is where we actually execute Windows code on Linux!
     if (kernel_available) {

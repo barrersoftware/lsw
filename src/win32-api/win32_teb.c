@@ -22,6 +22,42 @@
 #define SYS_arch_prctl 158
 #endif
 
+#include <sys/resource.h>
+#include <pthread.h>
+
+/* Get the actual Linux stack limits for the current thread so that
+ * Windows code using TEB.StackBase/StackLimit doesn't crash when it
+ * tries to walk the stack (e.g., SEH handler search). */
+static void lsw_get_stack_limits(void** out_base, void** out_limit) {
+    /* Read actual stack limits from /proc/self/maps or pthread attributes */
+    pthread_attr_t attr;
+    void* stack_addr = NULL;
+    size_t stack_size = 0;
+
+#ifdef __linux__
+    /* pthread_getattr_np gives us the current thread's stack */
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+        pthread_attr_destroy(&attr);
+        /* stack_addr = low address of stack region; stack grows down.
+         * StackLimit (lowest valid address) = stack_addr
+         * StackBase  (initial RSP, highest address) = stack_addr + stack_size */
+        *out_limit = stack_addr;
+        *out_base  = (char*)stack_addr + stack_size;
+        return;
+    }
+#endif
+    /* Fallback: use rlimit to size estimate */
+    struct rlimit rl;
+    getrlimit(RLIMIT_STACK, &rl);
+    size_t sz = (rl.rlim_cur == RLIM_INFINITY) ? (8 * 1024 * 1024) : rl.rlim_cur;
+    /* Approximate: current RSP is near top of stack */
+    uintptr_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    *out_base  = (void*)((rsp + 0x1000) & ~0xFFFF);
+    *out_limit = (void*)((uintptr_t)*out_base - sz);
+}
+
 // Thread-local storage for TEB
 static __thread win32_teb_t* current_teb = NULL;
 static __thread win32_peb_t* current_peb = NULL;
@@ -58,9 +94,13 @@ int win32_teb_init(void) {
     current_teb->CountOfOwnedCriticalSections = 0;
     current_teb->CurrentLocale = 0x0409; // English (US)
     
-    // Set up a fake stack
-    current_teb->StackBase = (void*)0x7fffffffffff;
-    current_teb->StackLimit = (void*)0x7ffffff00000;
+    // Set StackBase/StackLimit to the real Linux thread stack so that
+    // Windows code walking the stack (e.g. SEH) doesn't SIGSEGV.
+    void* stack_base = NULL, *stack_limit = NULL;
+    lsw_get_stack_limits(&stack_base, &stack_limit);
+    current_teb->StackBase  = stack_base;
+    current_teb->StackLimit = stack_limit;
+    LSW_LOG_INFO("TEB stack: base=%p limit=%p", stack_base, stack_limit);
     
     // Initialize all TLS slots to NULL
     memset(current_teb->TlsSlots, 0, sizeof(current_teb->TlsSlots));

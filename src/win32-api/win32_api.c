@@ -43,17 +43,59 @@
 #include <sys/wait.h>
 #include <sys/un.h>      /* Unix domain sockets for named pipes */
 #include <malloc.h>      /* malloc_usable_size */
+#include <inttypes.h>   /* PRId64, PRIu64, PRIx64, PRIX64 */
+#include <uchar.h>      /* char16_t (for (const uint16_t*)u"" literals) */
 #include <semaphore.h>   /* sem_t — for CreateSemaphore */
 #include <sys/timerfd.h> /* timerfd_create — for waitable timers */
 #include <poll.h>        /* poll — for IOCP wait */
 #include <setjmp.h>      /* longjmp — for C++ exception delivery */
+#include <pwd.h>         /* getpwuid — for username lookup */
 
-// ioctl command  
-#define LSW_IOCTL_MAGIC 'L'
+/* ---- ms_abi va_list → sysv va_list conversion ----
+ * GCC generates broken sysv va_list when va_start is used inside __attribute__((ms_abi))
+ * variadic functions. Fix: use __builtin_ms_va_start to get a proper ms_abi va_list (just a
+ * stack pointer), then manually build a sysv va_list struct with:
+ *   gp_offset=48 (all 6 GP regs "used") and overflow_arg_area = the ms stack pointer.
+ * This correctly maps ms_abi variadic args (stored linearly on the stack) to sysv's
+ * "overflow" arg area which vsnprintf/etc. reads from when gp_offset >= 48.
+ *
+ * x86-64 sysv va_list layout: { uint gp_off(4), fp_off(4), void* oa(8), void* rs(8) }[1]
+ */
+#define LSW_MS_TO_SYSV_VA(sysv_ap_, ms_ap_) do { \
+    ((unsigned int*)(sysv_ap_))[0] = 48;          \
+    ((unsigned int*)(sysv_ap_))[1] = 304;         \
+    ((void**)((char*)(sysv_ap_)+8))[0] = (ms_ap_);\
+    ((void**)((char*)(sysv_ap_)+16))[0] = NULL;   \
+} while(0)
+
+
 #define LSW_IOCTL_SYSCALL _IOWR(LSW_IOCTL_MAGIC, 5, struct lsw_syscall_request)
 
 /* Forward declarations */
 static void createprocess_win_to_linux(const char* wpath, char* out, size_t outsz);
+
+/* ---- Global exe path (set by PE loader at startup) ---- */
+static char g_lsw_exe_path[4096] = {0};
+
+/* ---- PE image info for x64 C++ exception dispatch ---- */
+static uint64_t g_lsw_image_base  = 0;
+static void*    g_lsw_pdata_va    = NULL;
+static uint32_t g_lsw_pdata_size  = 0;
+
+void win32_api_set_pe_image_info(uint64_t image_base,
+                                  void*    pdata_va,
+                                  uint32_t pdata_size)
+{
+    g_lsw_image_base = image_base;
+    g_lsw_pdata_va   = pdata_va;
+    g_lsw_pdata_size = pdata_size;
+    LSW_LOG_INFO("[exception] PE image info: base=0x%lx pdata=%p size=%u",
+                 (unsigned long)image_base, pdata_va, pdata_size);
+}
+
+void lsw_set_exe_path(const char* path) {
+    if (path) strncpy(g_lsw_exe_path, path, sizeof(g_lsw_exe_path) - 1);
+}
 
 /* ---- PE module handle ---- */
 #define LSW_PE_HMODULE_MAGIC 0x5045484DU  /* "PEHM" */
@@ -64,6 +106,12 @@ struct lsw_pe_hmodule_s {
     size_t image_size;
     void*  export_dir;
     uint32_t export_dir_size;
+    /* resource section: NULL if the DLL has no .rsrc section */
+    void*    rsrc_raw;   /* pointer into image_base at PointerToRawData */
+    uint32_t rsrc_rva;   /* VirtualAddress of .rsrc section (for RVA→ptr translation) */
+    /* MUI satellite image (for message-only DLLs on Vista+) */
+    void*    mui_image;
+    size_t   mui_image_size;
 };
 typedef struct lsw_pe_hmodule_s lsw_pe_hmodule_t;
 
@@ -260,12 +308,17 @@ void win32_crt_data_init(int argc, char** argv) {
     lsw_crt_initenv = environ;  /* libc's global environ */
     lsw_crt_environ = environ;
 
-    /* Build command-line string from argv */
+    /* Build command-line string from argv.
+     * Quote arguments that contain spaces so GetCommandLineW() returns a
+     * properly parseable Windows-style command line. */
     static char cmdln_buf[4096];
     cmdln_buf[0] = '\0';
     for (int i = 0; i < argc; i++) {
         if (i) strncat(cmdln_buf, " ", sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
-        strncat(cmdln_buf, argv[i], sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
+        int has_space = argv[i] && strchr(argv[i], ' ') != NULL;
+        if (has_space) strncat(cmdln_buf, "\"", sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
+        if (argv[i])   strncat(cmdln_buf, argv[i], sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
+        if (has_space) strncat(cmdln_buf, "\"", sizeof(cmdln_buf) - strlen(cmdln_buf) - 1);
     }
     lsw_crt_acmdln = cmdln_buf;
 
@@ -317,17 +370,44 @@ size_t __attribute__((ms_abi)) lsw_strlen(const char* s) {
     return strlen(s);
 }
 
-int __attribute__((ms_abi)) lsw_printf(const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    int result = vprintf(format, args);
-    va_end(args);
-    return result;
+/*
+ * ms_abi va_list → SysV va_list conversion helper
+ *
+ * In ms_abi, variadic args are all passed on the stack (shadow home space).
+ * va_start() sets ap to point to the first variadic arg on the stack.
+ * In SysV, va_list is a struct { gp_offset, fp_offset, overflow_arg_area, reg_save_area }.
+ * Setting gp_offset=48 fp_offset=176 means "all registers exhausted, read from stack".
+ * Then overflow_arg_area=ap reads directly from the ms_abi stack layout.
+ * This correctly bridges the two ABIs for integer/pointer variadic args.
+ */
+typedef struct { unsigned int gp_offset; unsigned int fp_offset;
+                 void* overflow_arg_area; void* reg_save_area; } lsw_sysv_va_list_t;
+
+/* Format a string from ms_abi va_list to a heap buffer. Caller must free result. */
+static char* lsw_format_ms_va(const char* format, va_list ap) {
+    lsw_sysv_va_list_t sysv_ap_s = { 48, 176, ap, NULL };
+    /* va_list is an array type; pass via pointer-to-first-element trick */
+    __builtin_va_list sysv_vl;
+    memcpy(&sysv_vl, &sysv_ap_s, sizeof(sysv_ap_s));
+    char* buf = NULL;
+    int n = vasprintf(&buf, format, sysv_vl);
+    (void)n;
+    return buf;
 }
 
-// Declare vfprintf first since fprintf uses it
+int __attribute__((ms_abi)) lsw_printf(const char* format, ...) {
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
+    char* buf = NULL; vasprintf(&buf, format, ap);
+    __builtin_ms_va_end(ms_ap);
+    if (!buf) return -1;
+    int n = (int)write(1, buf, strlen(buf));
+    free(buf);
+    return n;
+}
+
+// vfprintf / fprintf
 int __attribute__((ms_abi)) lsw_vfprintf(FILE* stream, const char* format, va_list ap) {
-    // Check if this is our fake FILE structure
     typedef struct {
         char* _ptr;
         int _cnt;
@@ -338,35 +418,273 @@ int __attribute__((ms_abi)) lsw_vfprintf(FILE* stream, const char* format, va_li
         int _bufsiz;
         char* _tmpfname;
     } fake_FILE;
-    
-    fake_FILE* fake = (fake_FILE*)stream;
-    
-    // Check if it's one of our fake stdio FILE structures (fd 0-2)
-    if (fake && fake->_file >= 0 && fake->_file <= 2) {
-        // Use vdprintf() to write formatted output directly to fd
-        return vdprintf(fake->_file, format, ap);
-    }
-    
-    // Otherwise use real vfprintf
-    return vfprintf(stream, format, ap);
-}
 
-int __attribute__((ms_abi)) lsw_fprintf(FILE* stream, const char* format, ...) {
-    va_list args;
-    va_start(args, format);
-    // Use our vfprintf which handles fake FILE structures
-    int result = lsw_vfprintf(stream, format, args);
-    va_end(args);
+    if (!format) return 0;
+
+    /* ap here is an ms_abi va_list (just a pointer); convert to sysv */
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    char* buf = NULL; vasprintf(&buf, format, sysv_ap);
+    if (!buf) return -1;
+
+    int fd = -1;
+    fake_FILE* fake = (fake_FILE*)stream;
+    if (fake && fake->_file >= 0 && fake->_file <= 2)
+        fd = fake->_file;
+    else if (stream == (FILE*)stdout) fd = 1;
+    else if (stream == (FILE*)stderr) fd = 2;
+    else if (stream == (FILE*)stdin)  fd = 0;
+
+    int result;
+    if (fd >= 0)
+        result = (int)write(fd, buf, strlen(buf));
+    else
+        result = (int)fwrite(buf, 1, strlen(buf), stream ? stream : stderr);
+
+    free(buf);
     return result;
 }
 
-// Wide-char versions (stubs - convert to narrow and use regular fprintf)
+int __attribute__((ms_abi)) lsw_fprintf(FILE* stream, const char* format, ...) {
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
+    char* buf = NULL; vasprintf(&buf, format, ap);
+    __builtin_ms_va_end(ms_ap);
+    if (!buf) return -1;
+    int fd = -1;
+    if (stream == stdout) fd = 1; else if (stream == stderr) fd = 2;
+    int result = (fd >= 0) ? (int)write(fd, buf, strlen(buf))
+                           : (int)fwrite(buf, 1, strlen(buf), stream ? stream : stderr);
+    free(buf);
+    return result;
+}
+
+/* Convert a single UTF-16LE code unit to UTF-8. Returns bytes written. */
+static int lsw_u16cp_to_utf8(uint16_t c, char* out) {
+    if (c < 0x80) { out[0] = (char)c; return 1; }
+    if (c < 0x800) { out[0] = 0xC0|(c>>6); out[1] = 0x80|(c&0x3F); return 2; }
+    out[0] = 0xE0|(c>>12); out[1] = 0x80|((c>>6)&0x3F); out[2] = 0x80|(c&0x3F); return 3;
+}
+
+/* Convert a Windows UTF-16LE string to UTF-8 in dst (dstlen includes null). Returns bytes written. */
+static int lsw_u16str_to_utf8(const uint16_t* src, char* dst, int dstlen) {
+    int j = 0;
+    if (!src || dstlen <= 0) { if (dst && dstlen>0) dst[0]='\0'; return 0; }
+    for (int i = 0; src[i] && j < dstlen - 4; i++)
+        j += lsw_u16cp_to_utf8(src[i], dst + j);
+    dst[j] = '\0';
+    return j;
+}
+
+/*
+ * lsw_wide_vprintf_to_fd — Windows-semantics wide printf to a Linux fd.
+ *
+ * 'format' is a pointer to a Windows UTF-16LE string (2 bytes per code unit).
+ * On Linux wchar_t is 4 bytes, so we MUST treat the format as uint16_t*.
+ *
+ * 'ap' is a raw Windows x64 ms_abi vararg pointer (char*).  Each argument
+ * slot is exactly 8 bytes; integers are zero-extended to 8 bytes.
+ *   #define W64_VA(ap, T) (ap += 8, *(T*)((ap)-8))
+ *
+ * Windows wide printf specifier semantics (differ from Linux):
+ *   %s / %ls / %ws  → wide string (uint16_t* / UTF-16LE)
+ *   %S / %hs        → narrow string (char*)
+ *   %c / %lc / %wc  → wide char (uint16_t, promoted to int)
+ *   %C / %hc        → narrow char (int)
+ *   %I64d / %I64u / %I64x → Windows 64-bit integer
+ *   %d %i %u %x %X %o %p → standard (same as Linux)
+ *   %l* modifiers   → 'long' (same as Linux)
+ */
+/* Read one Windows x64 ms_abi vararg slot (always 8 bytes) */
+#define W64_VA(ap, T) (ap += 8, *(T*)((ap)-8))
+
+static int lsw_wide_vprintf_to_fd(int fd, const wchar_t* format_wc, char* ap) {
+    if (!format_wc) return 0;
+    const uint16_t* fmt = (const uint16_t*)format_wc; /* treat as UTF-16LE */
+
+    char out[16384];
+    int olen = 0;
+
+    for (int fi = 0; fmt[fi] && olen < (int)sizeof(out) - 128; ) {
+        uint16_t ch = fmt[fi++];
+        if (ch != '%') {
+            olen += lsw_u16cp_to_utf8(ch, out + olen);
+            continue;
+        }
+        /* Start of format specifier: %[flags][width][.prec][length]conv */
+        if (!fmt[fi]) { out[olen++] = '%'; break; }
+
+        /* Collect into a narrow spec buffer for snprintf fallback */
+        char spec[32];
+        int sp = 0;
+        spec[sp++] = '%';
+
+        /* Flags */
+        while (fmt[fi] && (fmt[fi]=='-'||fmt[fi]=='+'||fmt[fi]==' '||
+                           fmt[fi]=='0'||fmt[fi]=='#'||fmt[fi]=='\''||fmt[fi]=='F')) /* F = Windows flag */
+            spec[sp++] = (char)fmt[fi++];
+
+        /* Width */
+        if (fmt[fi] == '*') {
+            int w = W64_VA(ap, int);
+            sp += snprintf(spec+sp, sizeof(spec)-sp, "%d", w);
+            fi++;
+        } else {
+            while (fmt[fi] >= '0' && fmt[fi] <= '9') spec[sp++] = (char)fmt[fi++];
+        }
+
+        /* Precision */
+        if (fmt[fi] == '.') {
+            spec[sp++] = '.'; fi++;
+            if (fmt[fi] == '*') {
+                int p = W64_VA(ap, int);
+                sp += snprintf(spec+sp, sizeof(spec)-sp, "%d", p);
+                fi++;
+            } else {
+                while (fmt[fi] >= '0' && fmt[fi] <= '9') spec[sp++] = (char)fmt[fi++];
+            }
+        }
+
+        /* Length modifier + conversion */
+        uint16_t lm = fmt[fi]; /* potential length modifier */
+        uint16_t conv;
+
+        /* Windows %I64d / %I64u / %I64x */
+        if (lm=='I' && fmt[fi+1]=='6' && fmt[fi+2]=='4') {
+            fi += 3;
+            conv = fmt[fi++];
+            int64_t  sv; uint64_t uv;
+            char tmp[64];
+            if (conv=='d'||conv=='i') { sv=W64_VA(ap,int64_t); snprintf(tmp,sizeof(tmp),"%"PRId64,sv); }
+            else if (conv=='u')       { uv=W64_VA(ap,uint64_t); snprintf(tmp,sizeof(tmp),"%"PRIu64,uv); }
+            else if (conv=='x')       { uv=W64_VA(ap,uint64_t); snprintf(tmp,sizeof(tmp),"%"PRIx64,uv); }
+            else if (conv=='X')       { uv=W64_VA(ap,uint64_t); snprintf(tmp,sizeof(tmp),"%"PRIX64,uv); }
+            else { tmp[0]='?'; tmp[1]='\0'; }
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+            continue;
+        }
+
+        /* %% */
+        if (lm=='%') { fi++; out[olen++]='%'; continue; }
+
+        /* Detect 'h' / 'l' / 'w' / 'F' length modifiers */
+        int lmod_h=0, lmod_l=0;
+        if (lm=='h') { lmod_h=1; fi++; lm=fmt[fi]; }
+        else if (lm=='l') { lmod_l=1; fi++; lm=fmt[fi]; }
+        else if (lm=='w' || lm=='F') { /* Windows 'w'/'F' = wide, same as 'l' for strings */
+            lmod_l=1; fi++; lm=fmt[fi];
+        }
+
+        conv = fmt[fi++];
+
+        if (conv=='s' || conv=='S') {
+            /* Windows wide printf: %s/%ls/%ws = wide string; %S/%hs = narrow string */
+            int want_wide = (conv=='s' && !lmod_h) || (conv=='s' && lmod_l) || (conv=='S' && lmod_l);
+            int want_narrow = (conv=='s' && lmod_h) || (conv=='S' && !lmod_l);
+            (void)want_narrow; /* narrow handled by else */
+            if (want_wide || (!lmod_h && conv=='s')) {
+                const uint16_t* wstr = W64_VA(ap, const uint16_t*);
+                if (!wstr) wstr = (const uint16_t*)u"(null)";
+                olen += lsw_u16str_to_utf8(wstr, out+olen, (int)sizeof(out)-olen);
+            } else {
+                /* narrow string */
+                const char* nstr = W64_VA(ap, const char*);
+                if (!nstr) nstr = "(null)";
+                int nl=(int)strlen(nstr); if(olen+nl<(int)sizeof(out)) { memcpy(out+olen,nstr,nl); olen+=nl; }
+            }
+        } else if (conv=='c' || conv=='C') {
+            /* %c/%lc/%wc = wide char; %C/%hc = narrow char */
+            if ((conv=='c' && !lmod_h) || (conv=='C' && lmod_l)) {
+                uint16_t wc = (uint16_t)W64_VA(ap, int);
+                olen += lsw_u16cp_to_utf8(wc, out+olen);
+            } else {
+                out[olen++] = (char)W64_VA(ap, int);
+            }
+        } else if (conv=='d' || conv=='i') {
+            spec[sp++] = lmod_l ? 'l' : (lmod_h ? 'h' : 0); if(!lmod_h&&!lmod_l) sp--;
+            spec[sp++] = 'd'; spec[sp]='\0';
+            long long v = lmod_l ? (long long)W64_VA(ap,long) : (long long)W64_VA(ap,int);
+            char tmp[64]; snprintf(tmp,sizeof(tmp),spec,v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='u') {
+            spec[sp++] = lmod_l ? 'l' : (lmod_h ? 'h' : 0); if(!lmod_h&&!lmod_l) sp--;
+            spec[sp++] = 'u'; spec[sp]='\0';
+            unsigned long long v = lmod_l ? (unsigned long long)W64_VA(ap,unsigned long) : (unsigned long long)W64_VA(ap,unsigned int);
+            char tmp[64]; snprintf(tmp,sizeof(tmp),spec,v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='x' || conv=='X') {
+            spec[sp++] = lmod_l ? 'l' : (lmod_h ? 'h' : 0); if(!lmod_h&&!lmod_l) sp--;
+            spec[sp++] = (char)conv; spec[sp]='\0';
+            unsigned long long v = lmod_l ? (unsigned long long)W64_VA(ap,unsigned long) : (unsigned long long)W64_VA(ap,unsigned int);
+            char tmp[64]; snprintf(tmp,sizeof(tmp),spec,v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='o') {
+            spec[sp++] = 'o'; spec[sp]='\0';
+            unsigned int v = W64_VA(ap, unsigned int);
+            char tmp[32]; snprintf(tmp,sizeof(tmp),spec,v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='p') {
+            void* v = W64_VA(ap, void*);
+            char tmp[32]; snprintf(tmp,sizeof(tmp),"%p",v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='f' || conv=='e' || conv=='E' || conv=='g' || conv=='G') {
+            spec[sp++] = (char)conv; spec[sp]='\0';
+            double v = W64_VA(ap, double);
+            char tmp[64]; snprintf(tmp,sizeof(tmp),spec,v);
+            int tl=(int)strlen(tmp); if(olen+tl<(int)sizeof(out)) { memcpy(out+olen,tmp,tl); olen+=tl; }
+        } else if (conv=='n') {
+            int* p = W64_VA(ap, int*); if(p) *p = olen;
+        } else {
+            /* Unknown specifier: emit raw */
+            spec[sp++] = (char)conv; spec[sp]='\0';
+            if(olen+(int)strlen(spec)<(int)sizeof(out)) {
+                int sl=(int)strlen(spec); memcpy(out+olen,spec,sl); olen+=sl;
+            }
+        }
+    }
+    out[olen] = '\0';
+    if (olen == 0) return 0;
+    return (int)write(fd, out, olen);
+}
+
+int __attribute__((ms_abi)) lsw_wprintf(const wchar_t* format, ...) {
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
+    int r = lsw_wide_vprintf_to_fd(1, format, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap);
+    return r;
+}
+
+int __attribute__((ms_abi)) lsw_vwprintf(const wchar_t* format, __builtin_ms_va_list ap) {
+    return lsw_wide_vprintf_to_fd(1, format, (char*)ap);
+}
+
 int __attribute__((ms_abi)) lsw_fwprintf(FILE* stream, const wchar_t* format, ...) {
-    // Stub: For now, just return success
-    // TODO: Properly convert wide-char format string and args
-    (void)stream;
-    (void)format;
-    return 0;
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
+    int fd = 1;
+    if (stream) {
+        fake_FILE* f = (fake_FILE*)stream;
+        if (f->_file == 1 || stream == (FILE*)stdout) fd = 1;
+        else if (f->_file == 2 || stream == (FILE*)stderr) fd = 2;
+        else if (f->_file == 0 || stream == (FILE*)stdin)  fd = 0;
+        else fd = f->_file;
+    }
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
+    int r = lsw_wide_vprintf_to_fd(fd, format, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap);
+    return r;
+}
+
+int __attribute__((ms_abi)) lsw_vfwprintf(FILE* stream, const wchar_t* format, __builtin_ms_va_list ap) {
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
+    int fd = 1;
+    if (stream) {
+        fake_FILE* f = (fake_FILE*)stream;
+        if (f->_file == 2 || stream == (FILE*)stderr) fd = 2;
+        else if (f->_file == 0 || stream == (FILE*)stdin)  fd = 0;
+        else fd = f->_file >= 0 ? f->_file : 1;
+    }
+    return lsw_wide_vprintf_to_fd(fd, format, (char*)ap);
 }
 
 int __attribute__((ms_abi)) lsw_fputwc(wchar_t wc, FILE* stream) {
@@ -413,6 +731,7 @@ int __attribute__((ms_abi)) lsw_fflush(FILE* stream) {
 }
 
 void __attribute__((ms_abi)) lsw_exit(int status) {
+    LSW_LOG_INFO("msvcrt exit(%d) called", status);
     exit(status);
 }
 
@@ -491,8 +810,111 @@ char* __attribute__((ms_abi)) lsw_strstr(const char* haystack, const char* needl
     return strstr(haystack, needle);
 }
 
+/* ===== UTF-16LE (uint16_t) string helpers ============================== *
+ * Windows wchar_t = 2 bytes (UTF-16LE); Linux wchar_t = 4 bytes (UTF-32). *
+ * All Windows PE code passes wchar_t* as uint16_t* pointers.               *
+ * We MUST NOT call Linux wcs*() on these — they read 4 bytes per char.     *
+ * These helpers operate on uint16_t (2-byte) units throughout.             *
+ * ======================================================================== */
+typedef uint16_t u16;
+
+static inline size_t u16_len(const u16* s) {
+    const u16* p = s; while (*p) p++; return (size_t)(p - s);
+}
+static inline size_t u16_nlen(const u16* s, size_t maxlen) {
+    size_t n = 0; while (n < maxlen && s[n]) n++; return n;
+}
+static inline u16* u16_cpy(u16* d, const u16* s) {
+    u16* r = d; while ((*d++ = *s++)); return r;
+}
+static inline u16* u16_ncpy(u16* d, const u16* s, size_t n) {
+    u16* r = d;
+    while (n && (*d = *s)) { d++; s++; n--; }
+    while (n--) *d++ = 0;
+    return r;
+}
+static inline u16* u16_cat(u16* d, const u16* s) {
+    u16* p = d; while (*p) p++; while ((*p++ = *s++)); return d;
+}
+static inline u16* u16_ncat(u16* d, const u16* s, size_t n) {
+    u16* p = d; while (*p) p++;
+    while (n-- && *s) *p++ = *s++;
+    *p = 0; return d;
+}
+static inline int u16_cmp(const u16* a, const u16* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)*a - (int)*b;
+}
+static inline int u16_ncmp(const u16* a, const u16* b, size_t n) {
+    while (n && *a && *a == *b) { a++; b++; n--; }
+    return n ? (int)*a - (int)*b : 0;
+}
+static inline int u16_icmp(const u16* a, const u16* b) {
+    while (*a && towlower(*a) == towlower(*b)) { a++; b++; }
+    return (int)towlower(*a) - (int)towlower(*b);
+}
+static inline int u16_nicmp(const u16* a, const u16* b, size_t n) {
+    while (n && *a && towlower(*a) == towlower(*b)) { a++; b++; n--; }
+    return n ? (int)towlower(*a) - (int)towlower(*b) : 0;
+}
+static inline u16* u16_chr(const u16* s, u16 c) {
+    for (;; s++) { if (*s == c) return (u16*)s; if (!*s) break; }
+    return NULL;
+}
+static inline u16* u16_rchr(const u16* s, u16 c) {
+    const u16* last = NULL;
+    for (; *s; s++) if (*s == c) last = s;
+    if (c == 0) return (u16*)s;
+    return (u16*)last;
+}
+static inline u16* u16_str(const u16* h, const u16* n) {
+    if (!*n) return (u16*)h;
+    size_t nlen = u16_len(n);
+    for (; *h; h++) if (*h == *n && u16_ncmp(h, n, nlen) == 0) return (u16*)h;
+    return NULL;
+}
+static inline u16* u16_dup(const u16* s) {
+    size_t sz = (u16_len(s) + 1) * sizeof(u16);
+    u16* d = malloc(sz); if (d) memcpy(d, s, sz); return d;
+}
+static inline void u16_to_utf8(const u16* src, char* dst, size_t dstmax) {
+    size_t i = 0;
+    for (; *src && i + 4 < dstmax; src++) {
+        uint32_t c = *src;
+        if (c < 0x80) { dst[i++] = (char)c; }
+        else if (c < 0x800) { dst[i++]=(char)(0xC0|(c>>6)); dst[i++]=(char)(0x80|(c&0x3F)); }
+        else { dst[i++]=(char)(0xE0|(c>>12)); dst[i++]=(char)(0x80|((c>>6)&0x3F)); dst[i++]=(char)(0x80|(c&0x3F)); }
+    }
+    dst[i] = '\0';
+}
+static inline unsigned long u16_strtoul(const u16* p, u16** end, int base) {
+    char buf[64]; u16_to_utf8(p, buf, sizeof(buf));
+    char* ep; unsigned long r = strtoul(buf, &ep, base);
+    if (end) *end = (u16*)p + (ep - buf); return r;
+}
+static inline long u16_strtol(const u16* p, u16** end, int base) {
+    char buf[64]; u16_to_utf8(p, buf, sizeof(buf));
+    char* ep; long r = strtol(buf, &ep, base);
+    if (end) *end = (u16*)p + (ep - buf); return r;
+}
+static inline double u16_strtod(const u16* p, u16** end) {
+    char buf[64]; u16_to_utf8(p, buf, sizeof(buf));
+    char* ep; double r = strtod(buf, &ep);
+    if (end) *end = (u16*)p + (ep - buf); return r;
+}
+static inline u16* u16_tok(u16* str, const u16* delim, u16** ctx) {
+    u16* s = str ? str : (ctx ? *ctx : NULL);
+    if (!s || !delim) return NULL;
+    while (*s && u16_chr(delim, *s)) s++;
+    if (!*s) { if (ctx) *ctx = NULL; return NULL; }
+    u16* tok = s;
+    while (*s && !u16_chr(delim, *s)) s++;
+    if (*s) { *s++ = 0; }
+    if (ctx) *ctx = s; return tok;
+}
+
 size_t __attribute__((ms_abi)) lsw_wcslen(const wchar_t* s) {
-    return wcslen(s);
+    return u16_len((const u16*)s);
 }
 
 struct lconv* __attribute__((ms_abi)) lsw_localeconv(void) {
@@ -505,29 +927,27 @@ void (*__attribute__((ms_abi)) lsw_signal(int signum, void (*handler)(int)))(int
 
 // CRT initialization stubs - minimal implementations to get past CRT init
 static char** lsw_environ = NULL;
-static int lsw_argc = 0;
-static char** lsw_argv = NULL;
 
 int __attribute__((ms_abi)) lsw__getmainargs(int* argc, char*** argv, char*** env, int do_wildcard, void* startinfo) {
     (void)do_wildcard;
     (void)startinfo;
-    
-    if (!lsw_argv) {
-        lsw_argc = 1;
-        lsw_argv = malloc(sizeof(char*) * 2);
-        lsw_argv[0] = "program.exe";
-        lsw_argv[1] = NULL;
+
+    /* Use real args from win32_crt_data_init() if available */
+    if (lsw_crt_argc > 0 && lsw_crt_argv) {
+        *argc = lsw_crt_argc;
+        *argv = lsw_crt_argv;
+    } else {
+        static char* fallback_argv[2] = { "program.exe", NULL };
+        *argc = 1;
+        *argv = fallback_argv;
     }
-    
+
     if (!lsw_environ) {
         lsw_environ = malloc(sizeof(char*));
         lsw_environ[0] = NULL;
     }
-    
-    *argc = lsw_argc;
-    *argv = lsw_argv;
     *env = lsw_environ;
-    
+
     return 0;
 }
 
@@ -539,33 +959,33 @@ char** __attribute__((ms_abi)) lsw__initenv(void) {
     return lsw_environ;
 }
 
+/* Windows CRT FILE structure (_iobuf) layout on x64, 48 bytes */
+typedef struct {
+    char* _ptr;       /* 0:  current position in buffer */
+    int   _cnt;       /* 8:  characters left in buffer */
+    /* 4 bytes implicit padding to align next pointer */
+    char* _base;      /* 16: base of buffer */
+    int   _flag;      /* 24: file status flags */
+    int   _file;      /* 28: file descriptor number */
+    int   _charbuf;   /* 32: char buffer for ungetch */
+    int   _bufsiz;    /* 36: buffer size */
+    char* _tmpfname;  /* 40: temporary filename */
+} lsw_fake_FILE;     /* total: 48 bytes */
+
+static lsw_fake_FILE lsw_fake_files[3] = {
+    {NULL, 0, NULL, 0, 0, 0, 0, NULL},  /* stdin  (fd 0) */
+    {NULL, 0, NULL, 0, 1, 0, 0, NULL},  /* stdout (fd 1) */
+    {NULL, 0, NULL, 0, 2, 0, 0, NULL},  /* stderr (fd 2) */
+};
+
 void* __attribute__((ms_abi)) lsw__iob_func(void) {
-    // Windows CRT expects __iob_func to return pointer to FILE array
-    // Windows FILE structure (_iobuf) is about 48 bytes on x64
-    // We create fake FILE structures with proper size for pointer arithmetic
-    typedef struct {
-        char* _ptr;       // Current position in buffer
-        int _cnt;         // Characters left in buffer  
-        char* _base;      // Base of buffer
-        int _flag;        // File status flags
-        int _file;        // File descriptor
-        int _charbuf;     // Char buffer for ungetch
-        int _bufsiz;      // Buffer size
-        char* _tmpfname;  // Temporary filename
-    } fake_FILE;
-    
-    static fake_FILE fake_files[3] = {
-        {NULL, 0, NULL, 0, 0, 0, 0, NULL},  // stdin
-        {NULL, 0, NULL, 0, 1, 0, 0, NULL},  // stdout  
-        {NULL, 0, NULL, 0, 2, 0, 0, NULL},  // stderr
-    };
-    
-    return (void*)fake_files;
+    /* Windows CRT __iob_func returns pointer to array of _iobuf structs */
+    return (void*)lsw_fake_files;
 }
 
 void __attribute__((ms_abi)) lsw__set_app_type(int type) {
+    LSW_LOG_INFO("__set_app_type(%d) called", type);
     (void)type;
-    // Stub - do nothing
 }
 
 void __attribute__((ms_abi)) lsw__setusermatherr(void* handler) {
@@ -574,6 +994,7 @@ void __attribute__((ms_abi)) lsw__setusermatherr(void* handler) {
 }
 
 void __attribute__((ms_abi)) lsw__amsg_exit(int code) {
+    LSW_LOG_INFO("_amsg_exit(%d) called - CRT fatal error", code);
     exit(code);
 }
 
@@ -581,14 +1002,735 @@ void __attribute__((ms_abi)) lsw__cexit(void) {
     // Stub - CRT cleanup, do nothing
 }
 
-int lsw_commode = 0;  // Make non-static for direct access
-int* __attribute__((ms_abi)) lsw__commode_ptr(void) {
-    return &lsw_commode;
+void __attribute__((ms_abi)) lsw__c_exit(void) {
+    // Stub - quick CRT cleanup without calling atexit handlers
 }
 
-int lsw_fmode = 0;  // Make non-static for direct access
-int* __attribute__((ms_abi)) lsw__fmode_ptr(void) {
-    return &lsw_fmode;
+/* _beginthreadex — create a thread via MSVC CRT */
+#include <pthread.h>
+typedef unsigned(__attribute__((ms_abi)) *_beginthreadex_start_t)(void*);
+typedef struct { _beginthreadex_start_t fn; void* arg; } _beginthreadex_ctx_t;
+static void* _beginthreadex_trampoline(void* arg) {
+    _beginthreadex_ctx_t* ctx = (_beginthreadex_ctx_t*)arg;
+    unsigned ret = ctx->fn(ctx->arg);
+    free(ctx);
+    return (void*)(uintptr_t)ret;
+}
+uintptr_t __attribute__((ms_abi)) lsw__beginthreadex(void* security, unsigned stack_size,
+        _beginthreadex_start_t start, void* arglist, unsigned initflag, unsigned* thrdaddr) {
+    (void)security; (void)stack_size; (void)initflag;
+    _beginthreadex_ctx_t* ctx = malloc(sizeof(_beginthreadex_ctx_t));
+    if (!ctx) return 0;
+    ctx->fn = start;
+    ctx->arg = arglist;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, _beginthreadex_trampoline, ctx) != 0) {
+        free(ctx);
+        return 0;
+    }
+    if (thrdaddr) *thrdaddr = (unsigned)(uintptr_t)tid;
+    pthread_detach(tid);
+    return (uintptr_t)tid;
+}
+void __attribute__((ms_abi)) lsw__endthreadex(unsigned retval) {
+    pthread_exit((void*)(uintptr_t)retval);
+}
+
+/* Wide-char version of __getmainargs — used by MSVCRT CRT startup in 64-bit apps */
+int __attribute__((ms_abi)) lsw__wgetmainargs(int* argc, wchar_t*** wargv, wchar_t*** wenvp,
+                                               int expand_wildcards, void* startupinfo) {
+    LSW_LOG_DEBUG("__wgetmainargs called");
+    (void)expand_wildcards;
+    (void)startupinfo;
+
+    /* Build UTF-16LE argv from the real CRT args set by win32_crt_data_init().
+     * NOTE: On Linux wchar_t is 4 bytes, but Windows expects 2-byte UTF-16.
+     * We use uint16_t storage and cast the pointer to wchar_t** to satisfy the
+     * Windows ABI while keeping correct 2-byte characters. */
+    int n = (lsw_crt_argc > 0 && lsw_crt_argv) ? lsw_crt_argc : 1;
+
+    static uint16_t  arg_storage[64][512]; /* 64 args × 512 UTF-16 code units */
+    static uint16_t* w_ptrs[65];           /* pointers + NULL sentinel */
+
+    int actual = (n > 64) ? 64 : n;
+    for (int i = 0; i < actual; i++) {
+        const char* src = (lsw_crt_argv && lsw_crt_argv[i]) ? lsw_crt_argv[i] : "program.exe";
+        size_t len = strlen(src);
+        uint16_t* dst = arg_storage[i];
+        size_t j;
+        for (j = 0; j < len && j < 511; j++)
+            dst[j] = (uint16_t)(unsigned char)src[j];
+        dst[j] = 0;
+        w_ptrs[i] = dst;
+    }
+    w_ptrs[actual] = NULL;
+
+    static uint16_t* empty_envp[1] = { NULL };
+
+    *argc  = actual;
+    *wargv = (wchar_t**)w_ptrs;
+    *wenvp = (wchar_t**)empty_envp;
+    LSW_LOG_DEBUG("__wgetmainargs -> argc=%d, argv[0]='%s'%s", actual,
+        (actual > 0 && lsw_crt_argv && lsw_crt_argv[0]) ? lsw_crt_argv[0] : "(null)",
+        (actual > 1 && lsw_crt_argv && lsw_crt_argv[1]) ? "" : " (no extra args)");
+    if (actual > 1 && lsw_crt_argv && lsw_crt_argv[1])
+        LSW_LOG_DEBUG("__wgetmainargs -> argv[1]='%s' (w_ptrs[1][0]=0x%04x)", lsw_crt_argv[1], (unsigned)w_ptrs[1][0]);
+    return 0;
+}
+
+/* _exit — exit without CRT cleanup */
+void __attribute__((ms_abi)) lsw__exit(int code) {
+    _exit(code);
+}
+
+/* _XcptFilter — MSVCRT SEH filter; always continue searching */
+int __attribute__((ms_abi)) lsw__XcptFilter(unsigned long xcpt_code, void* xcpt_info) {
+    (void)xcpt_info;
+    (void)xcpt_code;
+    return 0;  /* EXCEPTION_CONTINUE_SEARCH */
+}
+
+/* __dllonexit — register atexit handler from within a DLL; stub */
+void* __attribute__((ms_abi)) lsw___dllonexit(void* func, void** begin, void** end) {
+    (void)func; (void)begin; (void)end;
+    return func;
+}
+
+/* _fileno — get POSIX fd from Windows FILE* (we use real POSIX FILEs) */
+int __attribute__((ms_abi)) lsw__fileno(void* stream) {
+    if (!stream) return -1;
+    /* Detect our fake CRT streams (from lsw__iob_func / __iob_func) */
+    for (int i = 0; i < 3; i++) {
+        if (stream == (void*)&lsw_fake_files[i])
+            return lsw_fake_files[i]._file;
+    }
+    /* Genuine POSIX FILE* */
+    return fileno((FILE*)stream);
+}
+
+/* _get_osfhandle — return a pseudo-HANDLE for a CRT file descriptor */
+intptr_t __attribute__((ms_abi)) lsw__get_osfhandle(int fd) {
+    /* Return the fd itself as a pseudo-handle — our CloseHandle understands raw fds */
+    if (fd < 0) return -1;
+    return (intptr_t)fd;
+}
+
+/* Wide-char string conversions — thin wrappers over POSIX */
+unsigned long __attribute__((ms_abi)) lsw_wcstoul(const wchar_t* nptr, wchar_t** endptr, int base) {
+    return u16_strtoul((const u16*)nptr, (u16**)endptr, base);
+}
+long __attribute__((ms_abi)) lsw_wcstol(const wchar_t* nptr, wchar_t** endptr, int base) {
+    return u16_strtol((const u16*)nptr, (u16**)endptr, base);
+}
+double __attribute__((ms_abi)) lsw_wcstod(const wchar_t* nptr, wchar_t** endptr) {
+    return u16_strtod((const u16*)nptr, (u16**)endptr);
+}
+/* wcstok (msvcrt.dll) — classic 2-argument version with internal static state */
+static u16* s_wcstok_state = NULL;
+wchar_t* __attribute__((ms_abi)) lsw_wcstok(wchar_t* str, const wchar_t* delimiters) {
+    u16* s = str ? (u16*)str : s_wcstok_state;
+    const u16* delim = (const u16*)delimiters;
+    if (!s || !delim) { s_wcstok_state = NULL; return NULL; }
+    while (*s && u16_chr(delim, *s)) s++;
+    if (!*s) { s_wcstok_state = NULL; return NULL; }
+    u16* tok = s;
+    while (*s && !u16_chr(delim, *s)) s++;
+    if (*s) *s++ = 0;
+    s_wcstok_state = s;
+    return (wchar_t*)tok;
+}
+/* wcstok_s (msvcrt.dll / ucrtbase.dll) — 3-argument safe version */
+wchar_t* __attribute__((ms_abi)) lsw_wcstok_s(wchar_t* str, const wchar_t* delimiters, wchar_t** context) {
+    return (wchar_t*)u16_tok((u16*)str, (const u16*)delimiters, (u16**)context);
+}
+
+/* ?terminate@@YAXXZ / ?terminate@@YAXXX — C++ terminate() */
+void __attribute__((ms_abi)) lsw_cxx_terminate(void) {
+    LSW_LOG_ERROR("C++ terminate() called — aborting");
+    abort();
+}
+
+/* ??1type_info@@ destructors — no-op stub */
+void __attribute__((ms_abi)) lsw_type_info_dtor(void* self) {
+    (void)self;
+}
+
+/* _purecall — called on pure virtual call; abort */
+void __attribute__((ms_abi)) lsw__purecall(void) {
+    LSW_LOG_ERROR("pure virtual function call — aborting");
+    abort();
+}
+
+/* __CxxFrameHandler — Windows SEH/C++ frame handler stub */
+int __attribute__((ms_abi)) lsw___CxxFrameHandler(void* pExcept, void* pRN, void* pContext, void* pDC) {
+    (void)pExcept; (void)pRN; (void)pContext; (void)pDC;
+    return 0;
+}
+
+/* Forward declarations: TLS exception state variables (defined later) */
+static __thread void* tls_cxx_exception_obj;
+static __thread void* tls_cxx_exception_type;
+
+/* ==========================================================================
+ * x64 MSVC C++ Exception Dispatch
+ *
+ * Implements a minimal but functional version of the Windows x64 C++ exception
+ * dispatch mechanism so that PE executables using C++ exceptions (throw/catch)
+ * work without the real Windows OS exception infrastructure.
+ *
+ * How it works:
+ *  1. _CxxThrowException captures the current frame pointer (RBP) and
+ *     reconstructs the PE caller's RSP / RIP from the GCC frame chain.
+ *  2. The .pdata section (RUNTIME_FUNCTION table) is walked via binary search
+ *     to find the UNWIND_INFO for each stack frame.
+ *  3. For frames with an exception handler (UNW_FLAG_EHANDLER), the FuncInfo3
+ *     structure (magic 0x19930520) is parsed to locate TryBlockMap entries
+ *     whose IP-to-State range covers the current RIP.
+ *  4. When a matching catch(...) (pType == 0) is found, the catch funclet is
+ *     called directly with the try-function's frame-entry RSP as its first
+ *     argument (RCX).  The funclet runs the catch body and returns the
+ *     continuation virtual address.
+ *  5. We jump to the continuation with RSP restored to the try-function's
+ *     "body" RSP (the RSP that was active at the call site in that frame).
+ * ========================================================================== */
+
+/* RUNTIME_FUNCTION — one entry per function in the .pdata section */
+typedef struct {
+    uint32_t BeginAddress;
+    uint32_t EndAddress;
+    uint32_t UnwindData;     /* RVA of UNWIND_INFO */
+} lsw_RUNTIME_FUNCTION;
+
+/* UNWIND_INFO header (4 bytes) */
+#define UNW_FLAG_EHANDLER  1u
+#define UNW_FLAG_UHANDLER  2u
+#define UNW_FLAG_CHAININFO 4u
+
+/* Unwind opcodes */
+#define UWOP_PUSH_NONVOL      0
+#define UWOP_ALLOC_LARGE      1
+#define UWOP_ALLOC_SMALL      2
+#define UWOP_SET_FPREG        3
+#define UWOP_SAVE_NONVOL      4
+#define UWOP_SAVE_NONVOL_FAR  5
+#define UWOP_SAVE_XMM128      8
+#define UWOP_SAVE_XMM128_FAR  9
+#define UWOP_PUSH_MACHFRAME   10
+
+/* FuncInfo3 (FuncInfo for __CxxFrameHandler3, magic 0x19930520 – 0x19930524) */
+typedef struct {
+    uint32_t magic;           /* 0x19930520 – 0x19930524 */
+    int32_t  maxState;
+    uint32_t pUnwindMap;      /* RVA */
+    uint32_t nTryBlocks;
+    uint32_t pTryBlockMap;    /* RVA */
+    uint32_t nIPMap;
+    uint32_t pIPMap;          /* RVA */
+} lsw_FuncInfo3;
+
+/* TryBlockMapEntry */
+typedef struct {
+    int32_t  tryLow;
+    int32_t  tryHigh;
+    int32_t  catchHigh;
+    int32_t  nCatches;
+    uint32_t pHandlerArray;   /* RVA */
+} lsw_TryBlockMapEntry;
+
+/* HandlerType (16 bytes; VS 2019 may append an extra 4-byte dispFrame) */
+typedef struct {
+    uint32_t adjectives;
+    uint32_t pType;           /* RVA; 0 == catch(...) */
+    int32_t  dispCatchObj;
+    uint32_t addressOfHandler; /* RVA */
+} lsw_HandlerType;
+
+/* IPToStateMapEntry */
+typedef struct {
+    int32_t Ip;    /* RVA from image base */
+    int32_t State;
+} lsw_IPStateEntry;
+
+/* ThrowInfo — the second arg to _CxxThrowException, embedded as a const in .rdata */
+typedef struct {
+    uint32_t attributes;
+    uint32_t pmfn;                  /* RVA: destructor for thrown obj, or 0 */
+    uint32_t fwd;                   /* RVA: forward compat fn, or 0 */
+    uint32_t pCatchableTypeArray;   /* RVA: CatchableTypeArray */
+} lsw_ThrowInfo;
+
+/* CatchableType — one entry per catchable base class of the thrown type */
+typedef struct {
+    uint32_t properties;
+    uint32_t pType;             /* RVA: TypeDescriptor (mangled name at +16) */
+    /* thisDisplacement (PMD, 12 bytes), sizeOrOffset (4), copyFunction (4) follow */
+    int32_t  mdisp;
+    int32_t  pdisp;
+    int32_t  vdisp;
+    int32_t  sizeOrOffset;
+    uint32_t copyFunction;      /* RVA: copy ctor, or 0 */
+} lsw_CatchableType;
+
+/* CatchableTypeArray */
+typedef struct {
+    int32_t  nCatchableTypes;
+    uint32_t arrayOfCatchableTypes[1]; /* RVAs to CatchableType */
+} lsw_CatchableTypeArray;
+
+/* Resolve a PE RVA to a mapped virtual address */
+static inline void* lsw_rva2va(uint32_t rva) {
+    return rva ? (void*)(g_lsw_image_base + rva) : NULL;
+}
+
+/* Binary-search .pdata for the RUNTIME_FUNCTION covering 'rip'. */
+static lsw_RUNTIME_FUNCTION* lsw_find_rf(uint64_t rip) {
+    if (!g_lsw_pdata_va || g_lsw_pdata_size < 12 || !g_lsw_image_base) return NULL;
+    if (rip < g_lsw_image_base) return NULL;
+    uint32_t rva = (uint32_t)(rip - g_lsw_image_base);
+    lsw_RUNTIME_FUNCTION* pdata = (lsw_RUNTIME_FUNCTION*)g_lsw_pdata_va;
+    int n = (int)(g_lsw_pdata_size / sizeof(lsw_RUNTIME_FUNCTION));
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if      (rva < pdata[mid].BeginAddress) hi = mid - 1;
+        else if (rva >= pdata[mid].EndAddress)  lo = mid + 1;
+        else return &pdata[mid];
+    }
+    return NULL;
+}
+
+/*
+ * Apply UNWIND_INFO codes to 'current_rsp' to reconstruct the caller's RSP
+ * and RIP.  Returns the "entry RSP" (RSP at function entry = points to the
+ * return address on the stack).
+ */
+static uint64_t lsw_unwind_frame(lsw_RUNTIME_FUNCTION* rf,
+                                  uint64_t current_rsp,
+                                  uint64_t* out_caller_rip,
+                                  uint64_t* out_caller_rsp)
+{
+    if (!rf) return 0;
+
+    /* Resolve UNWIND_INFO header */
+    uint8_t* ui = (uint8_t*)lsw_rva2va(rf->UnwindData);
+    if (!ui) return 0;
+
+    /* Handle CHAININFO: follow the chained RUNTIME_FUNCTION instead */
+    for (int chain_depth = 0; chain_depth < 8; chain_depth++) {
+        uint8_t flags      = (ui[0] >> 3) & 0x1fu;
+        uint8_t code_count = ui[2];
+        int     codes_sz   = (int)(((code_count + 1) & ~1) * 2);
+        uint8_t* codes     = ui + 4;
+
+        if (flags & UNW_FLAG_CHAININFO) {
+            /* Chained: skip unwind codes, follow chain RUNTIME_FUNCTION */
+            lsw_RUNTIME_FUNCTION* chain_rf =
+                (lsw_RUNTIME_FUNCTION*)(codes + codes_sz);
+            ui = (uint8_t*)lsw_rva2va(chain_rf->UnwindData);
+            if (!ui) return 0;
+            continue;
+        }
+
+        /* Process unwind codes to compute caller's RSP */
+        uint64_t rsp = current_rsp;
+        uint16_t* c  = (uint16_t*)codes;
+        for (int i = 0; i < code_count; ) {
+            uint8_t op   = (c[i] >> 8) & 0xFu;
+            uint8_t info = (c[i] >> 12) & 0xFu;
+            switch (op) {
+            case UWOP_PUSH_NONVOL:      rsp += 8;               i += 1; break;
+            case UWOP_ALLOC_SMALL:      rsp += 8u*(info+1u);    i += 1; break;
+            case UWOP_ALLOC_LARGE:
+                if (info == 0) {
+                    rsp += 8u * (uint64_t)c[i+1];               i += 2;
+                } else {
+                    uint32_t v; memcpy(&v, &c[i+1], 4);
+                    rsp += v;                                    i += 3;
+                }
+                break;
+            case UWOP_SET_FPREG:        i += 1; break;
+            case UWOP_SAVE_NONVOL:      i += 2; break;
+            case UWOP_SAVE_NONVOL_FAR:  i += 3; break;
+            case UWOP_SAVE_XMM128:      i += 2; break;
+            case UWOP_SAVE_XMM128_FAR:  i += 3; break;
+            case UWOP_PUSH_MACHFRAME:   i += 1; break;
+            default:                    i += 1; break;
+            }
+        }
+
+        /* After undoing the prolog, rsp points to the saved return address */
+        if (rsp < 0x1000 || rsp > (uint64_t)0x7fffffffffff00ULL) return 0;
+        uint64_t ret_addr = *(uint64_t*)rsp;
+        *out_caller_rip = ret_addr;
+        *out_caller_rsp = rsp + 8;
+        return rsp;   /* "entry RSP" = function-entry RSP, points to ret addr */
+    }
+    return 0;
+}
+
+/*
+ * Look up the "state" for a given RIP in a function's IPToStateMap.
+ * Returns -1 if not found or no map.
+ */
+static int32_t lsw_ip_to_state(lsw_FuncInfo3* fi, uint64_t rip) {
+    if (!fi->nIPMap || !fi->pIPMap) return -1;
+    lsw_IPStateEntry* map = (lsw_IPStateEntry*)lsw_rva2va(fi->pIPMap);
+    if (!map) return -1;
+    uint32_t rip_rva = (uint32_t)(rip - g_lsw_image_base);
+    int32_t state = -1;
+    for (uint32_t i = 0; i < fi->nIPMap; i++) {
+        if ((uint32_t)map[i].Ip <= rip_rva)
+            state = map[i].State;
+        else
+            break;
+    }
+    return state;
+}
+
+/*
+ * Check whether RUNTIME_FUNCTION rf (for a frame at 'rip' with entry RSP
+ * 'entry_rsp') has a matching catch handler.  If found, fills *handler_va
+ * and *disp_catch_obj and returns true.
+ *
+ * We walk the try-block map and match each handler against the thrown type:
+ *   - pType == 0 → catch(...)  matches anything
+ *   - pType != 0 → compare against every entry in throwInfo's CatchableTypeArray
+ * The adjectives field drives how the exception object is placed:
+ *   bit 0x8 (reference) → handler slot gets pointer-to-object
+ *   bit 0x1 (const)     → same (no copy needed for ref)
+ *   neither             → value copy via copyFunction (not yet implemented)
+ */
+static bool lsw_find_catch_in_frame(lsw_RUNTIME_FUNCTION* rf,
+                                     uint64_t rip,
+                                     uint64_t entry_rsp,
+                                     lsw_ThrowInfo* throw_info,
+                                     uint64_t* handler_va,
+                                     int32_t*  disp_catch_obj,
+                                     uint32_t* out_adjectives)
+{
+    /* Load UNWIND_INFO to find the handler function and FuncInfo RVA */
+    uint8_t* ui = (uint8_t*)lsw_rva2va(rf->UnwindData);
+    if (!ui) return false;
+
+    /* Chase chains to find the real UNWIND_INFO with EHANDLER */
+    for (int depth = 0; depth < 8; depth++) {
+        uint8_t flags      = (ui[0] >> 3) & 0x1fu;
+        uint8_t code_count = ui[2];
+        int     codes_sz   = (int)(((code_count + 1) & ~1) * 2);
+
+        if (flags & UNW_FLAG_CHAININFO) {
+            lsw_RUNTIME_FUNCTION* chain =
+                (lsw_RUNTIME_FUNCTION*)(ui + 4 + codes_sz);
+            ui = (uint8_t*)lsw_rva2va(chain->UnwindData);
+            if (!ui) return false;
+            continue;
+        }
+        if (!(flags & UNW_FLAG_EHANDLER))
+            return false;
+
+        /* handler RVA and FuncInfo RVA follow the unwind codes */
+        uint32_t* after = (uint32_t*)(ui + 4 + codes_sz);
+
+        if ((uint32_t*)after + 2 > (uint32_t*)((uint8_t*)g_lsw_pdata_va + g_lsw_pdata_size + 0x10000))
+            return false;  /* rough bounds check */
+
+        uint32_t funcinfo_rva = after[1];
+        lsw_FuncInfo3* fi = (lsw_FuncInfo3*)lsw_rva2va(funcinfo_rva);
+        if (!fi) return false;
+
+        if (fi->magic < 0x19930520u || fi->magic > 0x19930524u)
+            return false;
+        if (!fi->nTryBlocks || !fi->pTryBlockMap)
+            return false;
+
+        int32_t cur_state = lsw_ip_to_state(fi, rip);
+
+        lsw_TryBlockMapEntry* tbm =
+            (lsw_TryBlockMapEntry*)lsw_rva2va(fi->pTryBlockMap);
+        if (!tbm) return false;
+
+        for (uint32_t t = 0; t < fi->nTryBlocks; t++) {
+            lsw_TryBlockMapEntry* tb = &tbm[t];
+            /* Check if current state is within this try block */
+            if (cur_state >= 0 &&
+                (cur_state < tb->tryLow || cur_state > tb->tryHigh))
+                continue;
+
+            if (!tb->nCatches || !tb->pHandlerArray) continue;
+            lsw_HandlerType* ha =
+                (lsw_HandlerType*)lsw_rva2va(tb->pHandlerArray);
+            if (!ha) continue;
+
+            /* Build a quick list of catchable pType RVAs from the ThrowInfo
+             * so we can match typed handlers as well as catch(...). */
+            uint32_t catchable_ptype[16];
+            int n_catchable = 0;
+            if (throw_info && throw_info->pCatchableTypeArray) {
+                lsw_CatchableTypeArray* cta =
+                    (lsw_CatchableTypeArray*)lsw_rva2va(throw_info->pCatchableTypeArray);
+                if (cta && cta->nCatchableTypes > 0 && cta->nCatchableTypes <= 64) {
+                    for (int ci = 0; ci < cta->nCatchableTypes && n_catchable < 16; ci++) {
+                        uint32_t ct_rva = cta->arrayOfCatchableTypes[ci];
+                        lsw_CatchableType* ct = (lsw_CatchableType*)lsw_rva2va(ct_rva);
+                        if (ct) catchable_ptype[n_catchable++] = ct->pType;
+                    }
+                }
+            }
+
+            /* Try 20-byte then 16-byte HandlerType strides.
+             * VS2019+ uses 20 bytes (adds dispFrame field); older uses 16. */
+            for (int stride = 20; stride >= 16; stride -= 4) {
+                bool found = false;
+                for (int32_t k = 0; k < tb->nCatches; k++) {
+                    lsw_HandlerType* h =
+                        (lsw_HandlerType*)((uint8_t*)ha + k * stride);
+                    if (!h->addressOfHandler) continue;
+
+                    bool matches = false;
+                    if (h->pType == 0) {
+                        /* catch(...) — matches anything */
+                        matches = true;
+                    } else {
+                        /* Typed catch — match against thrown type hierarchy */
+                        for (int ci = 0; ci < n_catchable; ci++) {
+                            if (catchable_ptype[ci] == h->pType) {
+                                matches = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (matches) {
+                        *handler_va     = g_lsw_image_base + h->addressOfHandler;
+                        *disp_catch_obj = h->dispCatchObj;
+                        *out_adjectives = h->adjectives;
+                        LSW_LOG_DEBUG("[exception] catch %s in func 0x%x "
+                                     "handler=0x%lx disp=%d state=%d [%d,%d]",
+                                     h->pType ? "typed" : "(...)",
+                                     rf->BeginAddress,
+                                     (unsigned long)*handler_va,
+                                     *disp_catch_obj,
+                                     cur_state, tb->tryLow, tb->tryHigh);
+                        found = true;
+                        return true;
+                    }
+                }
+                /* If adj values look reasonable for this stride, stop here.
+                 * Adjectives should be small flags (0-15); large values indicate wrong stride. */
+                if (!found && stride == 20 && tb->nCatches > 0) {
+                    lsw_HandlerType* h0 = ha;
+                    if (h0->adjectives <= 0xF) break; /* 20-byte stride fits; no match */
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
+/* _CxxThrowException — throw a C++ exception via x64 exception dispatch */
+void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) {
+    /* Store exception info for any outer handler that needs it */
+    tls_cxx_exception_obj  = obj;
+    tls_cxx_exception_type = throwInfo;
+
+    /* ------------------------------------------------------------------ *
+     * Reconstruct the PE caller's frame from GCC's RBP chain.             *
+     *                                                                      *
+     * Stack layout when we enter this ms_abi function (GCC prolog):       *
+     *   [PE caller did: sub rsp,0x20 ; call _CxxThrowException]           *
+     *   GCC prolog: push rbp ; mov rbp,rsp ; [optional push rbx ...] ;   *
+     *               sub rsp,N                                              *
+     *                                                                      *
+     * So:  my_rbp == RBP after GCC prolog                                 *
+     *      [my_rbp]   == saved old RBP                                    *
+     *      [my_rbp+8] == return address in PE caller (ret_to_B)           *
+     *      PE_caller_body_rsp == my_rbp + 0x30                            *
+     *         (my_rbp + 8 = RSP_at_C_entry;                               *
+     *          RSP_at_C_entry + 0x28 = PE caller's body RSP before shadow)*
+     * ------------------------------------------------------------------ */
+    uint64_t my_rbp;
+    __asm__ volatile ("mov %%rbp, %0" : "=r"(my_rbp));
+
+    uint64_t ret_to_b  = *(uint64_t*)(my_rbp + 8);
+    /* MSVC x64 pre-allocates shadow space in the function prolog — no separate
+     * "sub rsp,0x20" before the call to us.  So PE caller's body RSP is simply
+     * (entry_RSP_of_us + 8), where entry_RSP_of_us = my_rbp + 8. */
+    uint64_t body_rsp  = my_rbp + 0x10;  /* = entry_RSP_of_us + 0x08 */
+    uint64_t rip       = ret_to_b - 1;   /* point inside the call instruction */
+
+    LSW_LOG_INFO("[exception] _CxxThrowException obj=%p throw_info=%p",
+                 obj, throwInfo);
+    LSW_LOG_INFO("[exception] caller ret_addr=0x%lx body_rsp=0x%lx",
+                 (unsigned long)ret_to_b, (unsigned long)body_rsp);
+
+    /* Verify we have PE image info before trying to dispatch */
+    if (!g_lsw_pdata_va || !g_lsw_image_base) {
+        LSW_LOG_ERROR("[exception] No PE image info — cannot dispatch C++ exception");
+        abort();
+    }
+
+    /* Walk the PE call stack looking for a matching catch handler */
+    for (int depth = 0; depth < 128; depth++) {
+        if (rip < g_lsw_image_base ||
+            rip >= g_lsw_image_base + 0x10000000ULL) {
+            LSW_LOG_WARN("[exception] RIP 0x%lx outside PE image, stopping walk",
+                         (unsigned long)rip);
+            break;
+        }
+
+        lsw_RUNTIME_FUNCTION* rf = lsw_find_rf(rip);
+        if (!rf) {
+            LSW_LOG_WARN("[exception] No RUNTIME_FUNCTION for RIP 0x%lx depth=%d",
+                         (unsigned long)rip, depth);
+            break;
+        }
+
+        LSW_LOG_INFO("[exception] depth=%d rip=0x%lx func=[0x%x,0x%x)",
+                     depth, (unsigned long)rip, rf->BeginAddress, rf->EndAddress);
+
+        /* Unwind this frame to get entry RSP */
+        uint64_t caller_rip, caller_rsp;
+        uint64_t entry_rsp = lsw_unwind_frame(rf, body_rsp,
+                                               &caller_rip, &caller_rsp);
+        if (!entry_rsp) {
+            LSW_LOG_WARN("[exception] unwind_frame failed at depth=%d", depth);
+            break;
+        }
+
+        /* Check if this frame has a matching catch */
+        uint64_t catch_handler_va = 0;
+        int32_t  disp_catch_obj   = 0;
+        uint32_t catch_adjectives = 0;
+        if (lsw_find_catch_in_frame(rf, rip, entry_rsp,
+                                    (lsw_ThrowInfo*)throwInfo,
+                                    &catch_handler_va, &disp_catch_obj,
+                                    &catch_adjectives)) {
+            /* ----------------------------------------------------------
+             * Found a matching catch handler.  Execute its funclet.
+             *
+             * The catch funclet is called with RCX = the try function's
+             * "frame base" (entry_rsp).  It runs the catch body and
+             * returns the continuation virtual address in RAX.
+             * ---------------------------------------------------------- */
+            LSW_LOG_INFO("[exception] Dispatching to catch handler 0x%lx "
+                         "entry_rsp=0x%lx disp=%d adj=0x%x",
+                         (unsigned long)catch_handler_va,
+                         (unsigned long)entry_rsp, disp_catch_obj,
+                         catch_adjectives);
+
+            /* Place the exception object in the catch frame if disp != 0.
+             * For reference catches (adj & 0x8): slot = pointer-to-object.
+             * For value catches: slot = the object itself (copy needed,
+             *   but for now store pointer — good enough for most cases). */
+            if (disp_catch_obj != 0) {
+                void** slot = (void**)(entry_rsp + (int64_t)disp_catch_obj);
+                if (catch_adjectives & 0x8) {
+                    /* reference catch: slot holds pointer to exception object */
+                    *slot = obj;
+                } else {
+                    /* value catch: ideally copy via copyFunction; store ptr for now */
+                    *slot = obj;
+                }
+            }
+
+            /* Call the catch funclet.
+             *
+             * MSVC x64 catch funclets use RDX (2nd arg) as the frame base,
+             * not RCX (1st arg).  The funclet does `mov rbp,rdx` in its
+             * prolog.  RCX is overwritten by the funclet itself (it loads
+             * a constant into RCX immediately after).
+             *
+             * Convention: funclet(rcx_ignored, frame_base) → continuation
+             */
+            typedef void* (__attribute__((ms_abi)) *funclet_t)(uint64_t, uint64_t);
+            funclet_t funclet = (funclet_t)catch_handler_va;
+            void* continuation = funclet(0, entry_rsp);  /* RCX=0, RDX=entry_rsp */
+
+            LSW_LOG_INFO("[exception] catch funclet returned continuation=%p",
+                         continuation);
+
+            if (continuation) {
+                uint64_t cont_va = (uint64_t)continuation;
+                /* Jump to the continuation inside the try function with
+                 * RSP restored to the body RSP of that frame.             */
+                LSW_LOG_INFO("[exception] jumping to continuation 0x%lx "
+                             "with rsp=0x%lx",
+                             (unsigned long)cont_va, (unsigned long)body_rsp);
+                __asm__ volatile (
+                    "mov %0, %%rsp\n\t"
+                    "jmp *%1\n\t"
+                    : : "r"(body_rsp), "r"(cont_va) : "memory"
+                );
+                __builtin_unreachable();
+            }
+
+            /* Funclet returned NULL — treat as successful catch, continue
+             * execution normally (PE code will handle the rest) */
+            LSW_LOG_INFO("[exception] catch handler completed (no continuation)");
+            return;
+        }
+
+        /* No catch in this frame — unwind to parent */
+        rip      = caller_rip - 1;   /* point inside the call instruction */
+        body_rsp = caller_rsp;       /* MSVC pre-allocates shadow in prolog; no extra offset */
+    }
+
+    LSW_LOG_ERROR("[exception] No catch handler found after walking %d frames",
+                  128);
+    LSW_LOG_ERROR("[exception] C++ exception unhandled — aborting");
+    abort();
+}
+
+
+/* _isatty — check if fd refers to a terminal */
+int __attribute__((ms_abi)) lsw__isatty(int fd) {
+    return isatty(fd);
+}
+
+/* _controlfp — FPU control word; stub returning default 0x9001f */
+unsigned int __attribute__((ms_abi)) lsw__controlfp(unsigned int newval, unsigned int mask) {
+    (void)newval; (void)mask;
+    return 0x9001f;
+}
+
+/* __p__fmode — pointer to _fmode variable */
+int* __attribute__((ms_abi)) lsw___p__fmode(void) { return &lsw_crt_fmode; }
+
+/* __p__commode — pointer to _commode variable */
+int* __attribute__((ms_abi)) lsw___p__commode(void) { return &lsw_crt_commode; }
+
+/* _adjust_fdiv — legacy FP rounding; no-op */
+void __attribute__((ms_abi)) lsw__adjust_fdiv(void) {}
+
+/* __p___initenv — pointer to the initial environment */
+char*** __attribute__((ms_abi)) lsw___p___initenv(void) {
+    static char* dummy_env[] = { NULL };
+    static char** env_ptr = dummy_env;
+    return &env_ptr;
+}
+
+/* fputs — write string to FILE* */
+int __attribute__((ms_abi)) lsw_fputs(const char* str, void* stream) {
+    if (!str) return -1;
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag; int _file; } fake_FILE;
+    fake_FILE* fake = (fake_FILE*)stream;
+    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+        size_t len = strlen(str);
+        ssize_t written = write(fake->_file, str, len);
+        return written >= 0 ? (int)written : EOF;
+    }
+    if (!stream) return write(1, str, strlen(str)) >= 0 ? 0 : EOF;
+    return fputs(str, (FILE*)stream);
+}
+
+/* _iob — pointer to FILE array (alias for __iob_func result) */
+void* __attribute__((ms_abi)) lsw__iob(void) {
+    return lsw__iob_func();
+}
+
+int* __attribute__((ms_abi)) lsw__commode_ptr(void) {
+    return &lsw_crt_commode;
 }
 
 int* __attribute__((ms_abi)) lsw__errno_func(void) {
@@ -765,6 +1907,13 @@ uint32_t __attribute__((ms_abi)) lsw_GetLastError(void) {
 void __attribute__((ms_abi)) lsw_SetUnhandledExceptionFilter(void* handler) {
     (void)handler;
     // Stub - do nothing for now
+}
+
+/* UnhandledExceptionFilter — called when no handler catches an exception; return EXCEPTION_EXECUTE_HANDLER (1) */
+int __attribute__((ms_abi)) lsw_UnhandledExceptionFilter(void* pExceptionInfo) {
+    (void)pExceptionInfo;
+    LSW_LOG_ERROR("UnhandledExceptionFilter called — terminating");
+    return 1; /* EXCEPTION_EXECUTE_HANDLER */
 }
 
 void __attribute__((ms_abi)) lsw_InitializeCriticalSection(void* cs) {
@@ -1023,8 +2172,8 @@ void* __attribute__((ms_abi)) lsw_GetModuleHandleA(const char* module_name) {
         LSW_LOG_INFO("GetModuleHandleA: NULL -> 0x140000000 (base)");
         return (void*)0x140000000;
     }
-    LSW_LOG_INFO("GetModuleHandleA: %s -> 0x7FF000000", module_name);
-    return (void*)0x7FF000000; // Fake DLL base
+    LSW_LOG_INFO("GetModuleHandleA: %s -> system hmodule", module_name);
+    return (void*)0xDEADBEEF; /* LSW_SYSTEM_HMODULE — route GetProcAddress through our stubs */
 }
 
 // KERNEL32 Console I/O Functions
@@ -1705,23 +2854,14 @@ DWORD __attribute__((ms_abi)) lsw_GetWindowsDirectoryA(char* buffer, DWORD size)
 }
 
 // KERNEL32.dll!GetWindowsDirectoryW - Get Windows directory path (wide-char)
-DWORD __attribute__((ms_abi)) lsw_GetWindowsDirectoryW(wchar_t* buffer, DWORD size) {
-    LSW_LOG_INFO("GetWindowsDirectoryW called: buffer=%p, size=%u", buffer, size);
-    
-    const wchar_t* win_dir = L"C:\\Windows";
-    size_t len = wcslen(win_dir);
-    
-    if (!buffer || size == 0) {
-        return (DWORD)(len + 1);
-    }
-    
-    if (size <= len) {
-        return (DWORD)(len + 1);
-    }
-    
-    wcscpy(buffer, win_dir);
-    LSW_LOG_INFO("GetWindowsDirectoryW: returning wide-char path");
-    return (DWORD)len;
+DWORD __attribute__((ms_abi)) lsw_GetWindowsDirectoryW(uint16_t* buffer, DWORD size) {
+    /* "C:\Windows" as UTF-16LE (2-byte chars, not 4-byte wchar_t) */
+    static const uint16_t win_dir[] = {'C',':','\\','W','i','n','d','o','w','s',0};
+    DWORD len = 10; /* strlen("C:\\Windows") */
+    if (!buffer || size == 0) return len + 1;
+    if (size <= len) return len + 1;
+    for (DWORD i = 0; i <= len; i++) buffer[i] = win_dir[i];
+    return len;
 }
 
 // KERNEL32.dll!GetSystemDirectoryA - Get System32 directory path
@@ -1745,23 +2885,14 @@ DWORD __attribute__((ms_abi)) lsw_GetSystemDirectoryA(char* buffer, DWORD size) 
 }
 
 // KERNEL32.dll!GetSystemDirectoryW - Get System32 directory path (wide-char)
-DWORD __attribute__((ms_abi)) lsw_GetSystemDirectoryW(wchar_t* buffer, DWORD size) {
-    LSW_LOG_INFO("GetSystemDirectoryW called: buffer=%p, size=%u", buffer, size);
-    
-    const wchar_t* sys_dir = L"C:\\Windows\\System32";
-    size_t len = wcslen(sys_dir);
-    
-    if (!buffer || size == 0) {
-        return (DWORD)(len + 1);
-    }
-    
-    if (size <= len) {
-        return (DWORD)(len + 1);
-    }
-    
-    wcscpy(buffer, sys_dir);
-    LSW_LOG_INFO("GetSystemDirectoryW: returning wide-char path");
-    return (DWORD)len;
+DWORD __attribute__((ms_abi)) lsw_GetSystemDirectoryW(uint16_t* buffer, DWORD size) {
+    /* "C:\Windows\System32" as UTF-16LE (2-byte chars) */
+    static const uint16_t sys_dir[] = {'C',':','\\','W','i','n','d','o','w','s','\\','S','y','s','t','e','m','3','2',0};
+    DWORD len = 19; /* strlen("C:\\Windows\\System32") */
+    if (!buffer || size == 0) return len + 1;
+    if (size <= len) return len + 1;
+    for (DWORD i = 0; i <= len; i++) buffer[i] = sys_dir[i];
+    return len;
 }
 
 // KERNEL32.dll!GetTempPathA - Get temporary directory path
@@ -2398,11 +3529,8 @@ void* __attribute__((ms_abi)) lsw_HeapReAlloc(void* heap, uint32_t flags, void* 
 size_t __attribute__((ms_abi)) lsw_HeapSize(void* heap, uint32_t flags, void* mem) {
     (void)heap;
     (void)flags;
-    (void)mem;
-    
-    LSW_LOG_WARN("HeapSize called: not fully implemented, returning 0");
-    // TODO: Track allocation sizes
-    return 0;
+    if (!mem) return (size_t)-1;  /* Windows returns (SIZE_T)-1 for invalid pointer */
+    return malloc_usable_size(mem);
 }
 
 // KERNEL32.dll!LocalAlloc - Allocate local memory
@@ -2581,7 +3709,34 @@ void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
 
 uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t milliseconds)
 {
-    if (!handle) return 0xFFFFFFFF; /* WAIT_FAILED */
+    if (!handle || handle == INVALID_HANDLE_VALUE) return 0xFFFFFFFF; /* WAIT_FAILED */
+
+    /* ---- Raw process handle (small-integer PID from CreateProcess) ---- */
+    if (!IS_TYPED_HANDLE(handle)) {
+        pid_t pid = (pid_t)(uintptr_t)handle;
+        if (pid > 1) {
+            int wstatus = 0;
+            if (milliseconds == 0xFFFFFFFF) {
+                pid_t r = waitpid(pid, &wstatus, 0);
+                if (r == pid) return 0; /* WAIT_OBJECT_0 */
+            } else if (milliseconds == 0) {
+                pid_t r = waitpid(pid, &wstatus, WNOHANG);
+                if (r == pid) return 0;
+                return 0x00000102; /* WAIT_TIMEOUT */
+            } else {
+                uint32_t waited = 0, step = 5;
+                while (waited < milliseconds) {
+                    pid_t r = waitpid(pid, &wstatus, WNOHANG);
+                    if (r == pid) return 0;
+                    usleep(step * 1000);
+                    waited += step;
+                    if (step < 100) step *= 2;
+                }
+                return 0x00000102;
+            }
+        }
+        return 0xFFFFFFFF; /* WAIT_FAILED for other small integers */
+    }
 
     /* ---- Typed handle dispatch ---- */
     uint32_t magic = *(const uint32_t*)handle;
@@ -2667,30 +3822,6 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
         return (r == 0) ? 0x00000102 : 0xFFFFFFFF;
     }
 
-    /* ---- Process handle (PID) ---- */
-    pid_t pid = (pid_t)(uintptr_t)handle;
-    if (pid > 1 && pid < 65536) {
-        int wstatus = 0;
-        if (milliseconds == 0xFFFFFFFF) {
-            pid_t r = waitpid(pid, &wstatus, 0);
-            if (r == pid) return 0;
-        } else if (milliseconds == 0) {
-            pid_t r = waitpid(pid, &wstatus, WNOHANG);
-            if (r == pid) return 0;
-            return 0x00000102;
-        } else {
-            uint32_t waited = 0, step = 5;
-            while (waited < milliseconds) {
-                pid_t r = waitpid(pid, &wstatus, WNOHANG);
-                if (r == pid) return 0;
-                usleep(step * 1000);
-                waited += step;
-                if (step < 100) step *= 2;
-            }
-            return 0x00000102;
-        }
-    }
-
     /* ---- Kernel path ---- */
     if (g_kernel_fd >= 0) {
         struct lsw_syscall_request req;
@@ -2716,6 +3847,152 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
  * the DLL chain loader.  Allows GetProcAddress to look up exported symbols.
  */
 /* LSW_PE_HMODULE_MAGIC and lsw_pe_hmodule_t defined at top of file */
+
+/*
+ * Translate a PE RVA to a pointer in our raw-file copy.
+ * Since we mmap the raw file bytes (not mapped sections), each section's data
+ * lives at image + PointerToRawData, NOT at image + VirtualAddress.
+ */
+static const uint8_t* pe_raw_rva_to_ptr(const uint8_t* image, size_t image_size, uint32_t rva)
+{
+    if (!image || rva == 0) return NULL;
+    uint32_t pe_off = *(const uint32_t*)(image + 0x3C);
+    if (pe_off + 24 + 4 > (uint32_t)image_size) return NULL;
+    uint16_t num_sec    = *(const uint16_t*)(image + pe_off + 4 + 2);
+    uint16_t opt_size   = *(const uint16_t*)(image + pe_off + 4 + 16);
+    uint32_t sec_base   = pe_off + 4 + 20 + opt_size;
+    for (uint16_t s = 0; s < num_sec; s++) {
+        const uint8_t* sh   = image + sec_base + (uint32_t)s * 40;
+        uint32_t virt_addr  = *(const uint32_t*)(sh + 12);
+        uint32_t virt_size  = *(const uint32_t*)(sh + 16);
+        uint32_t raw_off    = *(const uint32_t*)(sh + 20);
+        uint32_t raw_size   = *(const uint32_t*)(sh + 24);
+        uint32_t effective  = virt_size ? virt_size : raw_size;
+        if (rva >= virt_addr && rva < virt_addr + effective) {
+            uint32_t off = raw_off + (rva - virt_addr);
+            if (off < (uint32_t)image_size) return image + off;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Check whether a PE image has an RT_MESSAGETABLE (type id=11) resource entry.
+ */
+static int pe_has_message_table(const uint8_t* image, size_t image_size)
+{
+    if (!image || image_size < 0x40) return 0;
+    uint32_t pe_off = *(const uint32_t*)(image + 0x3C);
+    if (pe_off + 28 > (uint32_t)image_size) return 0;
+    uint16_t opt_magic = *(const uint16_t*)(image + pe_off + 24);
+    uint32_t dd2_off = pe_off + 24 + ((opt_magic == 0x20b) ? 128u : 112u);
+    if (dd2_off + 4 > (uint32_t)image_size) return 0;
+    uint32_t rsrc_rva = *(const uint32_t*)(image + dd2_off);
+    if (!rsrc_rva) return 0;
+    const uint8_t* rsrc = pe_raw_rva_to_ptr(image, image_size, rsrc_rva);
+    if (!rsrc) return 0;
+    uint16_t n_named = *(const uint16_t*)(rsrc + 12);
+    uint16_t n_id    = *(const uint16_t*)(rsrc + 14);
+    for (int i = 0; i < n_named + n_id; i++) {
+        uint32_t name_id = *(const uint32_t*)(rsrc + 16 + (uint32_t)i * 8);
+        if (!(name_id & 0x80000000u) && (name_id & 0x7FFFFFFFu) == 11u) return 1;
+    }
+    return 0;
+}
+
+/*
+ * Find a message by ID in a PE message-table resource.
+ * Returns 1 (Unicode) or 2 (ANSI) on success; sets *out_str and *out_len.
+ * For Unicode: *out_str points to UTF-16LE chars (not null included in len).
+ * For ANSI:    *out_str points to char bytes  (cast caller side).
+ */
+static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg_id,
+                            const uint16_t** out_str, uint32_t* out_len)
+{
+    if (!image || !out_str || !out_len) return 0;
+
+    uint32_t pe_off = *(const uint32_t*)(image + 0x3C);
+    if (pe_off + 24 + 4 > (uint32_t)image_size) return 0;
+
+    /* DataDirectory[2] (resource) */
+    uint16_t opt_magic = *(const uint16_t*)(image + pe_off + 24);
+    uint32_t dd2_off = pe_off + 24 + ((opt_magic == 0x20b) ? 128u : 112u);
+    uint32_t rsrc_rva = *(const uint32_t*)(image + dd2_off);
+    if (!rsrc_rva) return 0;
+
+    const uint8_t* rsrc = pe_raw_rva_to_ptr(image, image_size, rsrc_rva);
+    if (!rsrc) return 0;
+
+    /* Level 1: find RT_MESSAGETABLE (id = 11) */
+    uint16_t n_named = *(const uint16_t*)(rsrc + 12);
+    uint16_t n_id    = *(const uint16_t*)(rsrc + 14);
+    const uint8_t* type_dir = NULL;
+    for (int i = 0; i < n_named + n_id; i++) {
+        uint32_t name_id = *(const uint32_t*)(rsrc + 16 + (uint32_t)i * 8);
+        uint32_t sub_off = *(const uint32_t*)(rsrc + 16 + (uint32_t)i * 8 + 4);
+        if (!(name_id & 0x80000000u) && (name_id & 0x7FFFFFFFu) == 11u) {
+            if (sub_off & 0x80000000u) type_dir = rsrc + (sub_off & 0x7FFFFFFFu);
+            break;
+        }
+    }
+    if (!type_dir) return 0;
+
+    /* Level 2: first name entry (id 1) */
+    uint16_t n2 = *(const uint16_t*)(type_dir + 12) + *(const uint16_t*)(type_dir + 14);
+    if (n2 == 0) return 0;
+    uint32_t sub2 = *(const uint32_t*)(type_dir + 16 + 4);
+    const uint8_t* name_dir = (sub2 & 0x80000000u) ? rsrc + (sub2 & 0x7FFFFFFFu) : NULL;
+    if (!name_dir) return 0;
+
+    /* Level 3: first language entry → data entry */
+    uint16_t n3 = *(const uint16_t*)(name_dir + 14);
+    if (n3 == 0) return 0;
+    uint32_t data_off = *(const uint32_t*)(name_dir + 16 + 4); /* should NOT have high bit set */
+    const uint8_t* de  = rsrc + data_off; /* IMAGE_RESOURCE_DATA_ENTRY */
+    uint32_t data_rva  = *(const uint32_t*)(de);
+
+    const uint8_t* msg_data = pe_raw_rva_to_ptr(image, image_size, data_rva);
+    if (!msg_data) return 0;
+
+    /* Walk MESSAGE_RESOURCE_DATA */
+    uint32_t num_blocks = *(const uint32_t*)(msg_data);
+    for (uint32_t b = 0; b < num_blocks; b++) {
+        uint32_t lo  = *(const uint32_t*)(msg_data + 4 + b * 12);
+        uint32_t hi  = *(const uint32_t*)(msg_data + 4 + b * 12 + 4);
+        uint32_t off = *(const uint32_t*)(msg_data + 4 + b * 12 + 8);
+        if (msg_id < lo || msg_id > hi) continue;
+
+        const uint8_t* entry = msg_data + off;
+        for (uint32_t id = lo; id < msg_id; id++) {
+            uint16_t entry_len = *(const uint16_t*)(entry);
+            if (entry_len < 4) return 0; /* corrupt */
+            entry += entry_len;
+        }
+        uint16_t entry_len   = *(const uint16_t*)(entry);
+        uint16_t entry_flags = *(const uint16_t*)(entry + 2);
+        const uint8_t* text  = entry + 4;
+        uint32_t text_bytes  = entry_len > 4 ? (uint32_t)(entry_len - 4) : 0;
+
+        if (entry_flags & 1) { /* Unicode */
+            const uint16_t* wstr = (const uint16_t*)text;
+            uint32_t wlen = text_bytes / 2;
+            /* trim trailing null/newline characters */
+            while (wlen > 0 && (wstr[wlen-1] == 0 || wstr[wlen-1] == '\r' || wstr[wlen-1] == '\n'))
+                wlen--;
+            *out_str = wstr;
+            *out_len = wlen;
+            return 1;
+        } else { /* ANSI */
+            uint32_t alen = text_bytes;
+            while (alen > 0 && (text[alen-1] == 0 || text[alen-1] == '\r' || text[alen-1] == '\n'))
+                alen--;
+            *out_str = (const uint16_t*)text;
+            *out_len = alen;
+            return 2;
+        }
+    }
+    return 0;
+}
 
 static lsw_pe_hmodule_t  g_pe_modules[64];
 static int               g_pe_module_count = 0;
@@ -2779,18 +4056,28 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
     if (!base) base = strrchr(filename, '/');
     base = base ? base + 1 : filename;
 
+    /* If name has no .dll extension, append it (e.g. "NETMSG" → "NETMSG.dll") */
+    char base_buf[256];
+    const char* ext = strrchr(base, '.');
+    if (!ext || strcasecmp(ext, ".dll") != 0) {
+        snprintf(base_buf, sizeof(base_buf), "%s.dll", base);
+        base = base_buf;
+        ext  = ".dll";
+    }
+
     /* System DLLs provided by LSW itself */
     if (is_system_dll(base)) {
         LSW_LOG_INFO("LoadLibraryA: system DLL %s -> fake handle", base);
         return LSW_SYSTEM_HMODULE;
     }
     
-    /* If it's a .dll file, try to load it as a PE via the DLL chain loader */
-    const char* ext = strrchr(base, '.');
+    /* It's now always a .dll name (extension was added above if missing) */
     if (ext && strcasecmp(ext, ".dll") == 0) {
         /* Search for the file on disk using the chain loader search paths */
         static const char* search_dirs[] = {
             NULL, /* filled from LSW_SYSTEM32 */
+            "/mnt/c/Windows/System32",   /* WSL path to Windows system32 */
+            "/mnt/c/windows/system32",
             "~/.lsw/system32",
             "~/.wine/drive_c/windows/system32",
             "/opt/lsw/system32",
@@ -2798,7 +4085,7 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
             NULL
         };
         const char* env_s32 = getenv("LSW_SYSTEM32");
-        search_dirs[0] = env_s32; /* may be NULL — skip */
+        search_dirs[0] = env_s32; /* may be NULL — loop skips NULLs */
 
         char found[512] = {0};
         /* First check if it's an absolute/relative path that exists directly */
@@ -2812,7 +4099,8 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
             strncpy(lower_base, base, sizeof(lower_base)-1); lower_base[sizeof(lower_base)-1]='\0';
             for (char* p = lower_base; *p; p++) *p = (char)tolower((unsigned char)*p);
 
-            for (int di = 0; search_dirs[di] && !found[0]; di++) {
+            int ndirs = (int)(sizeof(search_dirs)/sizeof(search_dirs[0]));
+            for (int di = 0; di < ndirs && !found[0]; di++) {
                 const char* dir = search_dirs[di];
                 if (!dir) continue;
                 /* Expand ~ */
@@ -2868,8 +4156,57 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
                                     mod->image_size = (size_t)st.st_size;
                                     mod->export_dir = export_rva ? (b + export_rva) : NULL;
                                     mod->export_dir_size = export_sz;
-                                    LSW_LOG_INFO("LoadLibraryA: PE DLL loaded -> slot %d, base %p", slot, image);
-                                    return (void*)mod;
+                                   /* Locate .rsrc section for FormatMessageW FROM_HMODULE */
+                                   mod->rsrc_raw = NULL; mod->rsrc_rva = 0;
+                                   uint16_t opt_size2  = *(uint16_t*)(b + pe_off2 + 4 + 16);
+                                   uint16_t num_sec2   = *(uint16_t*)(b + pe_off2 + 4 + 2);
+                                   uint32_t sec_off2   = pe_off2 + 4 + 20 + opt_size2;
+                                   for (uint16_t si = 0; si < num_sec2; si++) {
+                                       uint8_t* sh = b + sec_off2 + (uint32_t)si * 40;
+                                       if (memcmp(sh, ".rsrc\0\0\0", 8) == 0) {
+                                           mod->rsrc_rva = *(uint32_t*)(sh + 12);
+                                           mod->rsrc_raw = b + *(uint32_t*)(sh + 20);
+                                           break;
+                                       }
+                                   }
+                                   LSW_LOG_INFO("LoadLibraryA: PE DLL loaded -> slot %d, base %p, rsrc=%p",
+                                                slot, image, mod->rsrc_raw);
+                                   /* MUI satellite: if no RT_MESSAGETABLE in main DLL,
+                                    * look for en-US/<name>.dll.mui in the same directory */
+                                   mod->mui_image = NULL;
+                                   mod->mui_image_size = 0;
+                                   if (!pe_has_message_table((const uint8_t*)image, (size_t)st.st_size)) {
+                                        char dir_part[512]; strncpy(dir_part, found, sizeof(dir_part)-1);
+                                        char* sl = strrchr(dir_part, '/');
+                                        if (sl) *sl = '\0'; else dir_part[0] = '\0';
+                                        char lower_base2[128]; strncpy(lower_base2, base, sizeof(lower_base2)-1);
+                                        lower_base2[sizeof(lower_base2)-1] = '\0';
+                                        for (char* p = lower_base2; *p; p++) *p = (char)tolower((unsigned char)*p);
+                                        char mui_path[600];
+                                        snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, lower_base2);
+                                        if (access(mui_path, R_OK) != 0)
+                                            snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, base);
+                                        if (access(mui_path, R_OK) == 0) {
+                                           int mfd = open(mui_path, O_RDONLY);
+                                           if (mfd >= 0) {
+                                               struct stat mst; fstat(mfd, &mst);
+                                               void* mdata = mmap(NULL, (size_t)mst.st_size, PROT_READ, MAP_PRIVATE, mfd, 0);
+                                               close(mfd);
+                                               if (mdata != MAP_FAILED) {
+                                                   uint8_t* m8 = (uint8_t*)mdata;
+                                                   if (m8[0] == 'M' && m8[1] == 'Z') {
+                                                       mod->mui_image = mdata;
+                                                       mod->mui_image_size = (size_t)mst.st_size;
+                                                       LSW_LOG_INFO("LoadLibraryA: MUI satellite loaded from %s (%zu bytes)",
+                                                                    mui_path, mod->mui_image_size);
+                                                   } else {
+                                                       munmap(mdata, (size_t)mst.st_size);
+                                                   }
+                                               }
+                                           }
+                                       }
+                                   }
+                                   return (void*)mod;
                                 }
                             } else {
                                 munmap(file_data, (size_t)st.st_size);
@@ -2917,6 +4254,14 @@ void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_
         return NULL;
     }
 
+    /* System fake handle — resolve from our Win32 stubs (check BEFORE typed handle) */
+    if (module == LSW_SYSTEM_HMODULE) {
+        void* addr = win32_api_resolve_any(proc_name);
+        if (addr) { LSW_LOG_INFO("GetProcAddress: system stub %s -> %p", proc_name, addr); return addr; }
+        LSW_LOG_WARN("GetProcAddress: system stub %s not found", proc_name);
+        return NULL;
+    }
+
     /* PE module handle? */
     lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)module;
     if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
@@ -2928,14 +4273,6 @@ void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_
         return addr;
     }
 
-    /* System fake handle — resolve from our Win32 stubs */
-    if (module == LSW_SYSTEM_HMODULE) {
-        void* addr = win32_api_resolve_any(proc_name);
-        if (addr) { LSW_LOG_INFO("GetProcAddress: system stub %s -> %p", proc_name, addr); return addr; }
-        LSW_LOG_WARN("GetProcAddress: system stub %s not found", proc_name);
-        return NULL;
-    }
-    
     /* Real dlopen handle */
     void* addr = dlsym(module, proc_name);
     if (!addr) {
@@ -3229,6 +4566,89 @@ lsw_hostent_t* __attribute__((ms_abi)) lsw_gethostbyaddr(const char* addr, int l
 
 // ============================================================================
 // END Winsock APIs
+// ============================================================================
+
+// ============================================================================
+// SECTION: OLEAUT32 BSTR APIs
+// BSTR layout: [uint32_t byte_len][wchar_t data...][wchar_t NUL]
+// The BSTR pointer points to the data, NOT the length prefix.
+// ============================================================================
+
+static inline void* __attribute__((ms_abi)) lsw_SysAllocString(const wchar_t* str) {
+    if (!str) return NULL;
+    uint32_t len = 0;
+    while (str[len]) len++;
+    uint32_t byte_len = len * sizeof(wchar_t);
+    uint8_t* buf = malloc(4 + (len + 1) * sizeof(wchar_t));
+    if (!buf) return NULL;
+    *(uint32_t*)buf = byte_len;
+    wchar_t* data = (wchar_t*)(buf + 4);
+    for (uint32_t i = 0; i < len; i++) data[i] = str[i];
+    data[len] = 0;
+    return data;
+}
+
+static inline void __attribute__((ms_abi)) lsw_SysFreeString(void* bstr) {
+    if (!bstr) return;
+    free((uint8_t*)bstr - 4);
+}
+
+static inline uint32_t __attribute__((ms_abi)) lsw_SysStringLen(void* bstr) {
+    if (!bstr) return 0;
+    uint32_t byte_len = *(uint32_t*)((uint8_t*)bstr - 4);
+    return byte_len / sizeof(wchar_t);
+}
+
+static inline uint32_t __attribute__((ms_abi)) lsw_SysStringByteLen(void* bstr) {
+    if (!bstr) return 0;
+    return *(uint32_t*)((uint8_t*)bstr - 4);
+}
+
+static inline void* __attribute__((ms_abi)) lsw_SysAllocStringLen(const wchar_t* str, uint32_t len) {
+    uint32_t byte_len = len * sizeof(wchar_t);
+    uint8_t* buf = malloc(4 + (len + 1) * sizeof(wchar_t));
+    if (!buf) return NULL;
+    *(uint32_t*)buf = byte_len;
+    wchar_t* data = (wchar_t*)(buf + 4);
+    if (str) { for (uint32_t i = 0; i < len; i++) data[i] = str[i]; }
+    else       memset(data, 0, len * sizeof(wchar_t));
+    data[len] = 0;
+    return data;
+}
+
+static inline void* __attribute__((ms_abi)) lsw_SysAllocStringByteLen(const char* str, uint32_t byte_len) {
+    uint8_t* buf = malloc(4 + byte_len + 2);
+    if (!buf) return NULL;
+    *(uint32_t*)buf = byte_len;
+    uint8_t* data = buf + 4;
+    if (str) memcpy(data, str, byte_len);
+    else      memset(data, 0, byte_len);
+    data[byte_len] = 0; data[byte_len+1] = 0;
+    return data;
+}
+
+static inline int __attribute__((ms_abi)) lsw_SysReAllocString(void** pbstr, const wchar_t* str) {
+    if (!pbstr) return 0;
+    void* old = *pbstr;
+    void* nw = lsw_SysAllocString(str);
+    if (!nw && str) return 0;
+    lsw_SysFreeString(old);
+    *pbstr = nw;
+    return 1;
+}
+
+static inline int __attribute__((ms_abi)) lsw_SysReAllocStringLen(void** pbstr, const wchar_t* str, uint32_t len) {
+    if (!pbstr) return 0;
+    void* old = *pbstr;
+    void* nw = lsw_SysAllocStringLen(str, len);
+    if (!nw) return 0;
+    lsw_SysFreeString(old);
+    *pbstr = nw;
+    return 1;
+}
+
+// ============================================================================
+// END OLEAUT32 BSTR APIs
 // ============================================================================
 
 // ============================================================================
@@ -3608,23 +5028,251 @@ uint32_t __attribute__((ms_abi)) lsw_FormatMessageA(
 }
 
 // KERNEL32.dll!FormatMessageW
+/* Process-global persistent hostname storage — outlives NetApiBufferFree.
+ * Net1.exe stores the result of GetComputerNameW in a stack buffer, then stores
+ * that pointer in its args[] array. By the time FormatMessageW is called, the
+ * stack frame is gone and the pointer points to zeroed/overwritten stack memory.
+ * We fix this by keeping a persistent copy and substituting it in FormatMessageW
+ * when an args entry is non-null but points to an empty wide string. */
+static uint16_t* g_computername_w = NULL;
+static char      g_computername_a[256] = "";
+static void lsw_ensure_computername(void) {
+    if (g_computername_w) return;
+    char hostname[64] = "LSW";
+    gethostname(hostname, sizeof(hostname) - 1);
+    int hlen = (int)strlen(hostname);
+    g_computername_w = (uint16_t*)malloc((size_t)(hlen + 1) * 2);
+    if (!g_computername_w) return;
+    for (int i = 0; i < hlen; i++) g_computername_w[i] = (uint16_t)(unsigned char)hostname[i];
+    g_computername_w[hlen] = 0;
+    strncpy(g_computername_a, hostname, 255);
+    g_computername_a[255] = '\0';
+}
+
+/* Perform FormatMessage %N and %N!fmt! argument substitution into a UTF-16LE buffer.
+ * FORMAT_MESSAGE_ARGUMENT_ARRAY (0x2000): args is uint64_t* array (indexed 0-based for arg 1..99).
+ * Returns number of UTF-16 chars written (not counting null terminator). */
+static uint32_t fm_substitute(const uint16_t* tmpl, uint32_t tlen,
+                               uint16_t* out, uint32_t outsize,
+                               uint32_t flags, void* args)
+{
+    if (!out || outsize == 0) return 0;
+    uint32_t oi = 0;
+    for (uint32_t i = 0; i < tlen && oi < outsize - 1; ) {
+        uint16_t c = tmpl[i++];
+        if (c != '%') { out[oi++] = c; continue; }
+        if (i >= tlen) { out[oi++] = '%'; break; }
+        c = tmpl[i++];
+        switch (c) {
+            case '%': out[oi++] = '%'; break;
+            case 'n': out[oi++] = '\n'; break;
+            case 'r': out[oi++] = '\r'; break;
+            case 'b': out[oi++] = ' ';  break;
+            case 't': out[oi++] = '\t'; break;
+            case '0': goto fm_done;
+            case '.': out[oi++] = '.'; break;
+            case '!': out[oi++] = '!'; break;
+            default:
+                if (c >= '1' && c <= '9') {
+                    int argidx = c - '0';
+                    if (i < tlen && tmpl[i] >= '0' && tmpl[i] <= '9')
+                        argidx = argidx * 10 + (tmpl[i++] - '0');
+                    /* Parse optional !format! spec */
+                    char fmt[80] = "ls";
+                    int has_fmt = 0;
+                    if (i < tlen && tmpl[i] == '!') {
+                        i++; has_fmt = 1;
+                        int fi = 0;
+                        while (i < tlen && tmpl[i] != '!' && fi < 78) fmt[fi++] = (char)tmpl[i++];
+                        fmt[fi] = '\0';
+                        if (i < tlen) i++; /* skip closing ! */
+                    }
+                    (void)has_fmt;
+                    /* Get arg value (treat as pointer) */
+                    uint64_t argval = 0;
+                    if (args && (flags & 0x2000)) { /* ARGUMENT_ARRAY */
+                        argval = ((uint64_t*)args)[argidx - 1];
+                    }
+                    /* Parse format string: flags, width, precision, length modifier, type */
+                    int left = 0, width = 0, prec = -1;
+                    const char* fp = fmt;
+                    /* Flags */
+                    while (*fp == '-' || *fp == '+' || *fp == ' ' || *fp == '#' ||
+                           *fp == '0' || *fp == 'F') {
+                        if (*fp == '-') left = 1;
+                        fp++;
+                    }
+                    /* Width */
+                    while (*fp >= '1' && *fp <= '9') width = width * 10 + (*fp++ - '0');
+                    /* Precision */
+                    if (*fp == '.') { fp++; prec = 0; while (*fp >= '0' && *fp <= '9') prec = prec * 10 + (*fp++ - '0'); }
+                    /* Length modifier (w, l, h, I, L) — skip */
+                    while (*fp == 'w' || *fp == 'l' || *fp == 'h' || *fp == 'I' || *fp == 'L') fp++;
+                    char type_ch = *fp ? *fp : 's';
+                    int is_num = (type_ch=='d'||type_ch=='i'||type_ch=='u'||
+                                  type_ch=='x'||type_ch=='X'||type_ch=='o');
+                    if (is_num) {
+                        /* Numeric arg */
+                        char pfmt[90], nbuf[64];
+                        snprintf(pfmt, sizeof(pfmt), "%%%s", fmt);
+                        int n = snprintf(nbuf, sizeof(nbuf), pfmt, (long long)argval);
+                        if (n > 0) for (int k = 0; k < n && oi < outsize-1; k++) out[oi++] = (uint16_t)(unsigned char)nbuf[k];
+                    } else {
+                        /* String arg — pointer is to UTF-16LE (Windows WCHAR*), not Linux wchar_t */
+                        const uint16_t* warg = (const uint16_t*)(uintptr_t)argval;
+                        if (!warg) warg = (const uint16_t*)L"";
+                        uint32_t slen = 0;
+                        while (warg[slen]) slen++;
+                        uint32_t trunc = slen;
+                        if (prec >= 0 && trunc > (uint32_t)prec) trunc = (uint32_t)prec;
+                        /* Right-align padding (spaces before string) */
+                        if (width > 0 && !left) {
+                            for (int pad = (int)trunc; pad < width && oi < outsize-1; pad++) out[oi++] = ' ';
+                        }
+                        for (uint32_t k = 0; k < trunc && oi < outsize-1; k++) out[oi++] = (uint16_t)warg[k];
+                        /* Left-align padding (spaces after string) */
+                        if (width > 0 && left) {
+                            for (int pad = (int)trunc; pad < width && oi < outsize-1; pad++) out[oi++] = ' ';
+                        }
+                    }
+                } else {
+                    out[oi++] = '%'; out[oi++] = c;
+                }
+                break;
+        }
+    }
+fm_done:
+    out[oi] = 0;
+    return oi;
+}
+
 uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
     uint32_t flags, const void* source, uint32_t message_id,
     uint32_t language_id, uint16_t* buffer, uint32_t size, void* args)
 {
-    (void)source; (void)language_id; (void)args;
-    if (!buffer || size == 0) return 0;
+    (void)language_id;
+
+    /* FORMAT_MESSAGE_FROM_HMODULE (0x800): look up message in PE resource table */
+    if ((flags & 0x800) && source && source != (void*)0xDEADBEEFu) {
+        lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)source;
+        if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
+            const uint16_t* wstr = NULL;
+            uint32_t wlen = 0;
+            /* Try MUI satellite first (Vista+ message-only DLLs) */
+            int r = 0;
+            if (pem->mui_image) {
+                r = pe_find_message((const uint8_t*)pem->mui_image, pem->mui_image_size,
+                                    message_id, &wstr, &wlen);
+            }
+            if (!r) {
+                r = pe_find_message((const uint8_t*)pem->image_base, pem->image_size,
+                                    message_id, &wstr, &wlen);
+            }
+            if (r > 0) {
+                /* Build a null-terminated UTF-16 template */
+                uint16_t* tmpl = NULL;
+                int tmpl_alloc = 0;
+                if (r == 1) {
+                    tmpl = (uint16_t*)wstr;
+                } else {
+                    tmpl = (uint16_t*)malloc((wlen + 1) * sizeof(uint16_t));
+                    if (!tmpl) { lsw_SetLastError(8); return 0; }
+                    tmpl_alloc = 1;
+                    const uint8_t* astr = (const uint8_t*)wstr;
+                    for (uint32_t i = 0; i < wlen; i++) tmpl[i] = (uint16_t)astr[i];
+                    tmpl[wlen] = 0;
+                }
+                /* Log raw template */
+                {
+                    char dbg[256]; int di = 0;
+                    for (uint32_t k = 0; k < wlen && k < 80 && di < 252; k++) {
+                        uint16_t wc = tmpl[k];
+                        if (wc >= 32 && wc < 127) dbg[di++] = (char)wc;
+                        else { snprintf(dbg+di, 8, "\\x%04x", wc); di += 6; }
+                    }
+                    dbg[di] = '\0';
+                    LSW_LOG_INFO("FormatMessageW: id=0x%x flags=0x%x len=%u tmpl=\"%s\" args=%p",
+                                 message_id, flags, wlen, dbg, args);
+                }
+                /* When args[N] points to an empty string but is non-null (stale stack pointer),
+                 * substitute with the persistent hostname — this fixes net1.exe's "User accounts for \\%1"
+                 * header where GetComputerNameW writes to a stack buffer that becomes invalid
+                 * before FormatMessageW is called. */
+                if (args && (flags & 0x2000)) {
+                    uint64_t* argarr = (uint64_t*)args;
+                    for (int ai = 0; ai < 9; ai++) {
+                        uint64_t av = argarr[ai];
+                        if (!av) break;
+                        const uint16_t* sp = (const uint16_t*)(uintptr_t)av;
+                        if (sp[0] == 0) {
+                            /* Empty string from stale stack — replace with persistent hostname */
+                            lsw_ensure_computername();
+                            if (g_computername_w && g_computername_w[0])
+                                argarr[ai] = (uint64_t)(uintptr_t)g_computername_w;
+                        }
+                    }
+                }
+                /* Apply substitution and copy to output */
+                uint32_t outlen;
+                if (flags & 0x100) {  /* ALLOCATE_BUFFER */
+                    uint16_t** ppBuf = (uint16_t**)buffer;
+                    if (!ppBuf) { if (tmpl_alloc) free(tmpl); return 0; }
+                    uint32_t alloc_sz = wlen * 4 + 256;
+                    uint16_t* wbuf = (uint16_t*)malloc(alloc_sz * sizeof(uint16_t));
+                    if (!wbuf) { if (tmpl_alloc) free(tmpl); lsw_SetLastError(8); return 0; }
+                    outlen = fm_substitute(tmpl, wlen, wbuf, alloc_sz, flags, args);
+                    *ppBuf = wbuf;
+                } else {
+                    if (!buffer || size == 0) { if (tmpl_alloc) free(tmpl); return 0; }
+                    outlen = fm_substitute(tmpl, wlen, buffer, size, flags, args);
+                }
+                if (tmpl_alloc) free(tmpl);
+                return outlen;
+            }
+        }
+    }
+
     char tmp[512];
-    if (flags & 0x1000) {
-        const char* msg = strerror((int)message_id);
-        if (!msg) snprintf(tmp, sizeof(tmp), "Error %u", message_id);
-        else       snprintf(tmp, sizeof(tmp), "%s", msg);
+    if (flags & 0x1000) {  /* FORMAT_MESSAGE_FROM_SYSTEM */
+        /* Map Windows error codes to something readable */
+        const char* msg = NULL;
+        switch (message_id) {
+            case 0:   msg = "The operation completed successfully."; break;
+            case 2:   msg = "The system cannot find the file specified."; break;
+            case 3:   msg = "The system cannot find the path specified."; break;
+            case 5:   msg = "Access is denied."; break;
+            case 6:   msg = "The handle is invalid."; break;
+            case 8:   msg = "Not enough memory resources are available to process this command."; break;
+            case 87:  msg = "The parameter is incorrect."; break;
+            case 122: msg = "The data area passed to a system call is too small."; break;
+            default: {
+                /* Try strerror as a fallback */
+                const char* s = strerror((int)message_id);
+                if (s && s[0]) msg = s;
+                break;
+            }
+        }
+        if (msg) snprintf(tmp, sizeof(tmp), "%s", msg);
+        else     snprintf(tmp, sizeof(tmp), "Windows error %u.", message_id);
     } else {
         snprintf(tmp, sizeof(tmp), "Error 0x%x", message_id);
     }
+
     uint32_t len = (uint32_t)strlen(tmp);
-    if (len >= size) len = size - 1;
-    for (uint32_t i = 0; i <= len; i++) buffer[i] = (uint16_t)tmp[i];
+    LSW_LOG_INFO("FormatMessageW(flags=0x%x, id=%u) -> \"%s\" (len=%u)", flags, message_id, tmp, len);
+
+    if (flags & 0x100) {  /* FORMAT_MESSAGE_ALLOCATE_BUFFER — buffer is uint16_t** */
+        uint16_t** ppBuf = (uint16_t**)buffer;
+        if (!ppBuf) return 0;
+        uint16_t* wbuf = (uint16_t*)malloc((len + 1) * sizeof(uint16_t));
+        if (!wbuf) { lsw_SetLastError(8); return 0; }
+        for (uint32_t i = 0; i <= len; i++) wbuf[i] = (uint16_t)(unsigned char)tmp[i];
+        *ppBuf = wbuf;
+    } else {
+        if (!buffer || size == 0) return 0;
+        if (len >= size) len = size - 1;
+        for (uint32_t i = 0; i <= len; i++) buffer[i] = (uint16_t)(unsigned char)tmp[i];
+    }
     return len;
 }
 
@@ -3782,8 +5430,7 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryW(const uint16_t* filename) {
 void* __attribute__((ms_abi)) lsw_GetModuleHandleW(const uint16_t* name) {
     if (!name) {
         // NULL = handle of calling module (main PE)
-        LSW_LOG_INFO("GetModuleHandleW(NULL) -> returning NULL (no self handle)");
-        return NULL;
+        return lsw_GetModuleHandleA(NULL);
     }
     char buf[256];
     int i = 0;
@@ -3793,18 +5440,52 @@ void* __attribute__((ms_abi)) lsw_GetModuleHandleW(const uint16_t* name) {
     return lsw_GetModuleHandleA(buf);
 }
 
+/* Convert a Linux path (/mnt/c/...) to Windows path (C:\...) for wide output */
+static uint32_t lsw_linux_to_winpath_w(const char* src, uint16_t* buf, uint32_t size) {
+    if (!buf || size == 0) return 0;
+    char win[4096];
+    uint32_t wi = 0;
+    /* /mnt/<letter>/... → <letter>:\... */
+    if (src[0] == '/' && src[1] == 'm' && src[2] == 'n' && src[3] == 't' &&
+        src[4] == '/' && src[5] && src[6] == '/') {
+        win[wi++] = (char)((unsigned char)src[5] >= 'a' ? src[5] - 32 : src[5]); /* drive letter */
+        win[wi++] = ':';
+        win[wi++] = '\\';
+        src += 7; /* skip /mnt/x/ */
+    }
+    for (; *src && wi < (uint32_t)sizeof(win) - 1; src++, wi++) {
+        win[wi] = (*src == '/') ? '\\' : *src;
+    }
+    win[wi] = '\0';
+    uint32_t i = 0;
+    while (win[i] && i < size - 1) { buf[i] = (uint16_t)(unsigned char)win[i]; i++; }
+    buf[i] = 0;
+    return i;
+}
+
 uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameW(void* module, uint16_t* buf, uint32_t size) {
     (void)module;
-    LSW_LOG_WARN("GetModuleFileNameW stub");
-    if (buf && size > 0) buf[0] = 0;
-    return 0;
+    if (!buf || size == 0) return 0;
+    const char* src = (g_lsw_exe_path[0]) ? g_lsw_exe_path : "";
+    uint32_t i = lsw_linux_to_winpath_w(src, buf, size);
+    char dbg[256]; uint32_t di = 0;
+    while (buf[di] && di < 255) { dbg[di] = (char)(buf[di] & 0xFF); di++; } dbg[di] = '\0';
+    LSW_LOG_INFO("GetModuleFileNameW -> %s (%u chars)", dbg, i);
+    return i;
 }
 
 uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameA(void* module, char* buf, uint32_t size) {
     (void)module;
-    LSW_LOG_WARN("GetModuleFileNameA stub");
-    if (buf && size > 0) buf[0] = 0;
-    return 0;
+    if (!buf || size == 0) return 0;
+    /* Convert Linux path to Windows path */
+    uint16_t wbuf[4096];
+    const char* src = (g_lsw_exe_path[0]) ? g_lsw_exe_path : "";
+    uint32_t wlen = lsw_linux_to_winpath_w(src, wbuf, 4095);
+    uint32_t len = wlen < size - 1 ? wlen : size - 1;
+    for (uint32_t i = 0; i < len; i++) buf[i] = (char)(wbuf[i] & 0xFF);
+    buf[len] = '\0';
+    LSW_LOG_INFO("GetModuleFileNameA -> %s (%u chars)", buf, len);
+    return len;
 }
 
 // ============================================================================
@@ -3816,26 +5497,23 @@ uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameA(void* module, char* buf,
 // ============================================================================
 
 int __attribute__((ms_abi)) lsw_sprintf(char* buf, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     int r = vsnprintf(buf, 65536, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_end(ms_ap); return r;
 }
 int __attribute__((ms_abi)) lsw_snprintf(char* buf, size_t n, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     int r = vsnprintf(buf, n, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_end(ms_ap); return r;
 }
 // _snprintf (Windows, not null-terminated if truncated)
 int __attribute__((ms_abi)) lsw__snprintf(char* buf, size_t n, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     int r = vsnprintf(buf, n, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_end(ms_ap); return r;
 }
 int __attribute__((ms_abi)) lsw_vsprintf(char* buf, const char* fmt, va_list ap) {
     return vsprintf(buf, fmt, ap);
@@ -3844,11 +5522,10 @@ int __attribute__((ms_abi)) lsw_vsnprintf(char* buf, size_t n, const char* fmt, 
     return vsnprintf(buf, n, fmt, ap);
 }
 int __attribute__((ms_abi)) lsw_sscanf(const char* s, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     int r = vsscanf(s, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_end(ms_ap); return r;
 }
 int __attribute__((ms_abi)) lsw_vsscanf(const char* s, const char* fmt, va_list ap) {
     return vsscanf(s, fmt, ap);
@@ -3871,16 +5548,16 @@ int   __attribute__((ms_abi)) lsw__strnicmp(const char* a, const char* b, size_t
 }
 
 // Wide string helpers
-wchar_t* __attribute__((ms_abi)) lsw_wcscpy(wchar_t* d, const wchar_t* s)            { return wcscpy(d, s); }
-wchar_t* __attribute__((ms_abi)) lsw_wcsncpy(wchar_t* d, const wchar_t* s, size_t n) { return wcsncpy(d, s, n); }
-wchar_t* __attribute__((ms_abi)) lsw_wcscat(wchar_t* d, const wchar_t* s)            { return wcscat(d, s); }
-wchar_t* __attribute__((ms_abi)) lsw_wcsncat(wchar_t* d, const wchar_t* s, size_t n) { return wcsncat(d, s, n); }
-int      __attribute__((ms_abi)) lsw_wcscmp(const wchar_t* a, const wchar_t* b)      { return wcscmp(a, b); }
-int      __attribute__((ms_abi)) lsw_wcsncmp(const wchar_t* a, const wchar_t* b, size_t n) { return wcsncmp(a, b, n); }
-wchar_t* __attribute__((ms_abi)) lsw_wcschr(const wchar_t* s, wchar_t c)             { return wcschr(s, c); }
-wchar_t* __attribute__((ms_abi)) lsw_wcsrchr(const wchar_t* s, wchar_t c)            { return wcsrchr(s, c); }
-wchar_t* __attribute__((ms_abi)) lsw_wcsstr(const wchar_t* h, const wchar_t* n)      { return wcsstr(h, n); }
-wchar_t* __attribute__((ms_abi)) lsw__wcsdup(const wchar_t* s)                       { return wcsdup(s); }
+wchar_t* __attribute__((ms_abi)) lsw_wcscpy(wchar_t* d, const wchar_t* s)            { return (wchar_t*)u16_cpy((u16*)d, (const u16*)s); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsncpy(wchar_t* d, const wchar_t* s, size_t n) { return (wchar_t*)u16_ncpy((u16*)d, (const u16*)s, n); }
+wchar_t* __attribute__((ms_abi)) lsw_wcscat(wchar_t* d, const wchar_t* s)            { return (wchar_t*)u16_cat((u16*)d, (const u16*)s); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsncat(wchar_t* d, const wchar_t* s, size_t n) { return (wchar_t*)u16_ncat((u16*)d, (const u16*)s, n); }
+int      __attribute__((ms_abi)) lsw_wcscmp(const wchar_t* a, const wchar_t* b)      { return u16_cmp((const u16*)a, (const u16*)b); }
+int      __attribute__((ms_abi)) lsw_wcsncmp(const wchar_t* a, const wchar_t* b, size_t n) { return u16_ncmp((const u16*)a, (const u16*)b, n); }
+wchar_t* __attribute__((ms_abi)) lsw_wcschr(const wchar_t* s, wchar_t c)             { return (wchar_t*)u16_chr((const u16*)s, (u16)c); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsrchr(const wchar_t* s, wchar_t c)            { return (wchar_t*)u16_rchr((const u16*)s, (u16)c); }
+wchar_t* __attribute__((ms_abi)) lsw_wcsstr(const wchar_t* h, const wchar_t* n)      { return (wchar_t*)u16_str((const u16*)h, (const u16*)n); }
+wchar_t* __attribute__((ms_abi)) lsw__wcsdup(const wchar_t* s)                       { return (wchar_t*)u16_dup((const u16*)s); }
 
 // Numeric conversion
 int       __attribute__((ms_abi)) lsw_atoi(const char* s)               { return atoi(s); }
@@ -3910,13 +5587,28 @@ int __attribute__((ms_abi)) lsw_isprint(int c)   { return isprint(c); }
 int __attribute__((ms_abi)) lsw_ispunct(int c)   { return ispunct(c); }
 
 // stdlib sorting
+/* ABI bridge for qsort/bsearch: libc uses SysV (rdi/rsi), PE callbacks use ms_abi (rcx/rdx).
+ * Store the ms_abi comparator in TLS, then call it from a SysV trampoline. */
+typedef int (*lsw_ms_cmp_t)(const void*, const void*) __attribute__((ms_abi));
+static __thread lsw_ms_cmp_t tls_ms_cmp = NULL;
+static int lsw_ms_cmp_bridge(const void* a, const void* b) {
+    /* SysV entry: a in rdi, b in rsi — GCC will emit ms_abi call to tls_ms_cmp */
+    return tls_ms_cmp(a, b);
+}
 void __attribute__((ms_abi)) lsw_qsort(void* base, size_t n, size_t size,
-    int (*cmp)(const void*, const void*)) {
-    qsort(base, n, size, cmp);
+    lsw_ms_cmp_t cmp) {
+    lsw_ms_cmp_t saved = tls_ms_cmp;
+    tls_ms_cmp = cmp;
+    qsort(base, n, size, lsw_ms_cmp_bridge);
+    tls_ms_cmp = saved;
 }
 void* __attribute__((ms_abi)) lsw_bsearch(const void* key, const void* base, size_t n, size_t size,
-    int (*cmp)(const void*, const void*)) {
-    return bsearch(key, base, n, size, cmp);
+    lsw_ms_cmp_t cmp) {
+    lsw_ms_cmp_t saved = tls_ms_cmp;
+    tls_ms_cmp = cmp;
+    void* result = bsearch(key, base, n, size, lsw_ms_cmp_bridge);
+    tls_ms_cmp = saved;
+    return result;
 }
 
 // Time
@@ -3957,21 +5649,25 @@ int   __attribute__((ms_abi)) lsw_puts(const char* s)    { return puts(s); }
 int   __attribute__((ms_abi)) lsw_putchar(int c)          { return putchar(c); }
 int   __attribute__((ms_abi)) lsw_getchar(void)           { return getchar(); }
 int   __attribute__((ms_abi)) lsw_fscanf(void* f, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     int r = vfscanf((FILE*)f, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_end(ms_ap); return r;
 }
-int   __attribute__((ms_abi)) lsw_vprintf(const char* fmt, va_list ap) {
-    return vprintf(fmt, ap);
+int __attribute__((ms_abi)) lsw_vprintf(const char* fmt, va_list ap) {
+    /* ap is Windows va_list (char*); convert to sysv */
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    char* buf = NULL; vasprintf(&buf, fmt, sysv_ap);
+    if (!buf) return -1;
+    int n = (int)write(1, buf, strlen(buf));
+    free(buf); return n;
 }
+/* Forward declaration — defined later in this file */
+int __attribute__((ms_abi)) lsw__vsnwprintf(wchar_t* buf_w, size_t count, const wchar_t* fmt_w, char* ap_in);
 int   __attribute__((ms_abi)) lsw_swprintf(wchar_t* buf, const wchar_t* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    int r = vswprintf(buf, 65536, fmt, ap);
-    va_end(ap);
-    return r;
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    int r = lsw__vsnwprintf(buf, 65536, fmt, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap); return r;
 }
 
 // Math
@@ -4041,7 +5737,10 @@ int __attribute__((ms_abi)) lsw_strcat_s(char* dst, size_t sz, const char* src) 
     strncat(dst, src, sz - used - 1); return 0;
 }
 int __attribute__((ms_abi)) lsw_sprintf_s(char* dst, size_t sz, const char* fmt, ...) {
-    va_list ap; va_start(ap, fmt); int r = vsnprintf(dst, sz, fmt, ap); va_end(ap); return r;
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
+    int r = vsnprintf(dst, sz, fmt, ap);
+    __builtin_ms_va_end(ms_ap); return r;
 }
 int __attribute__((ms_abi)) lsw_memcpy_s(void* dst, size_t dsz, const void* src, size_t cnt) {
     if (cnt > dsz) return 22;
@@ -4053,33 +5752,39 @@ int __attribute__((ms_abi)) lsw_memmove_s(void* dst, size_t dsz, const void* src
 }
 int __attribute__((ms_abi)) lsw_wcscpy_s(wchar_t* dst, size_t sz, const wchar_t* src) {
     if (!dst || !sz) return 22;
-    wcsncpy(dst, src, sz); dst[sz-1] = 0; return 0;
+    if (!src) { dst[0] = 0; return 0; } /* NULL src → empty string, no crash */
+    u16_ncpy((u16*)dst, (const u16*)src, sz); ((u16*)dst)[sz-1] = 0; return 0;
 }
 int __attribute__((ms_abi)) lsw_wcscat_s(wchar_t* dst, size_t sz, const wchar_t* src) {
     if (!dst || !sz) return 22;
-    size_t used = wcslen(dst);
+    size_t used = u16_len((const u16*)dst);
     if (used >= sz) return 22;
-    wcsncat(dst, src, sz - used - 1); return 0;
+    u16_ncat((u16*)dst, (const u16*)src, sz - used - 1); return 0;
 }
 int __attribute__((ms_abi)) lsw_swprintf_s(wchar_t* dst, size_t sz, const wchar_t* fmt, ...) {
-    va_list ap; va_start(ap, fmt); int r = vswprintf(dst, sz, fmt, ap); va_end(ap); return r;
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    int r = lsw__vsnwprintf(dst, sz, fmt, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap); return r;
 }
 
 // Wide I/O
 void* __attribute__((ms_abi)) lsw__wfopen(const wchar_t* path, const wchar_t* mode) {
-    char p[512], m[32];
-    wcstombs(p, path, sizeof(p)); wcstombs(m, mode, sizeof(m));
+    char p[1024], m[32];
+    u16_to_utf8((const u16*)path, p, sizeof(p));
+    u16_to_utf8((const u16*)mode, m, sizeof(m));
     return fopen(p, m);
 }
 int __attribute__((ms_abi)) lsw__waccess(const wchar_t* path, int mode) {
-    char p[512]; wcstombs(p, path, sizeof(p)); return access(p, mode);
+    char p[1024]; u16_to_utf8((const u16*)path, p, sizeof(p)); return access(p, mode);
 }
 int __attribute__((ms_abi)) lsw__wrename(const wchar_t* o, const wchar_t* n_) {
-    char o2[512], n2[512]; wcstombs(o2, o, sizeof(o2)); wcstombs(n2, n_, sizeof(n2));
+    char o2[1024], n2[1024];
+    u16_to_utf8((const u16*)o, o2, sizeof(o2));
+    u16_to_utf8((const u16*)n_, n2, sizeof(n2));
     return rename(o2, n2);
 }
 int __attribute__((ms_abi)) lsw__wremove(const wchar_t* path) {
-    char p[512]; wcstombs(p, path, sizeof(p)); return remove(p);
+    char p[1024]; u16_to_utf8((const u16*)path, p, sizeof(p)); return remove(p);
 }
 
 // Aligned allocation
@@ -4103,10 +5808,10 @@ void __attribute__((ms_abi)) lsw___security_check_cookie(uintptr_t c) { (void)c;
 
 // Additional wide string helpers
 size_t __attribute__((ms_abi)) lsw_wcsnlen(const wchar_t* s, size_t max) {
-    size_t n = 0; while (n < max && s[n]) n++; return n;
+    return u16_nlen((const u16*)s, max);
 }
-int __attribute__((ms_abi)) lsw__wcsicmp(const wchar_t* a, const wchar_t* b) { return wcscasecmp(a, b); }
-int __attribute__((ms_abi)) lsw__wcsnicmp(const wchar_t* a, const wchar_t* b, size_t n) { return wcsncasecmp(a, b, n); }
+int __attribute__((ms_abi)) lsw__wcsicmp(const wchar_t* a, const wchar_t* b) { return u16_icmp((const u16*)a, (const u16*)b); }
+int __attribute__((ms_abi)) lsw__wcsnicmp(const wchar_t* a, const wchar_t* b, size_t n) { return u16_nicmp((const u16*)a, (const u16*)b, n); }
 /* lsw__stricmp, lsw__strnicmp, lsw__strdup, lsw__wcsdup, lsw__atoi64 defined earlier */
 long long __attribute__((ms_abi)) lsw__strtoi64(const char* s, char** e, int b) { return strtoll(s, e, b); }
 unsigned long long __attribute__((ms_abi)) lsw__strtoui64(const char* s, char** e, int b) { return strtoull(s, e, b); }
@@ -4157,10 +5862,10 @@ int __attribute__((ms_abi)) lsw___stdio_common_vsscanf(
     return vsscanf(buf, fmt, ap);
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vswprintf(
-    uint64_t opts, wchar_t* buf, size_t n, const wchar_t* fmt, void* locale, va_list ap)
+    uint64_t opts, wchar_t* buf, size_t n, const wchar_t* fmt, void* locale, char* ap)
 {
     (void)opts; (void)locale;
-    return vswprintf(buf, n, fmt, ap);
+    return lsw__vsnwprintf(buf, n, fmt, ap);
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vfwprintf(
     uint64_t opts, void* f, const wchar_t* fmt, void* locale, va_list ap)
@@ -4181,7 +5886,7 @@ void __attribute__((ms_abi)) lsw__register_onexit_function(void* t, void* fn) { 
 void __attribute__((ms_abi)) lsw__execute_onexit_table(void* t) { (void)t; }
 void __attribute__((ms_abi)) lsw___p___argc(void)   {}   // Returns pointer to __argc — stubbed
 void __attribute__((ms_abi)) lsw___p___argv(void)   {}
-void __attribute__((ms_abi)) lsw___p__commode(void) {}
+/* lsw___p__commode defined earlier with correct int* return type */
 
 // terminate / unexpected
 void __attribute__((ms_abi)) lsw__crt_atexit(void* fn) { (void)fn; }
@@ -4191,16 +5896,9 @@ void __attribute__((ms_abi)) lsw___crt_at_quick_exit(void* fn) { (void)fn; }
 void* __attribute__((ms_abi)) lsw___std_type_info_destroy_list(void* p) { (void)p; return NULL; }
 
 // C++ exception helpers (vcruntime)
-// Thread-local storage for the last thrown C++ exception
-static __thread void* tls_cxx_exception_obj  = NULL;
-static __thread void* tls_cxx_exception_type = NULL;
+/* tls_cxx_exception_obj / tls_cxx_exception_type defined near _CxxThrowException */
 
-void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* type) {
-    tls_cxx_exception_obj  = obj;
-    tls_cxx_exception_type = type;
-    LSW_LOG_ERROR("_CxxThrowException: obj=%p type=%p — calling exit(1)", obj, type);
-    exit(1);
-}
+/* lsw__CxxThrowException defined earlier */
 
 // __CxxFrameHandler3 — called by MSVC exception filter logic; always continue search
 int __attribute__((ms_abi)) lsw___CxxFrameHandler3(void* a, void* b, void* c, void* d) {
@@ -4293,12 +5991,21 @@ int __attribute__((ms_abi)) lsw_SetConsoleMode(void* h, uint32_t mode) {
 uint32_t __attribute__((ms_abi)) lsw_WriteConsoleW(
     void* h, const uint16_t* buf, uint32_t nchars, uint32_t* written, void* reserved) {
     (void)h; (void)reserved;
+    if (!buf || nchars == 0) { if (written) *written = 0; return 1; }
+    /* Debug: log first 64 chars as narrow for tracing */
+    char dbgbuf[130] = {0};
+    uint32_t dbglen = nchars < 64 ? nchars : 64;
+    for (uint32_t i = 0; i < dbglen; i++)
+        dbgbuf[i] = (buf[i] < 128 && buf[i] >= 32) ? (char)buf[i] : (buf[i] == 10 ? '\n' : '.');
+    dbgbuf[dbglen] = '\0';
+    LSW_LOG_INFO("WriteConsoleW(buf=%p, %u chars): \"%s\"", (void*)buf, nchars, dbgbuf);
     // Simple Latin-1 downcast for console output
     for (uint32_t i = 0; i < nchars; i++) {
         uint16_t c = buf[i];
         if (c < 128) putchar((char)c);
         else putchar('?');
     }
+    fflush(stdout);
     if (written) *written = nchars;
     return 1;
 }
@@ -4804,9 +6511,15 @@ int __attribute__((ms_abi)) lsw_GetHandleInformation(void* h, uint32_t* flags) {
 
 // Process environment block helpers
 void* __attribute__((ms_abi)) lsw_GetCommandLineW(void) {
-    // Return a static empty wide string
-    static uint16_t empty[2] = {0, 0};
-    return (void*)empty;
+    /* Build wide command line as UTF-16LE (uint16_t, NOT wchar_t which is 4 bytes on Linux) */
+    static uint16_t wcmdline[4096];
+    const char* src = lsw_crt_acmdln ? lsw_crt_acmdln : "";
+    size_t i;
+    for (i = 0; src[i] && i < 4095; i++)
+        wcmdline[i] = (uint16_t)(unsigned char)src[i];
+    wcmdline[i] = 0;
+    LSW_LOG_DEBUG("GetCommandLineW() -> '%s'", src);
+    return (void*)wcmdline;
 }
 
 // RtlMoveMemory / RtlFillMemory / RtlZeroMemory (KERNEL32 re-exports of ntdll)
@@ -4873,6 +6586,43 @@ int __attribute__((ms_abi)) lsw_GetModuleHandleExA(uint32_t dwFlags, const char*
     (void)dwFlags;
     if (phModule) *phModule = lsw_LoadLibraryA(lpModuleName);
     return phModule && *phModule ? 1 : 0;
+}
+
+// ---- DLL search order / directory management ----
+// SetDefaultDllDirectories(DWORD DirectoryFlags) — sets DLL search order flags
+// We ignore the flags since we handle DLL loading ourselves
+int __attribute__((ms_abi)) lsw_SetDefaultDllDirectories(uint32_t dwFlags) {
+    (void)dwFlags;
+    LSW_LOG_INFO("SetDefaultDllDirectories(0x%x) called (no-op)", dwFlags);
+    return 1; /* TRUE */
+}
+// AddDllDirectory — adds a directory to the process DLL search path
+void* __attribute__((ms_abi)) lsw_AddDllDirectory(const uint16_t* NewDirectory) {
+    (void)NewDirectory;
+    return (void*)0x1; /* non-NULL cookie */
+}
+// RemoveDllDirectory — removes a directory added by AddDllDirectory
+int __attribute__((ms_abi)) lsw_RemoveDllDirectory(void* Cookie) {
+    (void)Cookie;
+    return 1; /* TRUE */
+}
+// SetDllDirectoryW/A — sets a single extra DLL search directory
+int __attribute__((ms_abi)) lsw_SetDllDirectoryW(const uint16_t* lpPathName) {
+    (void)lpPathName;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetDllDirectoryA(const char* lpPathName) {
+    (void)lpPathName;
+    return 1;
+}
+// GetDllDirectoryW/A — returns the DLL search directory (empty string = default)
+uint32_t __attribute__((ms_abi)) lsw_GetDllDirectoryW(uint32_t nBufferLength, uint16_t* lpBuffer) {
+    if (lpBuffer && nBufferLength > 0) lpBuffer[0] = 0;
+    return 0;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetDllDirectoryA(uint32_t nBufferLength, char* lpBuffer) {
+    if (lpBuffer && nBufferLength > 0) lpBuffer[0] = 0;
+    return 0;
 }
 
 // ---- Heap management ----
@@ -4965,7 +6715,9 @@ int __attribute__((ms_abi)) lsw_CompareStringW(uint32_t Locale, uint32_t dwCmpFl
         r = strcasecmp(s1, s2);
     else
         r = strcmp(s1, s2);
-    return (r < 0) ? 1 : (r == 0) ? 2 : 3; // CSTR_LESS_THAN=1, CSTR_EQUAL=2, CSTR_GREATER_THAN=3
+    int result = (r < 0) ? 1 : (r == 0) ? 2 : 3; // CSTR_LESS_THAN=1, CSTR_EQUAL=2, CSTR_GREATER_THAN=3
+    LSW_LOG_DEBUG("CompareStringW('%s', '%s', flags=0x%x) -> %d", s1, s2, dwCmpFlags, result);
+    return result;
 }
 int __attribute__((ms_abi)) lsw_CompareStringA(uint32_t Locale, uint32_t dwCmpFlags, const char* lpString1, int cchCount1, const char* lpString2, int cchCount2) {
     (void)Locale;
@@ -5586,12 +7338,34 @@ static void createprocess_win_to_linux(const char* wpath, char* out, size_t outs
     /* Windows drive-letter path: C:\... */
     if (wpath[1] == ':' && (wpath[2] == '\\' || wpath[2] == '/')) {
         char drive = (char)tolower((unsigned char)wpath[0]);
-        const char* prefix = getenv("LSW_PREFIX");
-        if (!prefix) prefix = "/root/.lsw/drives";
         char rest[512]; strncpy(rest, wpath + 3, sizeof(rest)-1); rest[sizeof(rest)-1]='\0';
         /* replace backslashes */
         for (char* p = rest; *p; p++) if (*p == '\\') *p = '/';
-        snprintf(out, outsz, "%s/%c/%s", prefix, drive, rest);
+        /* Try candidate prefixes in order of preference:
+         * 1. WSL auto-mount (running under WSL: /mnt/c/...)
+         * 2. LSW_PREFIX environment variable
+         * 3. ~/.lsw/drives (default lsw prefix) */
+        const char* candidates[] = { "/mnt", NULL, NULL, NULL };
+        char env_prefix[512] = {0};
+        const char* lsw_pref = getenv("LSW_PREFIX");
+        if (lsw_pref) { strncpy(env_prefix, lsw_pref, sizeof(env_prefix)-1); candidates[1] = env_prefix; }
+        /* Check ~/.lsw/drives */
+        char home_prefix[512];
+        const char* home = getenv("HOME"); if (!home) home = "/root";
+        snprintf(home_prefix, sizeof(home_prefix), "%s/.lsw/drives", home);
+        candidates[2] = home_prefix;
+        /* Try each candidate, pick first where <prefix>/<drive>/<rest[.exe]> exists */
+        for (int ci = 0; candidates[ci]; ci++) {
+            char try_path[1024];
+            snprintf(try_path, sizeof(try_path), "%s/%c/%s", candidates[ci], drive, rest);
+            if (access(try_path, F_OK) == 0) { strncpy(out, try_path, outsz-1); out[outsz-1]='\0'; return; }
+            /* also try with .exe appended */
+            char try_exe[1024];
+            snprintf(try_exe, sizeof(try_exe), "%s.exe", try_path);
+            if (access(try_exe, F_OK) == 0) { strncpy(out, try_exe, outsz-1); out[outsz-1]='\0'; return; }
+        }
+        /* No candidate found — default to WSL mount */
+        snprintf(out, outsz, "/mnt/%c/%s", drive, rest);
         return;
     }
     /* Relative path — use as-is */
@@ -5707,10 +7481,11 @@ int __attribute__((ms_abi)) lsw_CreateProcessA(
         return 0;
     }
 
-    /* Build argv for pe-loader */
+    /* Build argv for pe-loader: lsw-pe-loader --launch <exe> [args...] */
     char* child_argv[64];
     int ci = 0;
     child_argv[ci++] = loader;
+    child_argv[ci++] = "--launch";
     child_argv[ci++] = exe_linux;
     /* Pass remaining args from lpCommandLine if application name was separate */
     char** extra = NULL; int extra_cnt = 0;
@@ -5720,6 +7495,11 @@ int __attribute__((ms_abi)) lsw_CreateProcessA(
         int start = 0;
         if (extra_cnt > 0 && strcasecmp(extra[0], lpApplicationName) == 0) start = 1;
         for (int i = start; i < extra_cnt && ci < 62; i++)
+            child_argv[ci++] = extra[i];
+    } else if (!lpApplicationName && lpCommandLine) {
+        /* cmdline only: extra args start at index 1 (after exe name) */
+        extra = parse_cmdline(lpCommandLine, &extra_cnt);
+        for (int i = 1; i < extra_cnt && ci < 62; i++)
             child_argv[ci++] = extra[i];
     }
     child_argv[ci] = NULL;
@@ -5769,6 +7549,7 @@ int __attribute__((ms_abi)) lsw_CreateProcessW(
         for (int i = 0; lpCommandLine[i] && i < 4095; i++) cmdA[i] = (char)lpCommandLine[i];
     if (lpCurrentDirectory)
         for (int i = 0; lpCurrentDirectory[i] && i < 1023; i++) cwdA[i] = (char)lpCurrentDirectory[i];
+    LSW_LOG_DEBUG("CreateProcessW: appA='%s' cmdA='%s'", appA[0]?appA:"(null)", cmdA[0]?cmdA:"(null)");
     return lsw_CreateProcessA(
         appA[0] ? appA : NULL,
         cmdA[0] ? cmdA : NULL,
@@ -5946,9 +7727,1931 @@ int __attribute__((ms_abi)) lsw_RemoveDirectoryA(const char* lpPathName) {
 // END Additional KERNEL32 APIs
 // ============================================================================
 
+// ============================================================================
+// SECTION: Missing KERNEL32/ADVAPI32/msvcrt stubs for real-world apps
+// ============================================================================
+
+/* InterlockedIncrement/Decrement/Exchange — atomic ops via GCC builtins */
+long __attribute__((ms_abi)) lsw_InterlockedIncrement(volatile long* Addend) {
+    return __atomic_add_fetch(Addend, 1, __ATOMIC_SEQ_CST);
+}
+long __attribute__((ms_abi)) lsw_InterlockedDecrement(volatile long* Addend) {
+    return __atomic_sub_fetch(Addend, 1, __ATOMIC_SEQ_CST);
+}
+long __attribute__((ms_abi)) lsw_InterlockedExchange(volatile long* Target, long Value) {
+    return __atomic_exchange_n(Target, Value, __ATOMIC_SEQ_CST);
+}
+long __attribute__((ms_abi)) lsw_InterlockedCompareExchange(volatile long* Dest, long Exchange, long Comperand) {
+    __atomic_compare_exchange_n(Dest, &Comperand, Exchange, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return Comperand;
+}
+
+/* GetThreadLocale — return the default locale (English US) */
+uint32_t __attribute__((ms_abi)) lsw_GetThreadLocale(void) {
+    return 0x0409;  /* MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US) */
+}
+
+/* SetThreadUILanguage — when called with 0 (query mode), return current language */
+uint16_t __attribute__((ms_abi)) lsw_SetThreadUILanguage(uint16_t langId) {
+    uint16_t result = langId ? langId : 0x0409; /* 0x0409 = LANG_ENGLISH/SUBLANG_ENGLISH_US */
+    LSW_LOG_DEBUG("SetThreadUILanguage(%u) -> %u", langId, result);
+    return result;
+}
+
+/* GetTimeFormatW — format time as wchar_t string; return a simple stub */
+int __attribute__((ms_abi)) lsw_GetTimeFormatW(uint32_t Locale, uint32_t dwFlags,
+                                                const void* lpTime, const wchar_t* lpFormat,
+                                                wchar_t* lpTimeStr, int cchTime) {
+    (void)Locale; (void)dwFlags; (void)lpTime; (void)lpFormat;
+    if (lpTimeStr && cchTime > 0) {
+        static const wchar_t dummy[] = L"00:00:00";
+        size_t len = sizeof(dummy)/sizeof(dummy[0]);
+        if ((int)len > cchTime) len = (size_t)cchTime;
+        memcpy(lpTimeStr, dummy, len * sizeof(wchar_t));
+        return (int)len;
+    }
+    return 9;
+}
+
+/* FindStringOrdinal — find a substring by ordinal (locale-independent)
+ * Windows strings are UTF-16LE (2 bytes/char); we must use u16* indexing. */
+int __attribute__((ms_abi)) lsw_FindStringOrdinal(uint32_t dwFindStringOrdinalFlags,
+                                                   const wchar_t* lpStringSource, int cchSource,
+                                                   const wchar_t* lpStringValue, int cchValue,
+                                                   int bIgnoreCase) {
+    (void)dwFindStringOrdinalFlags;
+    if (!lpStringSource || !lpStringValue) return -1;
+    const u16* src = (const u16*)lpStringSource;
+    const u16* val = (const u16*)lpStringValue;
+    if (cchSource < 0) cchSource = (int)u16_len(src);
+    if (cchValue  < 0) cchValue  = (int)u16_len(val);
+    LSW_LOG_DEBUG("FindStringOrdinal(flags=%u, cchSrc=%d cchVal=%d ignoreCase=%d)",
+                  dwFindStringOrdinalFlags, cchSource, cchValue, bIgnoreCase);
+    for (int i = 0; i <= cchSource - cchValue; i++) {
+        int match = 1;
+        for (int j = 0; j < cchValue && match; j++) {
+            u16 a = src[i+j];
+            u16 b = val[j];
+            if (bIgnoreCase) {
+                if (a >= 'A' && a <= 'Z') a += 32;
+                if (b >= 'A' && b <= 'Z') b += 32;
+            }
+            if (a != b) match = 0;
+        }
+        if (match) {
+            LSW_LOG_DEBUG("FindStringOrdinal -> %d", i);
+            return i;
+        }
+    }
+    LSW_LOG_DEBUG("FindStringOrdinal -> -1 (not found)");
+    return -1;
+}
+
+/* SetFileApisToOEM — switch file API to OEM charset; stub */
+void __attribute__((ms_abi)) lsw_SetFileApisToOEM(void) {}
+void __attribute__((ms_abi)) lsw_SetFileApisToANSI(void) {}
+
+/* IsProcessorFeaturePresent — return false for all features (safe default) */
+int __attribute__((ms_abi)) lsw_IsProcessorFeaturePresent(uint32_t ProcessorFeature) {
+    (void)ProcessorFeature;
+    return 0;
+}
+
+/* GlobalMemoryStatus — return generous memory figures */
+typedef struct {
+    uint32_t dwLength;
+    uint32_t dwMemoryLoad;
+    uint64_t dwTotalPhys;
+    uint64_t dwAvailPhys;
+    uint64_t dwTotalPageFile;
+    uint64_t dwAvailPageFile;
+    uint64_t dwTotalVirtual;
+    uint64_t dwAvailVirtual;
+} MEMORYSTATUS_LSW;
+
+void __attribute__((ms_abi)) lsw_GlobalMemoryStatus(MEMORYSTATUS_LSW* lpBuffer) {
+    if (!lpBuffer) return;
+    lpBuffer->dwLength       = sizeof(MEMORYSTATUS_LSW);
+    lpBuffer->dwMemoryLoad   = 50;
+    lpBuffer->dwTotalPhys    = 8ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailPhys    = 4ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwTotalPageFile= 16ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailPageFile= 12ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwTotalVirtual = (uint64_t)127 * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailVirtual = (uint64_t)126 * 1024 * 1024 * 1024;
+}
+
+/* GlobalMemoryStatusEx — like GlobalMemoryStatus but 64-bit aware */
+int __attribute__((ms_abi)) lsw_GlobalMemoryStatusEx(MEMORYSTATUS_LSW* lpBuffer) {
+    if (!lpBuffer) return 0;
+    lpBuffer->dwLength       = sizeof(MEMORYSTATUS_LSW);
+    lpBuffer->dwMemoryLoad   = 50;
+    lpBuffer->dwTotalPhys    = 8ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailPhys    = 4ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwTotalPageFile= 16ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailPageFile= 12ULL * 1024 * 1024 * 1024;
+    lpBuffer->dwTotalVirtual = (uint64_t)127 * 1024 * 1024 * 1024;
+    lpBuffer->dwAvailVirtual = (uint64_t)126 * 1024 * 1024 * 1024;
+    return 1;
+}
+
+/* GetLargePageMinimum — large page size (not supported → 0) */
+size_t __attribute__((ms_abi)) lsw_GetLargePageMinimum(void) {
+    return 0;
+}
+
+/* FindFirstStreamW / FindNextStreamW — NTFS streams enumeration (not supported) */
+void* __attribute__((ms_abi)) lsw_FindFirstStreamW(const uint16_t* lpFileName, int InfoLevel,
+                                                     void* lpFindStreamData, uint32_t dwFlags) {
+    (void)lpFileName; (void)InfoLevel; (void)lpFindStreamData; (void)dwFlags;
+    /* SetLastError(ERROR_HANDLE_EOF) — no streams */
+    extern void __attribute__((ms_abi)) lsw_SetLastError(uint32_t);
+    lsw_SetLastError(38); /* ERROR_HANDLE_EOF */
+    return (void*)(uintptr_t)-1; /* INVALID_HANDLE_VALUE */
+}
+int __attribute__((ms_abi)) lsw_FindNextStreamW(void* hFindStream, void* lpFindStreamData) {
+    (void)hFindStream; (void)lpFindStreamData;
+    extern void __attribute__((ms_abi)) lsw_SetLastError(uint32_t);
+    lsw_SetLastError(18); /* ERROR_NO_MORE_FILES */
+    return 0;
+}
+
+/* FileTimeToLocalFileTime — stub: return the same time */
+int __attribute__((ms_abi)) lsw_FileTimeToLocalFileTime(const uint64_t* lpFileTime, uint64_t* lpLocalFileTime) {
+    if (!lpFileTime || !lpLocalFileTime) return 0;
+    *lpLocalFileTime = *lpFileTime;
+    return 1;
+}
+
+/* FileTimeToDosDateTime — convert FILETIME to MS-DOS date/time */
+int __attribute__((ms_abi)) lsw_FileTimeToDosDateTime(const uint64_t* lpFileTime,
+                                                       uint16_t* lpFatDate, uint16_t* lpFatTime) {
+    if (!lpFileTime || !lpFatDate || !lpFatTime) return 0;
+    /* Default: 2000-01-01 00:00:00 */
+    *lpFatDate = (uint16_t)((20 << 9) | (1 << 5) | 1);  /* year=2000-1980=20, month=1, day=1 */
+    *lpFatTime = 0;
+    return 1;
+}
+
+/* CompareFileTime — compare two FILETIME values */
+int __attribute__((ms_abi)) lsw_CompareFileTime(const uint64_t* lpFileTime1, const uint64_t* lpFileTime2) {
+    if (!lpFileTime1 || !lpFileTime2) return 0;
+    if (*lpFileTime1 < *lpFileTime2) return -1;
+    if (*lpFileTime1 > *lpFileTime2) return  1;
+    return 0;
+}
+
+/* MoveFileWithProgressW — move file with optional progress callback */
+int __attribute__((ms_abi)) lsw_MoveFileWithProgressW(const wchar_t* lpExistingFileName,
+                                                       const wchar_t* lpNewFileName,
+                                                       void* lpProgressRoutine,
+                                                       void* lpData, uint32_t dwFlags) {
+    (void)lpProgressRoutine; (void)lpData; (void)dwFlags;
+    if (!lpExistingFileName || !lpNewFileName) return 0;
+    char src[4096], dst[4096];
+    /* Convert wchar_t paths to multibyte */
+    wcstombs(src, lpExistingFileName, sizeof(src));
+    wcstombs(dst, lpNewFileName, sizeof(dst));
+    if (rename(src, dst) == 0) return 1;
+    /* Cross-device: copy then remove */
+    FILE* fs = fopen(src, "rb");
+    if (!fs) return 0;
+    FILE* fd = fopen(dst, "wb");
+    if (!fd) { fclose(fs); return 0; }
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fs)) > 0) fwrite(buf, 1, n, fd);
+    fclose(fs); fclose(fd);
+    unlink(src);
+    return 1;
+}
+
+/* OpenEventW — stub returning a non-null handle */
+void* __attribute__((ms_abi)) lsw_OpenEventW(uint32_t dwDesiredAccess, int bInheritHandle, const wchar_t* lpName) {
+    (void)dwDesiredAccess; (void)bInheritHandle; (void)lpName;
+    return (void*)1;  /* non-null fake handle */
+}
+
+/* ADVAPI32 stubs — GetSidIdentifierAuthority, InitializeSid, LookupPrivilegeDisplayNameW
+   (OpenProcessToken and GetTokenInformation are defined in advapi32_api.c) */
+void* __attribute__((ms_abi)) lsw_GetSidIdentifierAuthority(void* pSid) {
+    /* The SID layout is: Revision(1), SubAuthorityCount(1), IdentifierAuthority[6], ...
+     * Return a pointer directly into the SID's IdentifierAuthority bytes. */
+    if (!pSid) {
+        static uint8_t zero_auth[6] = {0};
+        return zero_auth;
+    }
+    /* IdentifierAuthority starts at byte offset 2 in the SID */
+    return (uint8_t*)pSid + 2;
+}
+
+int __attribute__((ms_abi)) lsw_InitializeSid(void* pSid, void* pIdentifierAuthority, uint8_t nSubAuthorityCount) {
+    (void)pSid; (void)pIdentifierAuthority; (void)nSubAuthorityCount;
+    return 1;
+}
+
+int __attribute__((ms_abi)) lsw_LookupPrivilegeDisplayNameW(const wchar_t* lpSystemName, const wchar_t* lpName,
+                                                              wchar_t* lpDisplayName, uint32_t* cchDisplayName,
+                                                              uint32_t* lpLanguageId);
+/* implemented in advapi32_api.c */
+
+// ============================================================================
+// SECTION: Additional stubs for whoami.exe / real Windows apps
+// ============================================================================
+
+/*
+ * _vsnwprintf — Windows-ABI wide-char printf into a UTF-16LE buffer.
+ *
+ * We cannot use Linux vswprintf() here because:
+ *  1. Linux wchar_t = 4 bytes, Windows wchar_t = 2 bytes (UTF-16LE)
+ *  2. The fmt string and all %s args are 2-byte UTF-16LE pointers
+ *  3. args is a Windows va_list (plain char* to first variadic arg on stack),
+ *     not a SysV struct va_list
+ *
+ * This implementation parses the UTF-16LE format string directly and reads
+ * args using the Windows va_list convention (each arg is 8 bytes aligned).
+ */
+int __attribute__((ms_abi)) lsw__vsnwprintf(wchar_t* buf_w, size_t count, const wchar_t* fmt_w, char* ap_in) {
+    if (!buf_w || count == 0 || !fmt_w) return -1;
+
+    uint16_t* out = (uint16_t*)buf_w;
+    const uint16_t* f = (const uint16_t*)fmt_w;
+    size_t n = 0;
+    const char* ap = ap_in; /* Windows va_list: ptr to arg area */
+
+#define W_PUT(c)  do { if (n < count - 1) out[n++] = (uint16_t)(c); } while (0)
+
+    while (*f) {
+        if (*f != '%') { W_PUT(*f++); continue; }
+        f++; /* skip '%' */
+
+        /* flags */
+        int flag_minus = 0, flag_zero = 0;
+        for (;;) {
+            if (*f == '-') { flag_minus = 1; f++; }
+            else if (*f == '0') { flag_zero = 1; f++; }
+            else if (*f == '+' || *f == ' ' || *f == '#' || *f == 'F') { f++; } /* F = Windows flag, skip */
+            else break;
+        }
+        /* width */
+        int width = 0;
+        if (*f == '*') { width = *(int*)ap; ap += 8; if (width < 0) { flag_minus = 1; width = -width; } f++; }
+        else { while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; } }
+        /* precision */
+        int prec = -1;
+        if (*f == '.') {
+            f++; prec = 0;
+            if (*f == '*') { prec = *(int*)ap; ap += 8; if (prec < 0) prec = 0; f++; }
+            else { while (*f >= '0' && *f <= '9') { prec = prec * 10 + (*f - '0'); f++; } }
+        }
+        /* length modifier — track 64-bit ('ll', 'I64', 'I' for Windows %Id) */
+        int size64 = 0;
+        if (*f == 'l' && *(f+1) == 'l') { size64 = 1; f += 2; }
+        else if (*f == 'I' && *(f+1) == '6' && *(f+2) == '4') { size64 = 1; f += 3; }
+        else { while (*f == 'l' || *f == 'h' || *f == 'L' || *f == 'z' || *f == 'I' || *f == 'w' || *f == 'F') f++; } /* w/F = Windows modifiers */
+
+        char spec = (char)*f++;
+        switch (spec) {
+        case '%':
+            W_PUT('%');
+            break;
+        case 's': {
+            /* %s in Windows wprintf = wide (UTF-16LE) string */
+            const uint16_t* s = *(const uint16_t**)ap; ap += 8;
+            if (!s) s = (const uint16_t*)L"(null)"; /* safe fallback */
+            int slen = 0; for (const uint16_t* p = s; *p; p++) slen++;
+            if (prec >= 0 && slen > prec) slen = prec;
+            int pad = width - slen;
+            if (!flag_minus) while (pad-- > 0) W_PUT(' ');
+            for (int i = 0; i < slen; i++) W_PUT(s[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'S': {
+            /* %S in Windows wprintf = narrow (char) string */
+            const char* s = *(const char**)ap; ap += 8;
+            if (!s) s = "(null)";
+            int slen = (int)strlen(s);
+            if (prec >= 0 && slen > prec) slen = prec;
+            int pad = width - slen;
+            if (!flag_minus) while (pad-- > 0) W_PUT(' ');
+            for (int i = 0; i < slen; i++) W_PUT((unsigned char)s[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'c': {
+            unsigned int c = *(unsigned int*)ap; ap += 8;
+            W_PUT(c);
+            break;
+        }
+        case 'd': case 'i': {
+            long long v = size64 ? *(long long*)ap : (long long)(*(int*)ap); ap += 8;
+            char tmp[32]; int tlen = snprintf(tmp, sizeof(tmp), size64 ? "%lld" : "%d", size64 ? v : (int)v);
+            int pad = width - tlen;
+            char fc = (flag_zero && !flag_minus) ? '0' : ' ';
+            if (!flag_minus) while (pad-- > 0) W_PUT(fc);
+            for (int i = 0; i < tlen; i++) W_PUT((unsigned char)tmp[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'u': {
+            unsigned long long v = size64 ? *(unsigned long long*)ap : (unsigned long long)(*(unsigned int*)ap); ap += 8;
+            char tmp[32]; int tlen = snprintf(tmp, sizeof(tmp), size64 ? "%llu" : "%u", size64 ? v : (unsigned int)v);
+            int pad = width - tlen;
+            char fc = (flag_zero && !flag_minus) ? '0' : ' ';
+            if (!flag_minus) while (pad-- > 0) W_PUT(fc);
+            for (int i = 0; i < tlen; i++) W_PUT((unsigned char)tmp[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'x': case 'X': {
+            unsigned long long v = size64 ? *(unsigned long long*)ap : (unsigned long long)(*(unsigned int*)ap); ap += 8;
+            char tmp[32];
+            int tlen;
+            if (size64) tlen = snprintf(tmp, sizeof(tmp), spec == 'x' ? "%llx" : "%llX", v);
+            else        tlen = snprintf(tmp, sizeof(tmp), spec == 'x' ? "%x"   : "%X",   (unsigned int)v);
+            int pad = width - tlen;
+            char fc = (flag_zero && !flag_minus) ? '0' : ' ';
+            if (!flag_minus) while (pad-- > 0) W_PUT(fc);
+            for (int i = 0; i < tlen; i++) W_PUT((unsigned char)tmp[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'o': {
+            unsigned long long v = size64 ? *(unsigned long long*)ap : (unsigned long long)(*(unsigned int*)ap); ap += 8;
+            char tmp[32]; int tlen = snprintf(tmp, sizeof(tmp), size64 ? "%llo" : "%o", size64 ? v : (unsigned int)v);
+            int pad = width - tlen;
+            if (!flag_minus) while (pad-- > 0) W_PUT(' ');
+            for (int i = 0; i < tlen; i++) W_PUT((unsigned char)tmp[i]);
+            if (flag_minus)  while (pad-- > 0) W_PUT(' ');
+            break;
+        }
+        case 'p': {
+            void* v = *(void**)ap; ap += 8;
+            char tmp[32]; int tlen = snprintf(tmp, sizeof(tmp), "%p", v);
+            for (int i = 0; i < tlen; i++) W_PUT((unsigned char)tmp[i]);
+            break;
+        }
+        default:
+            /* Unknown specifier — pass through */
+            W_PUT('%'); W_PUT(spec);
+            break;
+        }
+    }
+#undef W_PUT
+    out[n] = 0;
+    return (int)n;
+}
+
+/* _ultow — convert unsigned long to wchar_t (UTF-16LE) string
+ * NOTE: Host swprintf uses 4-byte wchar_t (Linux UTF-32), but Windows callers
+ * expect 2-byte UTF-16LE.  We must write uint16_t digits manually. */
+wchar_t* __attribute__((ms_abi)) lsw__ultow(unsigned long val, wchar_t* str, int radix) {
+    if (!str) return NULL;
+    if (radix < 2 || radix > 36) { ((uint16_t*)str)[0] = 0; return str; }
+    uint16_t* s = (uint16_t*)str;
+    uint16_t  tmp[64];
+    int n = 0;
+    unsigned long v = val;
+    if (v == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (v > 0) {
+            unsigned int d = (unsigned int)(v % (unsigned long)radix);
+            tmp[n++] = (uint16_t)(d < 10 ? '0' + d : 'a' + d - 10);
+            v /= (unsigned long)radix;
+        }
+    }
+    for (int i = 0; i < n; i++) s[i] = tmp[n - 1 - i];
+    s[n] = 0;
+    return str;
+}
+
+/* _memicmp — case-insensitive memcmp */
+int __attribute__((ms_abi)) lsw__memicmp(const void* s1, const void* s2, size_t n) {
+    const unsigned char* p1 = (const unsigned char*)s1;
+    const unsigned char* p2 = (const unsigned char*)s2;
+    for (size_t i = 0; i < n; i++) {
+        int c = tolower(p1[i]) - tolower(p2[i]);
+        if (c != 0) return c;
+    }
+    return 0;
+}
+
+/* _callnewh — called by operator new on allocation failure; return 0 = rethrow */
+int __attribute__((ms_abi)) lsw__callnewh(size_t size) {
+    (void)size;
+    return 0;
+}
+
+/* operator delete(void*) — ??3@YAXPEAX@Z */
+void __attribute__((ms_abi)) lsw_operator_delete(void* p) {
+    free(p);
+}
+
+/* C++ exception class stubs — these are normally provided by the C++ runtime */
+void __attribute__((ms_abi)) lsw_exception_ctor_cstr(void* self, const char* msg) {
+    (void)self; (void)msg;
+}
+void __attribute__((ms_abi)) lsw_exception_ctor_cstr_h(void* self, const char* msg, int h) {
+    (void)self; (void)msg; (void)h;
+}
+void __attribute__((ms_abi)) lsw_exception_copy_ctor(void* self, const void* other) {
+    (void)self; (void)other;
+}
+void __attribute__((ms_abi)) lsw_exception_dtor(void* self) {
+    (void)self;
+}
+const char* __attribute__((ms_abi)) lsw_exception_what(const void* self) {
+    (void)self;
+    return "exception";
+}
+
+/* ntdll stubs needed by whoami */
+int __attribute__((ms_abi)) lsw_RtlVerifyVersionInfo(void* VersionInfo, uint32_t TypeMask, uint64_t ConditionMask) {
+    (void)VersionInfo; (void)TypeMask; (void)ConditionMask;
+    return 0; /* STATUS_SUCCESS */
+}
+uint64_t __attribute__((ms_abi)) lsw_VerSetConditionMask(uint64_t ConditionMask, uint32_t TypeMask, uint8_t Condition) {
+    (void)TypeMask; (void)Condition;
+    return ConditionMask;
+}
+int __attribute__((ms_abi)) lsw_RtlVirtualUnwind(uint32_t HandlerType, uint64_t ImageBase, uint64_t ControlPc,
+                                                   void* FunctionEntry, void* ContextRecord, void** HandlerData,
+                                                   uint64_t* EstablisherFrame, void* ContextPointers) {
+    (void)HandlerType; (void)ImageBase; (void)ControlPc; (void)FunctionEntry;
+    (void)ContextRecord; (void)HandlerData; (void)EstablisherFrame; (void)ContextPointers;
+    return 0;
+}
+
+/* ----------------------------------------------------------------
+ * SECTION: New stubs for hostname, ipconfig, and broader app compat
+ * ---------------------------------------------------------------- */
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <arpa/inet.h>
+
+/* --- msvcrt: _write(fd, buf, n) — low-level fd write --- */
+int __attribute__((ms_abi)) lsw__write(int fd, const void* buf, unsigned int count) {
+    ssize_t r = write(fd, buf, count);
+    return (r < 0) ? -1 : (int)r;
+}
+/* --- msvcrt: _setmode(fd, mode) — set text/binary mode (no-op on Linux) --- */
+int __attribute__((ms_abi)) lsw__setmode(int fd, int mode) {
+    (void)fd; (void)mode;
+    return 0; /* O_BINARY */
+}
+/* --- msvcrt: setlocale(cat, locale) --- */
+char* __attribute__((ms_abi)) lsw_setlocale(int cat, const char* locale) {
+    return setlocale(cat, locale);
+}
+/* --- msvcrt: fgetpos(stream, pos) --- */
+int __attribute__((ms_abi)) lsw_fgetpos(FILE* stream, fpos_t* pos) {
+    return fgetpos(stream, pos);
+}
+/* --- msvcrt: _vscwprintf(fmt, ap) — count wide chars that would be written --- */
+int __attribute__((ms_abi)) lsw__vscwprintf(const wchar_t* fmt_w, char* ap) {
+    /* Delegate to our _vsnwprintf with a null buffer trick (count=max, discard) */
+    static uint16_t _discard[4096];
+    return lsw__vsnwprintf((wchar_t*)_discard, sizeof(_discard)/sizeof(_discard[0]), fmt_w, ap);
+}
+/* --- msvcrt: vswprintf_s(buf, count, fmt, ap) --- */
+int __attribute__((ms_abi)) lsw_vswprintf_s(wchar_t* buf, size_t count, const wchar_t* fmt, char* ap) {
+    return lsw__vsnwprintf(buf, count, fmt, ap);
+}
+/* --- msvcrt: _wcsrev(str) — reverse UTF-16LE string in-place --- */
+wchar_t* __attribute__((ms_abi)) lsw__wcsrev(wchar_t* str) {
+    if (!str) return str;
+    uint16_t* s = (uint16_t*)str;
+    int len = 0;
+    while (s[len]) len++;
+    for (int i = 0, j = len - 1; i < j; i++, j--) {
+        uint16_t tmp = s[i]; s[i] = s[j]; s[j] = tmp;
+    }
+    return str;
+}
+
+/* --- Helper: convert ASCII C string to UTF-16LE into a buffer, returns char count --- */
+static int lsw_ascii_to_u16(const char* src, uint16_t* dst, int maxchars) {
+    int n = 0;
+    while (*src && n < maxchars - 1) dst[n++] = (uint16_t)(unsigned char)*src++;
+    if (n < maxchars) dst[n] = 0;
+    return n;
+}
+
+/* --- WS2_32: GetHostNameW(name, namelen) — wide version of gethostname --- */
+int __attribute__((ms_abi)) lsw_GetHostNameW(wchar_t* name, int namelen) {
+    if (!name || namelen <= 0) return -1; /* SOCKET_ERROR */
+    char host[256] = {0};
+    if (gethostname(host, sizeof(host)) != 0) return -1;
+    lsw_ascii_to_u16(host, (uint16_t*)name, namelen);
+    return 0;
+}
+/* --- WS2_32: InetNtopW(af, src, dst, size) — convert binary IP to wide string --- */
+const wchar_t* __attribute__((ms_abi)) lsw_InetNtopW(int af, const void* src, wchar_t* dst, size_t size) {
+    if (!dst || size == 0) return NULL;
+    char tmp[INET6_ADDRSTRLEN] = {0};
+    if (!inet_ntop(af, src, tmp, sizeof(tmp))) return NULL;
+    lsw_ascii_to_u16(tmp, (uint16_t*)dst, (int)size);
+    return dst;
+}
+
+/* --- KERNEL32: GetComputerNameExW(class, buf, size) --- */
+/* NOTE: implementations are in advapi32_api.c */
+extern int __attribute__((ms_abi)) lsw_GetComputerNameW(wchar_t* buf, uint32_t* size);
+extern int __attribute__((ms_abi)) lsw_GetComputerNameA(char* buf, uint32_t* size);
+extern int __attribute__((ms_abi)) lsw_GetComputerNameExW(int class_, wchar_t* buf, uint32_t* size);
+extern int32_t __attribute__((ms_abi)) lsw_RegOpenKeyExW(void* hKey, void* lpSubKey, uint32_t ulOptions, uint32_t samDesired, void** phkResult);
+
+/* --- KERNEL32: GetDateFormatW(locale, flags, date, fmt, datestr, cnt) --- */
+int __attribute__((ms_abi)) lsw_GetDateFormatW(uint32_t locale, uint32_t flags, const void* date,
+                                                 const wchar_t* fmt, wchar_t* datestr, int cnt) {
+    (void)locale; (void)flags; (void)date; (void)fmt;
+    /* Return a simple placeholder date */
+    const char* placeholder = "2026-01-01";
+    if (!datestr || cnt <= 0) return (int)(strlen(placeholder) + 1);
+    lsw_ascii_to_u16(placeholder, (uint16_t*)datestr, cnt);
+    return (int)(strlen(placeholder) + 1);
+}
+
+/* --- KERNEL32: RtlCaptureContext, RtlLookupFunctionEntry --- */
+/* NOTE: implementations are in ntdll_api.c — just need KERNEL32 alias mappings */
+extern void __attribute__((ms_abi)) lsw_RtlCaptureContext(void* ContextRecord);
+extern void* __attribute__((ms_abi)) lsw_RtlLookupFunctionEntry(uint64_t pc, uint64_t* imagebase, void* history);
+
+/* --- IPHLPAPI stubs moved to misc_api.c --- */
+
+/* GetAdaptersAddresses — real implementation using getifaddrs() */
+uint32_t __attribute__((ms_abi)) lsw_GetAdaptersAddresses_real(uint32_t Family, uint32_t Flags,
+                                                                  void* Reserved, uint8_t* AdapterAddresses,
+                                                                  uint32_t* SizePointer) {
+    (void)Flags; (void)Reserved;
+    /* Windows IP_ADAPTER_ADDRESSES struct is complex; we build a minimal subset.
+     * The minimal layout for the first fixed fields (x64):
+     *   +0    ULONG Length (4 bytes)
+     *   +4    DWORD IfIndex (4 bytes)
+     *   +8    PSIP_ADAPTER_ADDRESSES Next (8 bytes)
+     *   +16   PCHAR AdapterName (8 bytes) -- ASCII GUID-style name
+     *   +24   PIP_ADAPTER_UNICAST_ADDRESS FirstUnicastAddress (8 bytes)
+     *   +32   ... many more fields we'll fill with 0
+     *   Structure size we'll use: 448 bytes (Windows SDK value)
+     */
+#define LSW_AA_SIZE 448
+#define LSW_MAX_ADAPTERS 8
+
+    struct ifaddrs* ifa_head = NULL;
+    if (getifaddrs(&ifa_head) != 0) {
+        if (SizePointer) *SizePointer = 0;
+        return 0; /* NO_ERROR but empty */
+    }
+
+    /* Count unique interface names (excluding loopback if Family == AF_INET only) */
+    char seen[LSW_MAX_ADAPTERS][IF_NAMESIZE];
+    int nif = 0;
+    for (struct ifaddrs* p = ifa_head; p && nif < LSW_MAX_ADAPTERS; p = p->ifa_next) {
+        if (!p->ifa_name || !p->ifa_addr) continue;
+        if (p->ifa_addr->sa_family != AF_INET && p->ifa_addr->sa_family != AF_INET6) continue;
+        if (Family == 2 /* AF_INET */ && p->ifa_addr->sa_family != AF_INET) continue;
+        if (Family == 23 /* AF_INET6 */ && p->ifa_addr->sa_family != AF_INET6) continue;
+        int found = 0;
+        for (int i = 0; i < nif; i++) if (strcmp(seen[i], p->ifa_name) == 0) { found = 1; break; }
+        if (!found) { strncpy(seen[nif++], p->ifa_name, IF_NAMESIZE-1); }
+    }
+
+    /* Each adapter: LSW_AA_SIZE bytes + adapter name string */
+    uint32_t needed = (uint32_t)(nif * (LSW_AA_SIZE + 64));
+    if (!AdapterAddresses || (SizePointer && *SizePointer < needed)) {
+        if (SizePointer) *SizePointer = needed;
+        freeifaddrs(ifa_head);
+        return 111; /* ERROR_BUFFER_OVERFLOW */
+    }
+    if (SizePointer) *SizePointer = needed;
+    memset(AdapterAddresses, 0, needed);
+
+    uint8_t* cur = AdapterAddresses;
+    for (int i = 0; i < nif; i++) {
+        uint8_t* next = (i < nif-1) ? (cur + LSW_AA_SIZE + 64) : NULL;
+        /* Length */
+        *(uint32_t*)(cur + 0) = LSW_AA_SIZE;
+        /* IfIndex: use if_nametoindex */
+        *(uint32_t*)(cur + 4) = (uint32_t)if_nametoindex(seen[i]);
+        /* Next pointer */
+        *(uint64_t*)(cur + 8) = (uint64_t)(uintptr_t)next;
+        /* AdapterName (ASCII): placed after the struct */
+        char* namearea = (char*)(cur + LSW_AA_SIZE);
+        strncpy(namearea, seen[i], 63);
+        *(uint64_t*)(cur + 16) = (uint64_t)(uintptr_t)namearea;
+        /* FriendlyName (wide): reuse namearea+64 - not strictly needed but helps */
+        cur = cur + LSW_AA_SIZE + 64;
+    }
+    freeifaddrs(ifa_head);
+    return 0; /* NO_ERROR */
+}
+#undef LSW_AA_SIZE
+#undef LSW_MAX_ADAPTERS
+
+/* MSWSOCK stubs */
+int __attribute__((ms_abi)) lsw_GetSocketErrorMessageW(uint32_t code, wchar_t* buf, uint32_t len) {
+    (void)code; if (buf && len) { ((uint16_t*)buf)[0] = 0; } return 0;
+}
+
+/* USER32 stubs */
+
+/* ---- LoadStringW with MUI file fallback ---- *
+ * Windows system executables store all strings in a side-by-side MUI file.
+ * Path convention: <exe_dir>/en-US/<exe_name>.mui
+ *
+ * RT_STRING resource layout (type 6):
+ *   - Resources stored in blocks of 16 strings per group node
+ *   - Group ID = (stringID / 16) + 1
+ *   - Within the group: uint16_t length followed by <length> UTF-16LE code units
+ *     (NO null terminator; length==0 means empty/absent string)
+ */
+
+/* Helper: parse a PE32 or PE32+ file already mmap'd at `data`, find the
+ * RT_STRING resource directory, then locate and copy string uID to lpBuffer.
+ * lpBuffer is treated as a uint16_t array (Windows UTF-16, 2 bytes/char).
+ * Returns char count (not including null) on success, 0 on failure.
+ */
+static int lsw_pe_load_string_from_image(const uint8_t* data, size_t data_len,
+                                          uint32_t uID, uint16_t* lpBuffer, int cchMax) {
+    if (data_len < 0x40) return 0;
+    /* DOS header: e_magic at 0, e_lfanew at 0x3c */
+    if (data[0] != 'M' || data[1] != 'Z') return 0;
+    uint32_t pe_off = *(uint32_t*)(data + 0x3c);
+    if (pe_off + 4 > data_len) return 0;
+    if (memcmp(data + pe_off, "PE\0\0", 4) != 0) return 0;
+    /* COFF header immediately follows "PE\0\0" */
+    const uint8_t* coff = data + pe_off + 4;  /* machine, numSections, ... */
+    uint16_t machine = *(uint16_t*)coff;       /* 0x8664 = x64, 0x14c = i386 */
+    uint16_t num_sections = *(uint16_t*)(coff + 2);
+    uint16_t opt_size     = *(uint16_t*)(coff + 16);
+    const uint8_t* opt    = coff + 20;         /* start of optional header */
+    if (opt + 2 > data + data_len) return 0;
+    uint16_t magic = *(uint16_t*)opt;
+    int is64 = (magic == 0x20b);               /* 0x10b = PE32, 0x20b = PE32+ */
+    /* Offset of data directories from start of optional header:
+     *   PE32:  96  (ImageBase=4B, then DWORD stack/heap values)
+     *   PE32+: 112 (ImageBase=8B, then QWORD stack/heap values)
+     */
+    uint32_t dd_off  = is64 ? 112 : 96;
+    uint32_t rsrc_rva  = 0, rsrc_size_bytes = 0;
+    if (opt + dd_off + 8*3 > data + data_len) return 0; /* need at least first 3 DDs */
+    /* Data directory [2] is the resource directory */
+    rsrc_rva        = *(uint32_t*)(opt + dd_off + 8*2);
+    rsrc_size_bytes = *(uint32_t*)(opt + dd_off + 8*2 + 4);
+    if (!rsrc_rva || !rsrc_size_bytes) return 0;
+
+    /* Section table starts after optional header */
+    const uint8_t* sections = coff + 20 + opt_size;
+    /* Find the section that contains rsrc_rva */
+    uint32_t rsrc_raw_off = 0;
+    for (int s = 0; s < num_sections; s++) {
+        const uint8_t* sec = sections + s * 40;
+        uint32_t vaddr     = *(uint32_t*)(sec + 12);
+        uint32_t vsize     = *(uint32_t*)(sec + 16);
+        uint32_t raw_off   = *(uint32_t*)(sec + 20);
+        if (rsrc_rva >= vaddr && rsrc_rva < vaddr + vsize) {
+            rsrc_raw_off = raw_off + (rsrc_rva - vaddr);
+            break;
+        }
+    }
+    if (!rsrc_raw_off || rsrc_raw_off + rsrc_size_bytes > data_len) return 0;
+
+    const uint8_t* rsrc_base = data + rsrc_raw_off;  /* raw data at resource directory */
+
+    /* Resource directory entry layout (8 bytes):
+     *   DWORD NameOrID    (high bit set = named, else ID)
+     *   DWORD OffsetToData (high bit set = subdirectory offset, else leaf RVA)
+     */
+    /* Level 1: find RT_STRING (type ID = 6) */
+    uint16_t root_named  = *(uint16_t*)(rsrc_base + 12);
+    uint16_t root_id     = *(uint16_t*)(rsrc_base + 14);
+    uint32_t total_root  = root_named + root_id;
+    uint32_t rt_string_off = 0;
+    for (uint32_t i = 0; i < total_root; i++) {
+        const uint8_t* entry = rsrc_base + 16 + i * 8;
+        uint32_t id  = *(uint32_t*)entry;
+        uint32_t off = *(uint32_t*)(entry + 4);
+        if ((id & 0x80000000) == 0 && id == 6) {  /* RT_STRING = 6, not named */
+            if (off & 0x80000000) rt_string_off = off & 0x7FFFFFFF;
+            break;
+        }
+    }
+    if (!rt_string_off) return 0;
+
+    /* Level 2: find group (gid = uID/16 + 1) */
+    uint32_t gid = (uID / 16) + 1;
+    const uint8_t* l2 = rsrc_base + rt_string_off;
+    uint16_t l2_named  = *(uint16_t*)(l2 + 12);
+    uint16_t l2_id     = *(uint16_t*)(l2 + 14);
+    uint32_t total_l2  = l2_named + l2_id;
+    uint32_t group_off = 0;
+    for (uint32_t i = 0; i < total_l2; i++) {
+        const uint8_t* entry = l2 + 16 + i * 8;
+        uint32_t id  = *(uint32_t*)entry;
+        uint32_t off = *(uint32_t*)(entry + 4);
+        if ((id & 0x80000000) == 0 && id == gid) {
+            if (off & 0x80000000) group_off = off & 0x7FFFFFFF;
+            break;
+        }
+    }
+    if (!group_off) return 0;
+
+    /* Level 3: first (only) language entry — gives us the leaf data entry */
+    const uint8_t* l3 = rsrc_base + group_off;
+    if (*(uint16_t*)(l3 + 12) + *(uint16_t*)(l3 + 14) == 0) return 0;
+    /* The level-3 directory entry OffsetToData points (high bit CLEAR) to
+     * an IMAGE_RESOURCE_DATA_ENTRY: [DataRVA(4)][Size(4)][CodePage(4)][Reserved(4)] */
+    const uint8_t* l3_entry  = l3 + 16;
+    uint32_t leaf_de_off = *(uint32_t*)(l3_entry + 4);  /* OffsetToData → offset to DATA_ENTRY */
+    const uint8_t* de    = rsrc_base + leaf_de_off;
+    uint32_t data_rva  = *(uint32_t*)(de + 0);
+    uint32_t data_size = *(uint32_t*)(de + 4);
+    /* Convert RVA to raw offset */
+    uint32_t data_raw = 0;
+    for (int s = 0; s < num_sections; s++) {
+        const uint8_t* sec = sections + s * 40;
+        uint32_t vaddr   = *(uint32_t*)(sec + 12);
+        uint32_t vsize   = *(uint32_t*)(sec + 16);
+        uint32_t raw_off = *(uint32_t*)(sec + 20);
+        if (data_rva >= vaddr && data_rva < vaddr + vsize) {
+            data_raw = raw_off + (data_rva - vaddr);
+            break;
+        }
+    }
+    if (!data_raw || data_raw + data_size > data_len) return 0;
+
+    /* Walk the string block to find index (uID % 16) */
+    const uint8_t* p   = data + data_raw;
+    const uint8_t* end = p + data_size;
+    uint32_t idx = uID % 16;
+    for (uint32_t i = 0; i < 16 && p + 2 <= end; i++) {
+        uint16_t len = *(uint16_t*)p;
+        p += 2;
+        if (i == idx) {
+            if (len == 0) return 0;  /* empty string */
+            int copy = (int)len < (cchMax - 1) ? (int)len : (cchMax - 1);
+            memcpy(lpBuffer, p, copy * sizeof(uint16_t));
+            lpBuffer[copy] = 0;   /* null-terminate as uint16_t (2 bytes) */
+            return copy;
+        }
+        p += len * 2;  /* skip UTF-16 chars */
+    }
+    return 0;
+    (void)machine; /* suppress unused warning for non-64-bit paths */
+}
+
+/* Build MUI path: /path/to/foo.exe → /path/to/en-US/foo.exe.mui */
+static void lsw_build_mui_path(const char* exe_path, char* mui_out, size_t mui_sz) {
+    /* Find last '/' */
+    const char* slash = strrchr(exe_path, '/');
+    const char* base  = slash ? slash + 1 : exe_path;
+    size_t dir_len    = slash ? (size_t)(slash - exe_path) : 0;
+    if (dir_len + strlen("/en-US/") + strlen(base) + strlen(".mui") + 1 > mui_sz) {
+        mui_out[0] = '\0';
+        return;
+    }
+    if (dir_len > 0) {
+        memcpy(mui_out, exe_path, dir_len);
+        mui_out[dir_len] = '\0';
+    } else {
+        mui_out[0] = '.';
+        mui_out[1] = '\0';
+    }
+    strcat(mui_out, "/en-US/");
+    strcat(mui_out, base);
+    strcat(mui_out, ".mui");
+}
+
+/* Cached MUI data */
+static uint8_t* g_mui_data    = NULL;
+static size_t   g_mui_data_len = 0;
+
+int __attribute__((ms_abi)) lsw_LoadStringW(void* hInstance, uint32_t uID, uint16_t* lpBuffer, int cchBufferMax) {
+    (void)hInstance;
+    LSW_LOG_DEBUG("LoadStringW(hInst=%p, uID=%u, buf=%p, max=%d)", hInstance, uID, (void*)lpBuffer, cchBufferMax);
+    if (!lpBuffer || cchBufferMax <= 0) return 0;
+    lpBuffer[0] = 0;
+
+    /* Lazy-load and cache the MUI file */
+    if (!g_mui_data && g_lsw_exe_path[0]) {
+        char mui_path[4200];
+        lsw_build_mui_path(g_lsw_exe_path, mui_path, sizeof(mui_path));
+        LSW_LOG_INFO("LoadStringW: trying MUI file: %s", mui_path);
+        int fd = open(mui_path, O_RDONLY);
+        if (fd >= 0) {
+            off_t fsz = lseek(fd, 0, SEEK_END);
+            lseek(fd, 0, SEEK_SET);
+            if (fsz > 0) {
+                g_mui_data = malloc((size_t)fsz);
+                if (g_mui_data) {
+                    ssize_t rd = read(fd, g_mui_data, (size_t)fsz);
+                    if (rd > 0) {
+                        g_mui_data_len = (size_t)rd;
+                        LSW_LOG_INFO("LoadStringW: loaded MUI (%zu bytes)", g_mui_data_len);
+                    } else {
+                        free(g_mui_data); g_mui_data = NULL;
+                    }
+                }
+            }
+            close(fd);
+        } else {
+            LSW_LOG_WARN("LoadStringW: MUI file not found: %s", mui_path);
+        }
+    }
+
+    /* Also try the main EXE's resources (in case strings are embedded) */
+    if (!g_mui_data && g_lsw_exe_path[0]) {
+        LSW_LOG_DEBUG("LoadStringW: no MUI, trying main EXE resources");
+        int fd = open(g_lsw_exe_path, O_RDONLY);
+        if (fd >= 0) {
+            off_t fsz = lseek(fd, 0, SEEK_END);
+            lseek(fd, 0, SEEK_SET);
+            if (fsz > 0) {
+                uint8_t* tmp = malloc((size_t)fsz);
+                if (tmp) {
+                    ssize_t rd = read(fd, tmp, (size_t)fsz);
+                    if (rd > 0) {
+                        int r = lsw_pe_load_string_from_image(tmp, (size_t)rd, uID, lpBuffer, cchBufferMax);
+                        free(tmp);
+                        close(fd);
+                        if (r > 0) {
+                            LSW_LOG_DEBUG("LoadStringW: uID=%u found in main EXE (%d chars)", uID, r);
+                            return r;
+                        }
+                        goto not_found;
+                    }
+                    free(tmp);
+                }
+            }
+            close(fd);
+        }
+    }
+
+    if (g_mui_data && g_mui_data_len > 0) {
+        int r = lsw_pe_load_string_from_image(g_mui_data, g_mui_data_len, uID, lpBuffer, cchBufferMax);
+        if (r > 0) {
+            char narrow[256] = {0};
+            int  nc = r < 127 ? r : 127;
+            for (int i = 0; i < nc; i++) narrow[i] = (lpBuffer[i] < 128) ? (char)lpBuffer[i] : '?';
+            LSW_LOG_DEBUG("LoadStringW: uID=%u buf=%p -> \"%s\" (%d chars)", uID, (void*)lpBuffer, narrow, r);
+            return r;
+        }
+    }
+
+not_found:
+    LSW_LOG_DEBUG("LoadStringW: uID=%u not found", uID);
+    return 0;
+}
+wchar_t* __attribute__((ms_abi)) lsw_CharLowerW(wchar_t* lpsz) {
+    if (!lpsz) return NULL;
+    for (u16* p = (u16*)lpsz; *p; p++) *p = (u16)towlower(*p);
+    return lpsz;
+}
+wchar_t* __attribute__((ms_abi)) lsw_CharUpperW(wchar_t* lpsz) {
+    if (!lpsz) return NULL;
+    for (u16* p = (u16*)lpsz; *p; p++) *p = (u16)towupper(*p);
+    return lpsz;
+}
+
+/* SspiCli stubs */
+int __attribute__((ms_abi)) lsw_GetUserNameExW(int NameFormat, wchar_t* lpNameBuffer, uint32_t* nSize) {
+    struct passwd* pw = getpwuid(getuid());
+    const char* user = pw ? pw->pw_name : "user";
+    char full[256];
+    /* NameSamCompatible (2) returns "DOMAIN\user" */
+    if (NameFormat == 2)
+        snprintf(full, sizeof(full), "LSW\\%s", user);
+    else
+        snprintf(full, sizeof(full), "%s", user);
+    uint32_t len = (uint32_t)strlen(full);
+    LSW_LOG_DEBUG("GetUserNameExW(fmt=%d) -> \"%s\"", NameFormat, full);
+    if (!nSize) return 0;
+    if (*nSize < len + 1) {
+        *nSize = len + 1;
+        lsw_SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+    if (lpNameBuffer) {
+        for (uint32_t i = 0; i <= len; i++)
+            lpNameBuffer[i] = (uint16_t)(unsigned char)full[i];
+    }
+    *nSize = len;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_LsaConnectUntrusted(void** LsaHandle) {
+    if (LsaHandle) *LsaHandle = (void*)(uintptr_t)0xBEEF2;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_LsaCallAuthenticationPackage(void* LsaHandle, uint32_t AuthPackage,
+                                                               void* ProtocolSubmitBuffer, uint32_t SubmitBufferLength,
+                                                               void** ProtocolReturnBuffer, uint32_t* ReturnBufferLength,
+                                                               int* ProtocolStatus) {
+    (void)LsaHandle; (void)AuthPackage; (void)ProtocolSubmitBuffer; (void)SubmitBufferLength;
+    if (ProtocolReturnBuffer) *ProtocolReturnBuffer = NULL;
+    if (ReturnBufferLength) *ReturnBufferLength = 0;
+    if (ProtocolStatus) *ProtocolStatus = 0xC0000001; /* STATUS_UNSUCCESSFUL */
+    return 0xC0000001;
+}
+int __attribute__((ms_abi)) lsw_LsaLookupAuthenticationPackage(void* LsaHandle, void* PackageName, uint32_t* AuthPackage) {
+    (void)LsaHandle; (void)PackageName;
+    if (AuthPackage) *AuthPackage = 0;
+    return 0;
+}
+
+/* LsaOpenPolicy / LsaQueryInformationPolicy stubs for net user <name> display */
+static void* g_lsa_policy_handle = (void*)(uintptr_t)0xBEEF3;
+int __attribute__((ms_abi)) lsw_LsaOpenPolicy(void* SystemName, void* ObjectAttributes,
+                                                uint32_t DesiredAccess, void** PolicyHandle) {
+    (void)SystemName; (void)ObjectAttributes; (void)DesiredAccess;
+    LSW_LOG_INFO("LsaOpenPolicy called");
+    if (PolicyHandle) *PolicyHandle = g_lsa_policy_handle;
+    return 0; /* STATUS_SUCCESS */
+}
+int __attribute__((ms_abi)) lsw_LsaQueryInformationPolicy(void* PolicyHandle, uint32_t InformationClass,
+                                                            void** Buffer) {
+    (void)PolicyHandle;
+    LSW_LOG_INFO("LsaQueryInformationPolicy(class=%u)", InformationClass);
+    if (!Buffer) return 0xC000000D; /* STATUS_INVALID_PARAMETER */
+    *Buffer = NULL;
+    if (InformationClass == 5) {
+        /* PolicyAccountDomainInformation — returns POLICY_ACCOUNT_DOMAIN_INFO
+         * Layout (x64): [0] LSA_UNICODE_STRING DomainName (16 bytes)
+         *                   +0 Length(u16), +2 MaxLen(u16), +4 pad, +8 Buffer*
+         *               [16] DomainSid (PSID, 8 bytes)
+         * Total header: 24 bytes + string data appended */
+        lsw_ensure_computername();
+        size_t name_len = 0;
+        for (const uint16_t* p = g_computername_w; *p; p++) name_len++;
+        size_t str_bytes = (name_len + 1) * 2;
+        uint8_t* buf = (uint8_t*)calloc(24 + str_bytes, 1);
+        if (!buf) return 0xC0000017; /* STATUS_NO_MEMORY */
+        uint16_t* str = (uint16_t*)(buf + 24);
+        for (size_t i = 0; i <= name_len; i++) str[i] = g_computername_w[i];
+        *(uint16_t*)(buf +  0) = (uint16_t)(name_len * 2);   /* Length */
+        *(uint16_t*)(buf +  2) = (uint16_t)(str_bytes);       /* MaximumLength */
+        *(uint64_t*)(buf +  8) = (uint64_t)(uintptr_t)str;    /* Buffer */
+        *(uint64_t*)(buf + 16) = 0;                            /* DomainSid = NULL */
+        *Buffer = buf;
+        return 0; /* STATUS_SUCCESS */
+    }
+    /* Unsupported class — return empty buffer */
+    uint8_t* buf = (uint8_t*)calloc(32, 1);
+    *Buffer = buf;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_LsaFreeMemory(void* Buffer) {
+    if (Buffer) free(Buffer);
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_LsaClose(void* ObjectHandle) {
+    (void)ObjectHandle;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_LsaLookupSids(void* PolicyHandle, uint32_t Count,
+                                                void** Sids, void** ReferencedDomains, void** Names) {
+    (void)PolicyHandle; (void)Count; (void)Sids;
+    if (ReferencedDomains) *ReferencedDomains = NULL;
+    if (Names) *Names = NULL;
+    return 0xC0000073; /* STATUS_NONE_MAPPED */
+}
+int __attribute__((ms_abi)) lsw_LsaLookupNames2(void* PolicyHandle, uint32_t Flags, uint32_t Count,
+                                                  void* Names, void** ReferencedDomains, void** Sids) {
+    (void)PolicyHandle; (void)Flags; (void)Count; (void)Names;
+    if (ReferencedDomains) *ReferencedDomains = NULL;
+    if (Sids) *Sids = NULL;
+    return 0xC0000073; /* STATUS_NONE_MAPPED */
+}
+int __attribute__((ms_abi)) lsw_LsaOpenPolicy2(void* SystemName, void* ObjectAttributes,
+                                                 uint32_t DesiredAccess, void** PolicyHandle) {
+    (void)SystemName; (void)ObjectAttributes; (void)DesiredAccess;
+    if (PolicyHandle) *PolicyHandle = g_lsa_policy_handle;
+    return 0;
+}
+
+/* AUTHZ stubs */
+void __attribute__((ms_abi)) lsw_FreeClaimDefinitions(void* p) { (void)p; }
+int  __attribute__((ms_abi)) lsw_InitializeClaimDictionary(void** dict) { if (dict) *dict = NULL; return 0; }
+int  __attribute__((ms_abi)) lsw_GetClaimDefinitions(void* a, void* b, void* c) { (void)a;(void)b;(void)c; return 0; }
+void __attribute__((ms_abi)) lsw_FreeClaimDictionary(void* p) { (void)p; }
+
+/* wkscli / netutils stubs */
+int  __attribute__((ms_abi)) lsw_NetGetJoinInformation(const wchar_t* server, wchar_t** name, int* type) {
+    (void)server;
+    if (name) *name = NULL;
+    if (type) *type = 0;
+    return 2; /* NERR_WkstaNotStarted */
+}
+int __attribute__((ms_abi)) lsw_NetApiBufferFree(void* Buffer) { free(Buffer); return 0; }
+int __attribute__((ms_abi)) lsw_NetWkstaUserGetInfo(uint16_t* server, uint32_t level, uint8_t** bufptr) {
+    (void)server;
+    LSW_LOG_INFO("NetWkstaUserGetInfo(level=%u)", level);
+    if (!bufptr) return 87;
+    if (level != 0 && level != 1) { *bufptr = NULL; return 2102; }
+    lsw_ensure_computername();
+    /* Get current username */
+    char uname[64] = "user";
+    struct passwd* pw = getpwuid(getuid());
+    if (pw && pw->pw_name) strncpy(uname, pw->pw_name, 63);
+    int ulen = (int)strlen(uname);
+    const char* dom  = "WORKGROUP";  int dlen = (int)strlen(dom);
+    const char* odom = "";           int olen = 0;
+    /* WKSTA_USER_INFO_1: 4 LPWSTR at offsets 0,8,16,24 = 32 bytes + strings */
+    int hdr = (level == 1) ? 32 : 8;
+    uint8_t* buf = (uint8_t*)calloc((size_t)hdr + (size_t)(ulen+1)*2 + (size_t)(dlen+1)*2
+                                    + (size_t)(olen+1)*2, 1);
+    if (!buf) { *bufptr = NULL; return 8; }
+    uint16_t* uptr = (uint16_t*)(buf + hdr);
+    uint16_t* dptr = uptr + ulen + 1;
+    uint16_t* optr = dptr + dlen + 1;
+    *(uint64_t*)(buf + 0) = (uint64_t)(uintptr_t)uptr;
+    if (level == 1) {
+        *(uint64_t*)(buf + 8)  = (uint64_t)(uintptr_t)dptr;
+        *(uint64_t*)(buf + 16) = (uint64_t)(uintptr_t)optr;
+        *(uint64_t*)(buf + 24) = (uint64_t)(uintptr_t)g_computername_w;
+    }
+    for (int i = 0; i < ulen; i++) uptr[i] = (uint16_t)(unsigned char)uname[i];
+    for (int i = 0; i < dlen; i++) dptr[i] = (uint16_t)(unsigned char)dom[i];
+    *bufptr = buf;
+    LSW_LOG_INFO("NetWkstaUserGetInfo: user='%s' domain='%s'", uname, dom);
+    return 0;
+}
+/* WKSTA_INFO_100: platform_id(+0 DWORD), pad(+4), computername(+8 ptr), langroup(+16 ptr),
+ *                 ver_major(+24 DWORD), ver_minor(+28 DWORD) = 32 bytes header + strings */
+int __attribute__((ms_abi)) lsw_NetWkstaGetInfo(uint16_t* server, uint32_t level, uint8_t** bufptr) {
+    (void)server;
+    LSW_LOG_INFO("NetWkstaGetInfo(level=%u)", level);
+    if (!bufptr) return 87; /* ERROR_INVALID_PARAMETER */
+    if (level != 100 && level != 101 && level != 102) { *bufptr = NULL; return 2102; }
+    lsw_ensure_computername();
+    const char* wg = "WORKGROUP";
+    int wglen = (int)strlen(wg);
+    /* struct header: 40 bytes for level 101 (includes lanroot ptr), 32 bytes for 100 */
+    int hdr = (level >= 101) ? 40 : 32;
+    uint8_t* buf = (uint8_t*)calloc((size_t)hdr + (size_t)(wglen + 1) * 2, 1);
+    if (!buf) { *bufptr = NULL; return 8; }
+    *(uint32_t*)(buf + 0) = 500; /* SV_PLATFORM_ID_NT */
+    uint16_t* wg_ptr = (uint16_t*)(buf + hdr);
+    *(uint64_t*)(buf + 8)  = (uint64_t)(uintptr_t)g_computername_w; /* persistent — survives free */
+    *(uint64_t*)(buf + 16) = (uint64_t)(uintptr_t)wg_ptr;
+    *(uint32_t*)(buf + 24) = 10; /* ver_major: Windows 10 */
+    *(uint32_t*)(buf + 28) = 0;  /* ver_minor */
+    if (level >= 101) *(uint64_t*)(buf + 32) = 0; /* wki101_lanroot: null */
+    for (int i = 0; i < wglen; i++) wg_ptr[i] = (uint16_t)(unsigned char)wg[i];
+    *bufptr = buf;
+    LSW_LOG_INFO("NetWkstaGetInfo: returning hostname='%s' ptr=%p", g_computername_a, (void*)g_computername_w);
+    return 0; /* NERR_Success */
+}
+int __attribute__((ms_abi)) lsw_NetServerEnum(uint16_t* server, uint32_t level, uint8_t** bufptr,
+    uint32_t prefmaxlen, uint32_t* entriesread, uint32_t* totalentries,
+    uint32_t servertype, uint16_t* domain, uint32_t* resume_handle) {
+    (void)server; (void)level; (void)prefmaxlen; (void)servertype; (void)domain; (void)resume_handle;
+    if (bufptr) *bufptr = NULL;
+    if (entriesread) *entriesread = 0;
+    if (totalentries) *totalentries = 0;
+    return 2118; /* NERR_NetworkError */
+}
+int __attribute__((ms_abi)) lsw_CredUICmdLinePromptForCredentialsW(
+    const uint16_t* pszTargetName, void* pContext, uint32_t dwAuthError,
+    uint16_t* UserName, uint32_t ulUserNameBufferSize,
+    uint16_t* pszPassword, uint32_t ulPasswordBufferSize,
+    int* pfSave, uint32_t dwFlags) {
+    (void)pszTargetName; (void)pContext; (void)dwAuthError; (void)dwFlags;
+    if (UserName && ulUserNameBufferSize > 0) UserName[0] = 0;
+    if (pszPassword && ulPasswordBufferSize > 0) pszPassword[0] = 0;
+    if (pfSave) *pfSave = 0;
+    return 1223; /* ERROR_CANCELLED */
+}
+
+/* NetApiBufferAllocate / NetapipBufferAllocate — actual malloc so callers can use the pointer */
+int __attribute__((ms_abi)) lsw_NetApiBufferAllocate(uint32_t ByteCount, void** Buffer) {
+    if (!Buffer) return 87; /* ERROR_INVALID_PARAMETER */
+    *Buffer = calloc(1, ByteCount ? ByteCount : 1);
+    return *Buffer ? 0 : 8; /* 0=NERR_Success, 8=ERROR_NOT_ENOUGH_MEMORY */
+}
+int __attribute__((ms_abi)) lsw_NetapipBufferAllocate(uint32_t ByteCount, void** Buffer) {
+    return lsw_NetApiBufferAllocate(ByteCount, Buffer);
+}
+int __attribute__((ms_abi)) lsw_NetApiBufferReallocate(void* OldBuffer, uint32_t NewByteCount, void** NewBuffer) {
+    if (!NewBuffer) return 87;
+    *NewBuffer = realloc(OldBuffer, NewByteCount ? NewByteCount : 1);
+    return *NewBuffer ? 0 : 8;
+}
+/* NetpwNameValidate / NetpwPathType — stub (validation always passes) */
+int __attribute__((ms_abi)) lsw_NetpwNameValidate(uint16_t* Name, uint32_t NameType, uint32_t Flags) {
+    (void)Name; (void)NameType; (void)Flags; return 0;
+}
+int __attribute__((ms_abi)) lsw_NetpwPathType(uint16_t* PathName, uint32_t* PathType, uint32_t Flags) {
+    (void)PathName; (void)Flags; if (PathType) *PathType = 0; return 0;
+}
+
+/* GetCPInfo — fill CPINFO for a given code page; report UTF-8 / no lead bytes */
+typedef struct { uint32_t MaxCharSize; uint8_t DefaultChar[2]; uint8_t LeadByte[12]; } LSW_CPINFO;
+int __attribute__((ms_abi)) lsw_GetCPInfo(uint32_t CodePage, LSW_CPINFO* lpCPInfo) {
+    (void)CodePage;
+    if (!lpCPInfo) { lsw_SetLastError(87); return 0; }
+    lpCPInfo->MaxCharSize    = 1;
+    lpCPInfo->DefaultChar[0] = '?';
+    lpCPInfo->DefaultChar[1] = 0;
+    memset(lpCPInfo->LeadByte, 0, sizeof(lpCPInfo->LeadByte));
+    return 1; /* TRUE */
+}
+
+/* ApiSetQueryApiSetPresence — always report "not present" (safe no-op) */
+int __attribute__((ms_abi)) lsw_ApiSetQueryApiSetPresence(uint16_t* Namespace, int* Present) {
+    (void)Namespace;
+    if (Present) *Present = 0;
+    return 1; /* TRUE */
+}
+
+/* RegOpenKeyW — thin wrapper around RegOpenKeyExW */
+int32_t __attribute__((ms_abi)) lsw_RegOpenKeyW(void* hKey, uint16_t* lpSubKey, void** phkResult) {
+    return lsw_RegOpenKeyExW((void*)hKey, (void*)lpSubKey, 0, 0x20019 /* KEY_READ */, (void*)phkResult);
+}
+
+/* --- Wide-string functions missing from msvcrt.dll mappings --- */
+/* These operate on UTF-16LE (2-byte) strings, not 4-byte Linux wchar_t. */
+static size_t u16_wcsspn(const uint16_t* str, const uint16_t* accept)
+{
+    if (!str || !accept) return 0;
+    size_t n = 0;
+    while (str[n]) {
+        const uint16_t* a = accept;
+        int found = 0;
+        while (*a) { if (*a == str[n]) { found = 1; break; } a++; }
+        if (!found) break;
+        n++;
+    }
+    return n;
+}
+static size_t u16_wcscspn(const uint16_t* str, const uint16_t* reject)
+{
+    if (!str || !reject) return 0;
+    size_t n = 0;
+    while (str[n]) {
+        const uint16_t* r = reject;
+        while (*r) { if (*r == str[n]) return n; r++; }
+        n++;
+    }
+    return n;
+}
+static uint16_t* u16_wcspbrk(const uint16_t* str, const uint16_t* accept)
+{
+    if (!str || !accept) return NULL;
+    for (; *str; str++) {
+        const uint16_t* a = accept;
+        while (*a) { if (*a == *str) return (uint16_t*)str; a++; }
+    }
+    return NULL;
+}
+size_t __attribute__((ms_abi)) lsw_wcsspn(const uint16_t* str, const uint16_t* accept) {
+    return u16_wcsspn(str, accept);
+}
+uint16_t* __attribute__((ms_abi)) lsw_wcspbrk(const uint16_t* str, const uint16_t* accept) {
+    return u16_wcspbrk(str, accept);
+}
+size_t __attribute__((ms_abi)) lsw_wcscspn(const uint16_t* str, const uint16_t* reject) {
+    return u16_wcscspn(str, reject);
+}
+uint16_t* __attribute__((ms_abi)) lsw__wcsupr(uint16_t* str) {
+    if (!str) return NULL;
+    for (uint16_t* p = str; *p; p++) {
+        uint16_t c = *p;
+        if (c >= 'a' && c <= 'z') *p = c - 32;
+    }
+    return str;
+}
+int __attribute__((ms_abi)) lsw__wtoi(const uint16_t* str) {
+    if (!str) return 0;
+    while (*str == ' ' || *str == '\t') str++;
+    int neg = 0; int val = 0;
+    if (*str == '-') { neg = 1; str++; } else if (*str == '+') str++;
+    while (*str >= '0' && *str <= '9') { val = val * 10 + (*str - '0'); str++; }
+    return neg ? -val : val;
+}
+int __attribute__((ms_abi)) lsw_iswctype(wint_t c, unsigned long desc) {
+    return iswctype(c, desc);
+}
+int __attribute__((ms_abi)) lsw_wcsncat_s(u16* dst, size_t dstSz, const u16* src, size_t count) {
+    if (!dst || !src || dstSz == 0) return 22; /* EINVAL */
+    size_t len = u16_len(dst);
+    if (len >= dstSz) return 22;
+    size_t rem = dstSz - len - 1;
+    size_t n = (count == (size_t)-1 || count > rem) ? rem : count;
+    u16_ncpy(dst + len, src, n);
+    dst[len + n] = 0;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_wcsncpy_s(u16* dst, size_t dstSz, const u16* src, size_t count) {
+    if (!dst || dstSz == 0) return 22;
+    if (!src) { dst[0] = 0; return 0; }
+    size_t n = (count == (size_t)-1 || count >= dstSz) ? dstSz - 1 : count;
+    u16_ncpy(dst, src, n);
+    dst[n] = 0;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw__snwprintf_s(wchar_t* buf, size_t bufSz, size_t count, const wchar_t* fmt, ...) {
+    if (!buf || bufSz == 0) return -1;
+    (void)count;
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    int r = lsw__vsnwprintf(buf, bufSz, fmt, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap); return r;
+}
+int __attribute__((ms_abi)) lsw__vsnwprintf_s(wchar_t* buf, size_t bufSz, size_t count, const wchar_t* fmt, char* ap) {
+    if (!buf || bufSz == 0) return -1;
+    (void)count;
+    return lsw__vsnwprintf(buf, bufSz, fmt, ap);
+}
+void __attribute__((ms_abi)) lsw__local_unwind(void* frame, void* target) {
+    (void)frame; (void)target; /* no-op on Linux — no SEH unwinding needed */
+}
+
+/* --- NetAPI / SMB / MPR stubs --- */
+int __attribute__((ms_abi)) lsw_NetUseGetInfo(uint16_t* server, uint16_t* useName, uint32_t level, uint8_t** bufptr) {
+    (void)server; (void)useName; (void)level; if (bufptr) *bufptr = NULL; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetUseEnum(uint16_t* server, uint32_t level, uint8_t** bufptr,
+    uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+/* NetUserGetInfo — look up a Linux user in /etc/passwd */
+int __attribute__((ms_abi)) lsw_NetUserGetInfo(uint16_t* server, uint16_t* username, uint32_t level, uint8_t** bufptr) {
+    (void)server;
+    if (bufptr) *bufptr = NULL;
+    if (!username) { lsw_SetLastError(87); return 87; }
+    LSW_LOG_INFO("NetUserGetInfo(level=%u)", level);
+    if (level != 0 && level != 1 && level != 3 && level != 10 && level != 20 && level != 23) return 50; /* ERROR_NOT_SUPPORTED */
+    /* Convert UTF-16LE username to UTF-8 */
+    char name[64] = {0};
+    for (int i = 0; i < 63 && username[i]; i++) name[i] = (char)(unsigned char)username[i];
+    /* Look up in /etc/passwd */
+    struct passwd* pw_ent = getpwnam(name);
+    if (!pw_ent) {
+        /* Also check case-insensitively */
+        struct passwd* e; setpwent();
+        while ((e = getpwent()) != NULL) {
+            if (strcasecmp(e->pw_name, name) == 0) { pw_ent = e; break; }
+        }
+        endpwent();
+    }
+    if (!pw_ent) return 2221; /* NERR_UserNotFound */
+    /* Get the real username (canonical case) */
+    const char* rname = pw_ent->pw_name;
+    const char* gecos = pw_ent->pw_gecos ? pw_ent->pw_gecos : "";
+    /* Strip trailing comma from GECOS field if present */
+    char fullname[128] = {0};
+    strncpy(fullname, gecos, sizeof(fullname) - 1);
+    char* comma = strchr(fullname, ',');
+    if (comma) *comma = '\0';
+    const char* comment = "";
+    const char* homedir = pw_ent->pw_dir ? pw_ent->pw_dir : "";
+    const char* shell = pw_ent->pw_shell ? pw_ent->pw_shell : "";
+    /* Helper: append UTF-16LE string and return pointer to it */
+#define WSTR_APPEND(buf, pos, s) ({ \
+    uint16_t* _p = (uint16_t*)((buf) + (pos)); \
+    size_t _l = strlen(s); \
+    for (size_t _i = 0; _i < _l; _i++) _p[_i] = (uint16_t)(unsigned char)(s)[_i]; \
+    _p[_l] = 0; \
+    (pos) += ((int)_l + 1) * 2; \
+    _p; })
+    if (level == 0) {
+        /* USER_INFO_0: { LPWSTR name } */
+        size_t nlen = strlen(rname);
+        uint8_t* buf = (uint8_t*)calloc(1, 8 + (nlen + 1) * 2);
+        if (!buf) return 8;
+        int pos = 8;
+        *(uint16_t**)(buf + 0) = WSTR_APPEND(buf, pos, rname);
+        *bufptr = buf; return 0;
+    }
+    if (level == 1) {
+        /* USER_INFO_1: name, password(NULL), password_age(DWORD), priv(DWORD), home_dir, comment, flags(DWORD), script_path */
+        /* Layout: 4 LPWSTR (@0,8,24,40) + 3 DWORD (at 16,20,32) padded + 1 LPWSTR (@40)... */
+        /* +0  LPWSTR name, +8 LPWSTR password, +16 DWORD age, +20 DWORD priv,
+           +24 LPWSTR home_dir, +32 LPWSTR comment, +40 DWORD flags, +44 pad, +48 LPWSTR script */
+        size_t strsz = (strlen(rname)+1)*2 + (strlen(comment)+1)*2 + (strlen(homedir)+1)*2 + 2 /* empty script */;
+        uint8_t* buf = (uint8_t*)calloc(1, 56 + strsz);
+        if (!buf) return 8;
+        int pos = 56;
+        *(uint16_t**)(buf + 0)  = WSTR_APPEND(buf, pos, rname);
+        *(uint16_t**)(buf + 8)  = NULL; /* password */
+        *(uint32_t*)(buf + 16)  = 0;   /* password_age */
+        *(uint32_t*)(buf + 20)  = 1;   /* USER_PRIV_USER */
+        *(uint16_t**)(buf + 24) = WSTR_APPEND(buf, pos, homedir);
+        *(uint16_t**)(buf + 32) = WSTR_APPEND(buf, pos, comment);
+        *(uint32_t*)(buf + 40)  = 0x200; /* UF_NORMAL_ACCOUNT */
+        *(uint16_t**)(buf + 48) = WSTR_APPEND(buf, pos, "");
+        *bufptr = buf; return 0;
+    }
+    if (level == 3) {
+        /* USER_INFO_3 x64 layout (184-byte header):
+         * +0   LPWSTR name         +8   LPWSTR password(NULL)
+         * +16  DWORD  password_age +20  DWORD  priv
+         * +24  LPWSTR home_dir     +32  LPWSTR comment
+         * +40  DWORD  flags        [+44 pad]
+         * +48  LPWSTR script_path  +56  DWORD  auth_flags  [+60 pad]
+         * +64  LPWSTR full_name    +72  LPWSTR usr_comment
+         * +80  LPWSTR parms        +88  LPWSTR workstations
+         * +96  DWORD  last_logon   +100 DWORD  last_logoff
+         * +104 DWORD  acct_expires +108 DWORD  max_storage
+         * +112 DWORD  units_per_wk [+116 pad]
+         * +120 PBYTE  logon_hours  +128 DWORD  bad_pw_count
+         * +132 DWORD  num_logons   [+136 aligned]
+         * +136 LPWSTR logon_server +144 DWORD  country_code
+         * +148 DWORD  code_page    +152 DWORD  user_id
+         * +156 DWORD  prim_grp_id  +160 LPWSTR profile
+         * +168 LPWSTR home_dir_drv +176 DWORD  password_expired
+         * [+180 pad → struct = 184 bytes] */
+        const char* logon_server = "\\\\*";
+        size_t strsz = (strlen(rname)+1)*2 + (strlen(fullname)+1)*2 + (strlen(comment)+1)*2
+                     + (strlen(homedir)+1)*2 + (strlen(logon_server)+1)*2 + 4*2 /* 4 empty strs */;
+        uint8_t* buf = (uint8_t*)calloc(1, 184 + strsz);
+        if (!buf) return 8;
+        int pos = 184;
+        *(uint16_t**)(buf + 0)   = WSTR_APPEND(buf, pos, rname);
+        *(uint16_t**)(buf + 8)   = NULL;                            /* password */
+        *(uint32_t*)(buf + 16)   = 0;                               /* password_age: 0 days */
+        *(uint32_t*)(buf + 20)   = 1;                               /* USER_PRIV_USER */
+        *(uint16_t**)(buf + 24)  = WSTR_APPEND(buf, pos, homedir);
+        *(uint16_t**)(buf + 32)  = WSTR_APPEND(buf, pos, comment);
+        *(uint32_t*)(buf + 40)   = 0x10200; /* UF_NORMAL_ACCOUNT | UF_DONT_EXPIRE_PASSWD */
+        *(uint16_t**)(buf + 48)  = WSTR_APPEND(buf, pos, "");      /* script_path */
+        *(uint32_t*)(buf + 56)   = 0;                               /* auth_flags */
+        *(uint16_t**)(buf + 64)  = WSTR_APPEND(buf, pos, fullname);
+        *(uint16_t**)(buf + 72)  = WSTR_APPEND(buf, pos, "");      /* usr_comment */
+        *(uint16_t**)(buf + 80)  = WSTR_APPEND(buf, pos, "");      /* parms */
+        *(uint16_t**)(buf + 88)  = WSTR_APPEND(buf, pos, "");      /* workstations: all */
+        *(uint32_t*)(buf + 96)   = 0;                               /* last_logon: never */
+        *(uint32_t*)(buf + 100)  = 0;                               /* last_logoff: never */
+        *(uint32_t*)(buf + 104)  = 0xFFFFFFFF;                     /* acct_expires: TIMEQ_FOREVER */
+        *(uint32_t*)(buf + 108)  = 0xFFFFFFFF;                     /* max_storage: unlimited */
+        *(uint32_t*)(buf + 112)  = 168;                             /* units_per_week (7*24) */
+        *(uint8_t**)(buf + 120)  = NULL;                            /* logon_hours: all */
+        *(uint32_t*)(buf + 128)  = 0;                               /* bad_pw_count */
+        *(uint32_t*)(buf + 132)  = 0;                               /* num_logons: unknown */
+        *(uint16_t**)(buf + 136) = WSTR_APPEND(buf, pos, logon_server);
+        *(uint32_t*)(buf + 144)  = 0;                               /* country_code */
+        *(uint32_t*)(buf + 148)  = 0;                               /* code_page */
+        *(uint32_t*)(buf + 152)  = (uint32_t)pw_ent->pw_uid;
+        *(uint32_t*)(buf + 156)  = 513;                             /* DOMAIN_GROUP_RID_USERS */
+        *(uint16_t**)(buf + 160) = WSTR_APPEND(buf, pos, "");      /* profile */
+        *(uint16_t**)(buf + 168) = WSTR_APPEND(buf, pos, "");      /* home_dir_drive */
+        *(uint32_t*)(buf + 176)  = 0;                               /* password_expired: no */
+        *bufptr = buf; return 0;
+    }
+    if (level == 10) {
+        /* USER_INFO_10: name(+0), comment(+8), usr_comment(+16), full_name(+24) — 4 LPWSTR = 32 bytes */
+        size_t strsz = (strlen(rname)+1)*2 + (strlen(comment)+1)*2 + (strlen(fullname)+1)*2 + 2;
+        uint8_t* buf = (uint8_t*)calloc(1, 32 + strsz);
+        if (!buf) return 8;
+        int pos = 32;
+        *(uint16_t**)(buf + 0)  = WSTR_APPEND(buf, pos, rname);
+        *(uint16_t**)(buf + 8)  = WSTR_APPEND(buf, pos, comment);
+        *(uint16_t**)(buf + 16) = WSTR_APPEND(buf, pos, "");   /* usr_comment */
+        *(uint16_t**)(buf + 24) = WSTR_APPEND(buf, pos, fullname);
+        *bufptr = buf; return 0;
+    }
+    if (level == 20 || level == 23) {
+        /* USER_INFO_20: name(+0), full_name(+8), comment(+16), flags(DWORD +24), user_id(DWORD +28) = 32 bytes */
+        size_t strsz = (strlen(rname)+1)*2 + (strlen(fullname)+1)*2 + (strlen(comment)+1)*2;
+        uint8_t* buf = (uint8_t*)calloc(1, 32 + strsz);
+        if (!buf) return 8;
+        int pos = 32;
+        *(uint16_t**)(buf + 0)  = WSTR_APPEND(buf, pos, rname);
+        *(uint16_t**)(buf + 8)  = WSTR_APPEND(buf, pos, fullname);
+        *(uint16_t**)(buf + 16) = WSTR_APPEND(buf, pos, comment);
+        *(uint32_t*)(buf + 24)  = 0x200; /* UF_NORMAL_ACCOUNT */
+        *(uint32_t*)(buf + 28)  = (uint32_t)pw_ent->pw_uid;
+        *bufptr = buf; return 0;
+    }
+    return 50;
+#undef WSTR_APPEND
+}
+int __attribute__((ms_abi)) lsw_NetServerGetInfo(uint16_t* server, uint32_t level, uint8_t** bufptr) {
+    (void)server;
+    LSW_LOG_INFO("NetServerGetInfo(level=%u)", level);
+    if (!bufptr) return 2102;
+    if (level != 100 && level != 101) { *bufptr = NULL; return 2102; }
+    lsw_ensure_computername();
+    /* SERVER_INFO_100: platform_id (DWORD @0, pad @4), sv100_name (ptr @8) = 16 bytes */
+    uint8_t* buf = (uint8_t*)calloc(16, 1);
+    if (!buf) { *bufptr = NULL; return 8; /* ERROR_NOT_ENOUGH_MEMORY */ }
+    *(uint32_t*)(buf + 0) = 500; /* SV_PLATFORM_ID_NT */
+    *(uint64_t*)(buf + 8) = (uint64_t)(uintptr_t)g_computername_w; /* persistent — survives free */
+    *bufptr = buf;
+    return 0; /* NERR_Success */
+}
+int __attribute__((ms_abi)) lsw_NetShareEnum(uint16_t* server, uint32_t level, uint8_t** bufptr,
+    uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+
+/* samcli.dll stubs — all return NERR_ServerNotStarted (2102) */
+int __attribute__((ms_abi)) lsw_NetUserAdd(uint16_t* server, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetUserDel(uint16_t* server, uint16_t* username) {
+    (void)server; (void)username; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetUserSetInfo(uint16_t* server, uint16_t* username, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)username; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetUserGetGroups(uint16_t* server, uint16_t* username, uint32_t level,
+    uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries) {
+    (void)server; (void)username; (void)level; (void)prefMaxLen;
+    LSW_LOG_INFO("NetUserGetGroups(level=%u)", level);
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 0; /* success — empty list */
+}
+int __attribute__((ms_abi)) lsw_NetUserGetLocalGroups(uint16_t* server, uint16_t* username, uint32_t level,
+    uint32_t flags, uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries) {
+    (void)server; (void)username; (void)level; (void)flags; (void)prefMaxLen;
+    LSW_LOG_INFO("NetUserGetLocalGroups(level=%u)", level);
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 0; /* success — empty list */
+}
+int __attribute__((ms_abi)) lsw_NetUserEnum(uint16_t* server, uint32_t level, uint32_t filter,
+    uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)filter; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL;
+    if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0;
+    if (level != 0) return 50; /* ERROR_NOT_SUPPORTED */
+    /* Read usernames from /etc/passwd */
+    char names[256][64];
+    int count = 0;
+    FILE* pw = fopen("/etc/passwd", "r");
+    if (!pw) return 0; /* empty list */
+    char line[1024];
+    while (fgets(line, sizeof(line), pw) && count < 256) {
+        char* colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        /* Find uid field (3rd ':' separated field) */
+        char* f2 = colon + 1; char* f3 = strchr(f2, ':');
+        if (!f3) continue;
+        char* uidstr = f3 + 1; char* f4end = strchr(uidstr, ':');
+        if (f4end) *f4end = '\0';
+        int uid = atoi(uidstr);
+        if (uid == 0 || uid >= 1000) {
+            strncpy(names[count], line, 63);
+            names[count++][63] = '\0';
+        }
+    }
+    fclose(pw);
+    if (count == 0) return 0;
+    /* Allocate flat buffer: array of (uint16_t*) structs + string area */
+    size_t struct_sz = (size_t)count * sizeof(uint16_t*);
+    size_t str_sz    = (size_t)count * 64 * sizeof(uint16_t);
+    uint8_t* buf = (uint8_t*)calloc(1, struct_sz + str_sz);
+    if (!buf) return 8; /* ERROR_NOT_ENOUGH_MEMORY */
+    uint16_t** structs = (uint16_t**)buf;
+    uint16_t*  strarea = (uint16_t*)(buf + struct_sz);
+    for (int i = 0; i < count; i++) {
+        structs[i] = strarea;
+        int j = 0;
+        while (names[i][j]) { strarea[j] = (uint16_t)(unsigned char)names[i][j]; j++; }
+        strarea[j] = 0;
+        strarea += j + 1;
+    }
+    *bufptr = buf;
+    if (entriesRead) *entriesRead = (uint32_t)count;
+    if (totalEntries) *totalEntries = (uint32_t)count;
+    return 0; /* NERR_Success */
+}
+int __attribute__((ms_abi)) lsw_NetUserModalsGet(uint16_t* server, uint32_t level, uint8_t** bufptr) {
+    (void)server;
+    LSW_LOG_INFO("NetUserModalsGet(level=%u)", level);
+    if (!bufptr) return 87; /* ERROR_INVALID_PARAMETER */
+    *bufptr = NULL;
+    if (level == 0) {
+        /* USER_MODALS_INFO_0: min_passwd_len, max_passwd_age, min_passwd_age, force_logoff, password_hist_len */
+        uint8_t* buf = (uint8_t*)calloc(20, 1);
+        if (!buf) return 8;
+        *(uint32_t*)(buf +  0) = 0;           /* min_passwd_len: no minimum */
+        *(uint32_t*)(buf +  4) = 0xFFFFFFFF;  /* max_passwd_age: TIMEQ_FOREVER (never expires) */
+        *(uint32_t*)(buf +  8) = 0;           /* min_passwd_age: 0 */
+        *(uint32_t*)(buf + 12) = 0xFFFFFFFF;  /* force_logoff: TIMEQ_FOREVER */
+        *(uint32_t*)(buf + 16) = 0;           /* password_hist_len: 0 */
+        *bufptr = buf; return 0;
+    }
+    if (level == 1) {
+        /* USER_MODALS_INFO_1: role, primary (ptr) — 16 bytes */
+        uint8_t* buf = (uint8_t*)calloc(16, 1);
+        if (!buf) return 8;
+        *(uint32_t*)(buf + 0) = 2;  /* UAS_ROLE_STANDALONE */
+        *(uint64_t*)(buf + 8) = 0;  /* no primary DC */
+        *bufptr = buf; return 0;
+    }
+    if (level == 2) {
+        /* USER_MODALS_INFO_2: domain_name ptr, domain_id ptr — 16 bytes */
+        lsw_ensure_computername();
+        uint8_t* buf = (uint8_t*)calloc(16, 1);
+        if (!buf) return 8;
+        *(uint64_t*)(buf + 0) = (uint64_t)(uintptr_t)g_computername_w; /* domain name = hostname */
+        *(uint64_t*)(buf + 8) = 0; /* no SID */
+        *bufptr = buf; return 0;
+    }
+    return 50; /* ERROR_NOT_SUPPORTED */
+}
+int __attribute__((ms_abi)) lsw_NetUserModalsSet(uint16_t* server, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupAdd(uint16_t* server, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupDel(uint16_t* server, uint16_t* groupname) {
+    (void)server; (void)groupname; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupGetInfo(uint16_t* server, uint16_t* groupname, uint32_t level, uint8_t** bufptr) {
+    (void)server; (void)groupname; (void)level; if (bufptr) *bufptr = NULL; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupSetInfo(uint16_t* server, uint16_t* groupname, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)groupname; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupGetUsers(uint16_t* server, uint16_t* groupname, uint32_t level,
+    uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)groupname; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 0; /* empty list */
+}
+int __attribute__((ms_abi)) lsw_NetGroupEnum(uint16_t* server, uint32_t level,
+    uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    LSW_LOG_INFO("NetGroupEnum(level=%u)", level);
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 0; /* empty list */
+}
+int __attribute__((ms_abi)) lsw_NetGroupAddUser(uint16_t* server, uint16_t* groupname, uint16_t* username) {
+    (void)server; (void)groupname; (void)username; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetGroupDelUser(uint16_t* server, uint16_t* groupname, uint16_t* username) {
+    (void)server; (void)groupname; (void)username; return 2102;
+}
+
+/* ---- missing wkscli.dll stubs ---- */
+int __attribute__((ms_abi)) lsw_NetWkstaTransportEnum(uint16_t* server, uint32_t level, uint8_t** bufptr,
+    uint32_t prefMaxLen, uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetWkstaStatisticsGet(uint16_t* server, uint16_t* service,
+    uint32_t level, uint32_t options, uint8_t** bufptr) {
+    (void)server; (void)service; (void)level; (void)options;
+    if (bufptr) *bufptr = NULL; return 2102;
+}
+
+/* ---- missing netutils.dll stubs ---- */
+int __attribute__((ms_abi)) lsw_NetpwListCanonicalize(uint16_t* path, uint16_t* out, uint32_t outSz,
+    uint16_t* prefix, uint32_t* type, uint32_t flags) {
+    (void)path; (void)out; (void)outSz; (void)prefix; (void)type; (void)flags; return 0;
+}
+int __attribute__((ms_abi)) lsw_NetpwNameCompare(uint16_t* a, uint16_t* b, uint32_t type, uint32_t flags) {
+    (void)a; (void)b; (void)type; (void)flags; return 0;
+}
+int __attribute__((ms_abi)) lsw_NetpwListTraverse(void* list, void** cookie, uint32_t flags) {
+    (void)list; (void)cookie; (void)flags; return 0;
+}
+int __attribute__((ms_abi)) lsw_NetpwNameCanonicalize(uint16_t* name, uint16_t* out,
+    uint32_t outSz, uint32_t type, uint32_t flags) {
+    (void)name; (void)out; (void)outSz; (void)type; (void)flags; return 0;
+}
+
+/* ---- DSROLE.dll stubs ---- */
+/* DSROLE_PRIMARY_DOMAIN_INFO_BASIC: MachineRole=0(standalone), Flags=0, all names NULL, GUID=0 */
+typedef struct {
+    uint32_t MachineRole;
+    uint32_t Flags;
+    uint16_t* DomainNameFlat;
+    uint16_t* DomainNameDns;
+    uint16_t* DomainForestName;
+    uint8_t   DomainGuid[16];
+} lsw_dsrole_info_t;
+uint32_t __attribute__((ms_abi)) lsw_DsRoleGetPrimaryDomainInformation(
+    uint16_t* server, uint32_t infoLevel, uint8_t** buffer) {
+    (void)server; (void)infoLevel;
+    if (!buffer) return 87; /* ERROR_INVALID_PARAMETER */
+    /* DomainNameFlat must not be NULL — net1.exe copies it unconditionally.
+     * For a standalone workstation, use "WORKGROUP" as the flat domain name. */
+    const char* domain = "WORKGROUP";
+    size_t dlen = strlen(domain);
+    lsw_dsrole_info_t* info = (lsw_dsrole_info_t*)calloc(
+        1, sizeof(lsw_dsrole_info_t) + (dlen + 1) * sizeof(uint16_t));
+    if (!info) return 8;
+    info->MachineRole = 0; /* DsRole_RoleStandaloneWorkstation */
+    info->Flags = 0;
+    uint16_t* flat = (uint16_t*)((uint8_t*)info + sizeof(lsw_dsrole_info_t));
+    for (size_t i = 0; i < dlen; i++) flat[i] = (uint16_t)(unsigned char)domain[i];
+    flat[dlen] = 0;
+    info->DomainNameFlat = flat;
+    /* DomainNameDns and DomainForestName remain NULL (standalone, no DNS domain) */
+    *buffer = (uint8_t*)info;
+    return 0;
+}
+void __attribute__((ms_abi)) lsw_DsRoleFreeMemory(void* buffer) {
+    free(buffer);
+}
+
+/* ---- DSROLE / DS Client stubs ---- */
+uint32_t __attribute__((ms_abi)) lsw_DsGetDcNameW(uint16_t* computer, uint16_t* domain,
+    void* domainGuid, uint16_t* site, uint32_t flags, void** dcinfo) {
+    (void)computer; (void)domain; (void)domainGuid; (void)site; (void)flags;
+    if (dcinfo) *dcinfo = NULL;
+    return 1355; /* ERROR_NO_SUCH_DOMAIN */
+}
+uint32_t __attribute__((ms_abi)) lsw_DsBindWithSpnExW(uint16_t* domainCtrl, uint16_t* dnsDomain,
+    void* authIdent, uint16_t* spn, uint32_t bindFlags, void** phDS) {
+    (void)domainCtrl; (void)dnsDomain; (void)authIdent; (void)spn; (void)bindFlags;
+    if (phDS) *phDS = NULL; return 1355;
+}
+uint32_t __attribute__((ms_abi)) lsw_DsUnBindW(void** phDS) {
+    if (phDS) *phDS = NULL; return 0;
+}
+uint32_t __attribute__((ms_abi)) lsw_DsFreeNameResultW(void* result) {
+    free(result); return 0;
+}
+uint32_t __attribute__((ms_abi)) lsw_DsCrackNamesW(void* hDS, uint32_t flags, uint32_t formatOffered,
+    uint32_t formatDesired, uint32_t cNames, uint16_t** rpNames, void** ppResult) {
+    (void)hDS; (void)flags; (void)formatOffered; (void)formatDesired; (void)cNames; (void)rpNames;
+    if (ppResult) *ppResult = NULL; return 8453; /* DS_NAME_ERROR_NOT_FOUND */
+}
+
+/* ---- missing srvcli.dll stubs ---- */
+int __attribute__((ms_abi)) lsw_NetFileEnum(uint16_t* server, uint16_t* basepath, uint16_t* user,
+    uint32_t level, uint8_t** bufptr, uint32_t prefMaxLen,
+    uint32_t* entriesRead, uint32_t* totalEntries, uint64_t* resumeHandle) {
+    (void)server; (void)basepath; (void)user; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetFileGetInfo(uint16_t* server, uint32_t fileId, uint32_t level, uint8_t** bufptr) {
+    (void)server; (void)fileId; (void)level; if (bufptr) *bufptr = NULL; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetFileClose(uint16_t* server, uint32_t fileId) {
+    (void)server; (void)fileId; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetSessionEnum(uint16_t* server, uint16_t* client, uint16_t* user,
+    uint32_t level, uint8_t** bufptr, uint32_t prefMaxLen,
+    uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)client; (void)user; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetSessionGetInfo(uint16_t* server, uint16_t* client,
+    uint16_t* user, uint32_t level, uint8_t** bufptr) {
+    (void)server; (void)client; (void)user; (void)level;
+    if (bufptr) *bufptr = NULL; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetSessionDel(uint16_t* server, uint16_t* client, uint16_t* user) {
+    (void)server; (void)client; (void)user; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetConnectionEnum(uint16_t* server, uint16_t* qualifier,
+    uint32_t level, uint8_t** bufptr, uint32_t prefMaxLen,
+    uint32_t* entriesRead, uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)qualifier; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetServerTransportEnum(uint16_t* server, uint32_t level,
+    uint8_t** bufptr, uint32_t prefMaxLen, uint32_t* entriesRead,
+    uint32_t* totalEntries, uint32_t* resumeHandle) {
+    (void)server; (void)level; (void)prefMaxLen; (void)resumeHandle;
+    if (bufptr) *bufptr = NULL; if (entriesRead) *entriesRead = 0;
+    if (totalEntries) *totalEntries = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetServerSetInfo(uint16_t* server, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2102;
+}
+int __attribute__((ms_abi)) lsw_NetShareGetInfo(uint16_t* server, uint16_t* sharename, uint32_t level, uint8_t** bufptr) {
+    (void)server; (void)sharename; (void)level; if (bufptr) *bufptr = NULL; return 2310; /* NERR_NetNameNotFound */
+}
+int __attribute__((ms_abi)) lsw_NetShareCheck(uint16_t* server, uint16_t* device, uint32_t* type) {
+    (void)server; (void)device; if (type) *type = 0; return 2312; /* NERR_DeviceNotShared */
+}
+int __attribute__((ms_abi)) lsw_NetShareSetInfo(uint16_t* server, uint16_t* sharename, uint32_t level,
+    uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)sharename; (void)level; (void)buf;
+    if (parm_err) *parm_err = 0; return 2310;
+}
+int __attribute__((ms_abi)) lsw_NetShareDel(uint16_t* server, uint16_t* sharename, uint32_t reserved) {
+    (void)server; (void)sharename; (void)reserved; return 2310;
+}
+int __attribute__((ms_abi)) lsw_NetShareDelSticky(uint16_t* server, uint16_t* sharename, uint32_t reserved) {
+    (void)server; (void)sharename; (void)reserved; return 2310;
+}
+int __attribute__((ms_abi)) lsw_NetShareAdd(uint16_t* server, uint32_t level, uint8_t* buf, uint32_t* parm_err) {
+    (void)server; (void)level; (void)buf; if (parm_err) *parm_err = 0; return 2118; /* NERR_NetworkError */
+}
+typedef struct { uint32_t tod_elapsedt; uint32_t tod_msecs; uint32_t tod_hours; uint32_t tod_mins;
+    uint32_t tod_secs; uint32_t tod_hunds; int32_t tod_timezone; uint32_t tod_tinterval;
+    uint32_t tod_day; uint32_t tod_month; uint32_t tod_year; uint32_t tod_weekday; } lsw_time_of_day_t;
+int __attribute__((ms_abi)) lsw_NetRemoteTOD(uint16_t* server, uint8_t** bufptr) {
+    (void)server;
+    if (!bufptr) return 87;
+    lsw_time_of_day_t* tod = (lsw_time_of_day_t*)calloc(1, sizeof(lsw_time_of_day_t));
+    if (!tod) return 8;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    time_t now = ts.tv_sec;
+    struct tm tm; gmtime_r(&now, &tm);
+    tod->tod_elapsedt  = (uint32_t)now;
+    tod->tod_msecs     = (uint32_t)(ts.tv_nsec / 1000000);
+    tod->tod_hours     = (uint32_t)tm.tm_hour;
+    tod->tod_mins      = (uint32_t)tm.tm_min;
+    tod->tod_secs      = (uint32_t)tm.tm_sec;
+    tod->tod_hunds     = 0;
+    tod->tod_timezone  = 0;
+    tod->tod_tinterval = 310; /* 100ths of seconds per clock tick */
+    tod->tod_day       = (uint32_t)tm.tm_mday;
+    tod->tod_month     = (uint32_t)(tm.tm_mon + 1);
+    tod->tod_year      = (uint32_t)(tm.tm_year + 1900);
+    tod->tod_weekday   = (uint32_t)tm.tm_wday;
+    *bufptr = (uint8_t*)tod;
+    return 0;
+}
+
+/* ---- KERNEL32 SetLocalTime / SetSystemTime ---- */
+int __attribute__((ms_abi)) lsw_SetLocalTime(void* lpSystemTime) {
+    (void)lpSystemTime; lsw_SetLastError(1314 /* ERROR_PRIVILEGE_NOT_HELD */); return 0;
+}
+int __attribute__((ms_abi)) lsw_SetSystemTime(void* lpSystemTime) {
+    (void)lpSystemTime; lsw_SetLastError(1314); return 0;
+}
+
+/* ---- CRYPTBASE.dll SystemFunction036 = RtlGenRandom ---- */
+int __attribute__((ms_abi)) lsw_SystemFunction036(void* buf, uint32_t len) {
+    if (!buf || !len) return 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, len);
+    close(fd);
+    return (n == (ssize_t)len) ? 1 : 0; /* TRUE on success */
+}
+
+/* ---- Service management stubs (no SCM on Linux) ---- */
+int __attribute__((ms_abi)) lsw_GetServiceDisplayNameW(void* hSCManager,
+    uint16_t* lpServiceName, uint16_t* lpDisplayName, uint32_t* lpcchBuffer) {
+    (void)hSCManager; (void)lpServiceName; (void)lpDisplayName; (void)lpcchBuffer;
+    lsw_SetLastError(1060 /* ERROR_SERVICE_DOES_NOT_EXIST */); return 0;
+}
+int __attribute__((ms_abi)) lsw_GetServiceKeyNameW(void* hSCManager,
+    uint16_t* lpDisplayName, uint16_t* lpServiceName, uint32_t* lpcchBuffer) {
+    (void)hSCManager; (void)lpDisplayName; (void)lpServiceName; (void)lpcchBuffer;
+    lsw_SetLastError(1060); return 0;
+}
+int __attribute__((ms_abi)) lsw_EnumServicesStatusExW(void* hSCManager,
+    uint32_t InfoLevel, uint32_t dwServiceType, uint32_t dwServiceState, uint8_t* lpServices,
+    uint32_t cbBufSize, uint32_t* pcbBytesNeeded, uint32_t* lpServicesReturned,
+    uint32_t* lpResumeHandle, uint16_t* pszGroupName) {
+    (void)hSCManager; (void)InfoLevel; (void)dwServiceType; (void)dwServiceState;
+    (void)lpServices; (void)cbBufSize; (void)pszGroupName; (void)lpResumeHandle;
+    if (pcbBytesNeeded) *pcbBytesNeeded = 0;
+    if (lpServicesReturned) *lpServicesReturned = 0;
+    lsw_SetLastError(6 /* ERROR_INVALID_HANDLE */); return 0;
+}
+int __attribute__((ms_abi)) lsw_EnumDependentServicesW(void* hService,
+    uint32_t dwServiceState, uint8_t* lpServices, uint32_t cbBufSize,
+    uint32_t* pcbBytesNeeded, uint32_t* lpServicesReturned) {
+    (void)hService; (void)dwServiceState; (void)lpServices; (void)cbBufSize;
+    if (pcbBytesNeeded) *pcbBytesNeeded = 0;
+    if (lpServicesReturned) *lpServicesReturned = 0;
+    lsw_SetLastError(6); return 0;
+}
+
+/* MPR (Multiple Provider Router) stubs */
+int __attribute__((ms_abi)) lsw_WNetGetLastErrorW(uint32_t* lpError, uint16_t* lpErrorBuf,
+    uint32_t nErrorBufSize, uint16_t* lpNameBuf, uint32_t nNameBufSize) {
+    (void)nErrorBufSize; (void)nNameBufSize;
+    if (lpError) *lpError = 0;
+    if (lpErrorBuf) *lpErrorBuf = 0;
+    if (lpNameBuf) *lpNameBuf = 0;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_WNetCancelConnection2W(uint16_t* lpName, uint32_t dwFlags, int fForce) {
+    (void)lpName; (void)dwFlags; (void)fForce; return 2250; /* ERROR_NOT_CONNECTED */
+}
+int __attribute__((ms_abi)) lsw_WNetOpenEnumW(uint32_t dwScope, uint32_t dwType, uint32_t dwUsage,
+    void* lpNetResource, void** lphEnum) {
+    (void)dwScope; (void)dwType; (void)dwUsage; (void)lpNetResource;
+    if (lphEnum) *lphEnum = NULL; return 1; /* ERROR_INVALID_FUNCTION */
+}
+int __attribute__((ms_abi)) lsw_WNetAddConnection4W(void* hwndOwner, void* lpNetResource, void* lpAuthBuffer,
+    uint32_t cbAuthBuffer, uint32_t dwFlags, uint8_t* lpUseOptions, uint32_t cbUseOptions) {
+    (void)hwndOwner; (void)lpNetResource; (void)lpAuthBuffer; (void)cbAuthBuffer;
+    (void)dwFlags; (void)lpUseOptions; (void)cbUseOptions; return 1; /* ERROR_INVALID_FUNCTION */
+}
+int __attribute__((ms_abi)) lsw_WNetEnumResourceW(void* hEnum, uint32_t* lpcCount, void* lpBuffer, uint32_t* lpBufferSize) {
+    (void)hEnum; (void)lpcCount; (void)lpBuffer; (void)lpBufferSize; return 259; /* ERROR_NO_MORE_ITEMS */
+}
+int __attribute__((ms_abi)) lsw_WNetGetConnectionW(uint16_t* lpLocalName, uint16_t* lpRemoteName, uint32_t* lpnLength) {
+    (void)lpLocalName;
+    if (lpRemoteName && lpnLength && *lpnLength > 0) *lpRemoteName = 0;
+    return 2250; /* ERROR_NOT_CONNECTED */
+}
+int __attribute__((ms_abi)) lsw_WNetCloseEnum(void* hEnum) { (void)hEnum; return 0; }
+
+/* SSPI auth identity stubs */
+int __attribute__((ms_abi)) lsw_SspiMarshalAuthIdentity(void* AuthIdentity, uint32_t* MarshaledLength, uint8_t** MarshaledAuthIdentity) {
+    (void)AuthIdentity; if (MarshaledLength) *MarshaledLength = 0;
+    if (MarshaledAuthIdentity) *MarshaledAuthIdentity = NULL; return 1; /* SEC_E_UNSUPPORTED_FUNCTION */
+}
+int __attribute__((ms_abi)) lsw_SsspiFreeAuthIdentity(void* AuthIdentity) { (void)AuthIdentity; return 0; }
+int __attribute__((ms_abi)) lsw_SspiLocalFree(void* DataBuffer) { (void)DataBuffer; return 0; }
+int __attribute__((ms_abi)) lsw_SspiEncodeStringsAsAuthIdentity(uint16_t* user, uint16_t* dom, uint16_t* pass, void** ppAuthIdentity) {
+    (void)user; (void)dom; (void)pass; if (ppAuthIdentity) *ppAuthIdentity = NULL; return 1;
+}
+/* SspiCli — also has these names */
+int __attribute__((ms_abi)) lsw_SspiFreeAuthIdentity(void* AuthIdentity) { (void)AuthIdentity; return 0; }
+
+/* ResolveDelayLoadedAPI / DelayLoadFailureHook — delay-load stubs (no-op on our loader) */
+void* __attribute__((ms_abi)) lsw_ResolveDelayLoadedAPI(void* base, void* desc, void* resolver, void* hook,
+    void* ibn, uint32_t flags) {
+    (void)base; (void)desc; (void)resolver; (void)hook; (void)ibn; (void)flags;
+    return NULL;
+}
+void* __attribute__((ms_abi)) lsw_DelayLoadFailureHook(const char* dllName, void* thunk) {
+    (void)dllName; (void)thunk; return NULL;
+}
+/* PeekConsoleInputW */
+int __attribute__((ms_abi)) lsw_PeekConsoleInputW(void* hConsoleInput, void* lpBuffer, uint32_t nLength, uint32_t* lpNumberOfEventsRead) {
+    (void)hConsoleInput; (void)lpBuffer; (void)nLength;
+    if (lpNumberOfEventsRead) *lpNumberOfEventsRead = 0; return 1;
+}
+
+// ============================================================================
+// END Additional stubs for whoami.exe
+// ============================================================================
+
+/* GetProfileStringW — returns default value (no .ini file support) */
+int __attribute__((ms_abi)) lsw_GetProfileStringW(const uint16_t* lpAppName, const uint16_t* lpKeyName,
+    const uint16_t* lpDefault, uint16_t* lpReturnedString, uint32_t nSize) {
+    (void)lpAppName; (void)lpKeyName;
+    if (!lpReturnedString || nSize == 0) return 0;
+    if (!lpDefault) { *lpReturnedString = 0; return 0; }
+    uint32_t i = 0;
+    while (i < nSize - 1 && lpDefault[i]) { lpReturnedString[i] = lpDefault[i]; i++; }
+    lpReturnedString[i] = 0;
+    return i;
+}
+
+/* InitializeAcl — zero-fills buffer and sets ACL header (revision + size) */
+int __attribute__((ms_abi)) lsw_InitializeAcl(void* pAcl, uint32_t nAclLength, uint32_t dwAclRevision) {
+    if (!pAcl || nAclLength < 8) { return 0; } /* FALSE */
+    memset(pAcl, 0, nAclLength);
+    uint8_t* p = (uint8_t*)pAcl;
+    p[0] = (uint8_t)dwAclRevision; /* AclRevision */
+    p[1] = 0;                       /* Sbz1 */
+    /* AclSize (little-endian WORD at offset 2) */
+    p[2] = (uint8_t)(nAclLength & 0xff);
+    p[3] = (uint8_t)((nAclLength >> 8) & 0xff);
+    /* AceCount, Sbz2 remain 0 */
+    return 1; /* TRUE */
+}
+
+/* GetSidLengthRequired — 8-byte SID header + 4 bytes per sub-authority */
+uint32_t __attribute__((ms_abi)) lsw_GetSidLengthRequired(uint8_t nSubAuthorityCount) {
+    return 8 + 4 * (uint32_t)nSubAuthorityCount;
+}
+
+/* GetAce — return FALSE; empty ACL has no ACEs */
+int __attribute__((ms_abi)) lsw_GetAce(void* pAcl, uint32_t dwAceIndex, void** pAce) {
+    (void)pAcl; (void)dwAceIndex;
+    if (pAce) *pAce = NULL;
+    lsw_SetLastError(24); /* ERROR_NO_MORE_ITEMS */
+    return 0; /* FALSE */
+}
+
+/* AddAccessAllowedAce — stub that succeeds (SID/DACL building not needed on Linux) */
+int __attribute__((ms_abi)) lsw_AddAccessAllowedAce(void* pAcl, uint32_t dwAclRevision,
+    uint32_t AccessMask, void* pSid) {
+    (void)pAcl; (void)dwAclRevision; (void)AccessMask; (void)pSid;
+    return 1; /* TRUE */
+}
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
+
+/* Forward declarations for functions defined in other translation units */
+extern uint32_t __attribute__((ms_abi)) lsw_GetUserDefaultLCID(void);
+/* advapi32 security functions */
+extern int    __attribute__((ms_abi)) lsw_EqualSid(void*, void*);
+extern int    __attribute__((ms_abi)) lsw_CopySid(uint32_t, void*, void*);
+extern uint32_t __attribute__((ms_abi)) lsw_GetLengthSid(void*);
+extern int    __attribute__((ms_abi)) lsw_CreateWellKnownSid(int, void*, void*, uint32_t*);
+extern int    __attribute__((ms_abi)) lsw_InitializeSecurityDescriptor(void*, uint32_t);
+extern int    __attribute__((ms_abi)) lsw_SetSecurityDescriptorDacl(void*, int, void*, int);
+extern int    __attribute__((ms_abi)) lsw_GetSecurityDescriptorDacl(void*, int*, void**, int*);
+extern uint8_t* __attribute__((ms_abi)) lsw_GetSidSubAuthorityCount(void*);
+extern uint32_t* __attribute__((ms_abi)) lsw_GetSidSubAuthority(void*, uint32_t);
+/* advapi32 registry */
+extern long   __attribute__((ms_abi)) lsw_RegQueryValueExW(void*, const uint16_t*, uint32_t*, uint32_t*, uint8_t*, uint32_t*);
+extern long   __attribute__((ms_abi)) lsw_RegCloseKey(void*);
+/* ntdll memory */
+extern size_t __attribute__((ms_abi)) lsw_RtlCompareMemory(const void*, const void*, size_t);
 
 // Global API mapping table
 static const win32_api_mapping_t api_mappings[] = {
@@ -5964,7 +9667,11 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "abort", (void*)lsw_abort},
     {"msvcrt.dll", "printf", (void*)lsw_printf},
     {"msvcrt.dll", "fprintf", (void*)lsw_fprintf},
+    {"msvcrt.dll", "wprintf", (void*)lsw_wprintf},
+    {"msvcrt.dll", "vwprintf", (void*)lsw_vwprintf},
     {"msvcrt.dll", "fwprintf", (void*)lsw_fwprintf},
+    {"msvcrt.dll", "vfwprintf", (void*)lsw_vfwprintf},
+    {"msvcrt.dll", "_wprintf", (void*)lsw_wprintf},
     {"msvcrt.dll", "fputwc", (void*)lsw_fputwc},
     {"msvcrt.dll", "fflush", (void*)lsw_fflush},
     {"msvcrt.dll", "vfprintf", (void*)lsw_vfprintf},
@@ -5980,14 +9687,21 @@ static const win32_api_mapping_t api_mappings[] = {
     
     // msvcrt.dll - CRT initialization
     {"msvcrt.dll", "__getmainargs", (void*)lsw__getmainargs},
+    {"msvcrt.dll", "__wgetmainargs", (void*)lsw__wgetmainargs},
+    {"msvcrt.dll", "_wgetmainargs", (void*)lsw__wgetmainargs},
     {"msvcrt.dll", "__initenv", (void*)lsw__initenv},
     {"msvcrt.dll", "__iob_func", (void*)lsw__iob_func},
+    {"msvcrt.dll", "_iob",       (void*)lsw__iob},
     {"msvcrt.dll", "__set_app_type", (void*)lsw__set_app_type},
     {"msvcrt.dll", "__setusermatherr", (void*)lsw__setusermatherr},
     {"msvcrt.dll", "_amsg_exit", (void*)lsw__amsg_exit},
     {"msvcrt.dll", "_cexit", (void*)lsw__cexit},
-    {"msvcrt.dll", "_commode", (void*)&lsw_commode},  // Direct pointer to variable
-    {"msvcrt.dll", "_fmode", (void*)&lsw_fmode},      // Direct pointer to variable
+    {"msvcrt.dll", "_c_exit", (void*)lsw__c_exit},
+    {"msvcrt.dll", "_beginthreadex", (void*)lsw__beginthreadex},
+    {"msvcrt.dll", "_endthreadex", (void*)lsw__endthreadex},
+    {"msvcrt.dll", "_exit",  (void*)lsw__exit},
+    {"msvcrt.dll", "_commode", (void*)&lsw_crt_commode},  // Direct pointer to variable
+    {"msvcrt.dll", "_fmode", (void*)&lsw_crt_fmode},      // Direct pointer to variable
     {"msvcrt.dll", "_errno", (void*)lsw__errno_func},
     {"msvcrt.dll", "_initterm", (void*)lsw__initterm},
     {"msvcrt.dll", "_lock", (void*)lsw__lock},
@@ -5996,11 +9710,69 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "__C_specific_handler", (void*)lsw___C_specific_handler},
     {"msvcrt.dll", "___lc_codepage_func", (void*)lsw___lc_codepage_func},
     {"msvcrt.dll", "___mb_cur_max_func", (void*)lsw___mb_cur_max_func},
+    {"msvcrt.dll", "_XcptFilter",         (void*)lsw__XcptFilter},
+    {"msvcrt.dll", "__dllonexit",         (void*)lsw___dllonexit},
+    {"msvcrt.dll", "_fileno",             (void*)lsw__fileno},
+    {"msvcrt.dll", "_get_osfhandle",      (void*)lsw__get_osfhandle},
+    {"msvcrt.dll", "_isatty",             (void*)lsw__isatty},
+    {"msvcrt.dll", "_controlfp",          (void*)lsw__controlfp},
+    {"msvcrt.dll", "__p__fmode",          (void*)lsw___p__fmode},
+    {"msvcrt.dll", "__p__commode",        (void*)lsw___p__commode},
+    {"msvcrt.dll", "_adjust_fdiv",        (void*)lsw__adjust_fdiv},
+    {"msvcrt.dll", "__p___initenv",       (void*)lsw___p___initenv},
+    {"msvcrt.dll", "fputs",               (void*)lsw_fputs},
+    {"msvcrt.dll", "_purecall",           (void*)lsw__purecall},
+    {"msvcrt.dll", "_CxxThrowException",  (void*)lsw__CxxThrowException},
+    {"msvcrt.dll", "__CxxFrameHandler",   (void*)lsw___CxxFrameHandler},
+    {"msvcrt.dll", "?terminate@@YAXXZ",   (void*)lsw_cxx_terminate},
+    {"msvcrt.dll", "?terminate@@YAXXX",   (void*)lsw_cxx_terminate},
+    {"msvcrt.dll", "??1type_info@@UAE@XZ",(void*)lsw_type_info_dtor},
+    {"msvcrt.dll", "??1type_info@@UEAA@XZ",(void*)lsw_type_info_dtor},
+    {"msvcrt.dll", "wcstok",              (void*)lsw_wcstok},
+    {"msvcrt.dll", "wcstok_s",            (void*)lsw_wcstok_s},
+    {"ucrtbase.dll", "wcstok_s",          (void*)lsw_wcstok_s},
+    {"msvcrt.dll", "wcstoul",             (void*)lsw_wcstoul},
+    {"msvcrt.dll", "wcstol",              (void*)lsw_wcstol},
+    {"msvcrt.dll", "wcstod",              (void*)lsw_wcstod},
+    {"msvcrt.dll", "__CxxFrameHandler3",  (void*)lsw___CxxFrameHandler3},
+    {"msvcrt.dll", "__CxxFrameHandler4",  (void*)lsw___CxxFrameHandler3},
+    {"msvcrt.dll", "_vsnwprintf",         (void*)lsw__vsnwprintf},
+    {"msvcrt.dll", "_ultow",              (void*)lsw__ultow},
+    {"msvcrt.dll", "_memicmp",            (void*)lsw__memicmp},
+    {"msvcrt.dll", "_callnewh",           (void*)lsw__callnewh},
+    {"msvcrt.dll", "??3@YAXPEAX@Z",       (void*)lsw_operator_delete},
+    {"msvcrt.dll", "??0exception@@QEAA@AEBQEBD@Z",  (void*)lsw_exception_ctor_cstr},
+    {"msvcrt.dll", "??0exception@@QEAA@AEBQEBDH@Z", (void*)lsw_exception_ctor_cstr_h},
+    {"msvcrt.dll", "??0exception@@QEAA@AEBV0@@Z",   (void*)lsw_exception_copy_ctor},
+    {"msvcrt.dll", "??1exception@@UEAA@XZ",          (void*)lsw_exception_dtor},
+    {"msvcrt.dll", "?what@exception@@UEBAPEBDXZ",    (void*)lsw_exception_what},
     
     // KERNEL32.dll
     {"KERNEL32.dll", "Sleep", (void*)lsw_Sleep},
     {"KERNEL32.dll", "GetLastError", (void*)lsw_GetLastError},
     {"KERNEL32.dll", "SetUnhandledExceptionFilter", (void*)lsw_SetUnhandledExceptionFilter},
+    {"KERNEL32.dll", "UnhandledExceptionFilter",    (void*)lsw_UnhandledExceptionFilter},
+    {"KERNEL32.dll", "InterlockedIncrement",         (void*)lsw_InterlockedIncrement},
+    {"KERNEL32.dll", "InterlockedDecrement",         (void*)lsw_InterlockedDecrement},
+    {"KERNEL32.dll", "InterlockedExchange",          (void*)lsw_InterlockedExchange},
+    {"KERNEL32.dll", "InterlockedCompareExchange",   (void*)lsw_InterlockedCompareExchange},
+    {"KERNEL32.dll", "GetThreadLocale",              (void*)lsw_GetThreadLocale},
+    {"KERNEL32.dll", "SetThreadUILanguage",          (void*)lsw_SetThreadUILanguage},
+    {"KERNEL32.dll", "GetTimeFormatW",               (void*)lsw_GetTimeFormatW},
+    {"KERNEL32.dll", "FindStringOrdinal",            (void*)lsw_FindStringOrdinal},
+    {"KERNEL32.dll", "SetFileApisToOEM",             (void*)lsw_SetFileApisToOEM},
+    {"KERNEL32.dll", "SetFileApisToANSI",            (void*)lsw_SetFileApisToANSI},
+    {"KERNEL32.dll", "IsProcessorFeaturePresent",    (void*)lsw_IsProcessorFeaturePresent},
+    {"KERNEL32.dll", "GlobalMemoryStatus",           (void*)lsw_GlobalMemoryStatus},
+    {"KERNEL32.dll", "GlobalMemoryStatusEx",         (void*)lsw_GlobalMemoryStatusEx},
+    {"KERNEL32.dll", "GetLargePageMinimum",          (void*)lsw_GetLargePageMinimum},
+    {"KERNEL32.dll", "FindFirstStreamW",             (void*)lsw_FindFirstStreamW},
+    {"KERNEL32.dll", "FindNextStreamW",              (void*)lsw_FindNextStreamW},
+    {"KERNEL32.dll", "FileTimeToLocalFileTime",      (void*)lsw_FileTimeToLocalFileTime},
+    {"KERNEL32.dll", "FileTimeToDosDateTime",        (void*)lsw_FileTimeToDosDateTime},
+    {"KERNEL32.dll", "CompareFileTime",              (void*)lsw_CompareFileTime},
+    {"KERNEL32.dll", "MoveFileWithProgressW",        (void*)lsw_MoveFileWithProgressW},
+    {"KERNEL32.dll", "OpenEventW",                   (void*)lsw_OpenEventW},
     {"KERNEL32.dll", "InitializeCriticalSection", (void*)lsw_InitializeCriticalSection},
     {"KERNEL32.dll", "DeleteCriticalSection", (void*)lsw_DeleteCriticalSection},
     {"KERNEL32.dll", "EnterCriticalSection", (void*)lsw_EnterCriticalSection},
@@ -6018,6 +9790,101 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "WriteConsoleA", (void*)lsw_WriteConsoleA},
     {"KERNEL32.dll", "GetCommandLineA", (void*)lsw_GetCommandLineA},
     {"KERNEL32.dll", "ExitProcess", (void*)lsw_ExitProcess},
+
+    // ADVAPI32.dll — extra stubs not in advapi32_api.c
+    {"advapi32.dll", "GetSidIdentifierAuthority",  (void*)lsw_GetSidIdentifierAuthority},
+    {"ADVAPI32.dll", "GetSidIdentifierAuthority",  (void*)lsw_GetSidIdentifierAuthority},
+    {"advapi32.dll", "InitializeSid",              (void*)lsw_InitializeSid},
+    {"ADVAPI32.dll", "InitializeSid",              (void*)lsw_InitializeSid},
+    {"advapi32.dll", "LookupPrivilegeDisplayNameW",(void*)lsw_LookupPrivilegeDisplayNameW},
+    {"ADVAPI32.dll", "LookupPrivilegeDisplayNameW",(void*)lsw_LookupPrivilegeDisplayNameW},
+    /* LSA policy functions — needed by net user <name> for domain/SID lookups */
+    {"ADVAPI32.dll", "LsaOpenPolicy",              (void*)lsw_LsaOpenPolicy},
+    {"ADVAPI32.dll", "LsaQueryInformationPolicy",  (void*)lsw_LsaQueryInformationPolicy},
+    {"ADVAPI32.dll", "LsaFreeMemory",              (void*)lsw_LsaFreeMemory},
+    {"ADVAPI32.dll", "LsaClose",                   (void*)lsw_LsaClose},
+    {"ADVAPI32.dll", "LsaLookupSids",              (void*)lsw_LsaLookupSids},
+    {"ADVAPI32.dll", "LsaLookupNames2",            (void*)lsw_LsaLookupNames2},
+    /* apiset forwarding for LSA policy DLL */
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaOpenPolicy",             (void*)lsw_LsaOpenPolicy},
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaQueryInformationPolicy", (void*)lsw_LsaQueryInformationPolicy},
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaFreeMemory",             (void*)lsw_LsaFreeMemory},
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaClose",                  (void*)lsw_LsaClose},
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaLookupSids",             (void*)lsw_LsaLookupSids},
+    {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaLookupNames2",           (void*)lsw_LsaLookupNames2},
+
+    // ntdll.dll — additional stubs
+    {"ntdll.dll", "RtlVerifyVersionInfo",  (void*)lsw_RtlVerifyVersionInfo},
+    {"ntdll.dll", "VerSetConditionMask",   (void*)lsw_VerSetConditionMask},
+    {"ntdll.dll", "RtlVirtualUnwind",      (void*)lsw_RtlVirtualUnwind},
+
+    // USER32.dll — additional stubs
+    {"USER32.dll", "LoadStringW",          (void*)lsw_LoadStringW},
+    {"USER32.dll", "CharLowerW",           (void*)lsw_CharLowerW},
+    {"USER32.dll", "CharUpperW",           (void*)lsw_CharUpperW},
+
+    // SspiCli.dll stubs (Kerberos/NTLM auth — whoami needs these)
+    {"SspiCli.dll", "GetUserNameExW",                  (void*)lsw_GetUserNameExW},
+    {"SspiCli.dll", "LsaConnectUntrusted",             (void*)lsw_LsaConnectUntrusted},
+    {"SspiCli.dll", "LsaCallAuthenticationPackage",    (void*)lsw_LsaCallAuthenticationPackage},
+    {"SspiCli.dll", "LsaLookupAuthenticationPackage",  (void*)lsw_LsaLookupAuthenticationPackage},
+
+    // AUTHZ.dll stubs
+    {"AUTHZ.dll", "FreeClaimDefinitions",      (void*)lsw_FreeClaimDefinitions},
+    {"AUTHZ.dll", "InitializeClaimDictionary", (void*)lsw_InitializeClaimDictionary},
+    {"AUTHZ.dll", "GetClaimDefinitions",       (void*)lsw_GetClaimDefinitions},
+    {"AUTHZ.dll", "FreeClaimDictionary",       (void*)lsw_FreeClaimDictionary},
+
+    // wkscli.dll / netutils.dll stubs
+    {"wkscli.dll",   "NetGetJoinInformation",  (void*)lsw_NetGetJoinInformation},
+    {"wkscli.dll",   "NetUseGetInfo",           (void*)lsw_NetUseGetInfo},
+    {"wkscli.dll",   "NetUseEnum",              (void*)lsw_NetUseEnum},
+    {"wkscli.dll",   "NetWkstaUserGetInfo",     (void*)lsw_NetWkstaUserGetInfo},
+    {"wkscli.dll",   "NetWkstaGetInfo",         (void*)lsw_NetWkstaGetInfo},
+    {"netutils.dll", "NetApiBufferFree",        (void*)lsw_NetApiBufferFree},
+    {"netutils.dll", "NetApiBufferAllocate",    (void*)lsw_NetApiBufferAllocate},
+    {"netutils.dll", "NetapipBufferAllocate",   (void*)lsw_NetapipBufferAllocate},
+    {"netutils.dll", "NetApiBufferReallocate",  (void*)lsw_NetApiBufferReallocate},
+    {"netutils.dll", "NetpwNameValidate",       (void*)lsw_NetpwNameValidate},
+    {"netutils.dll", "NetpwPathType",           (void*)lsw_NetpwPathType},
+    {"samcli.dll",   "NetUserGetInfo",          (void*)lsw_NetUserGetInfo},
+    {"samcli.dll",   "NetUserAdd",              (void*)lsw_NetUserAdd},
+    {"samcli.dll",   "NetUserDel",              (void*)lsw_NetUserDel},
+    {"samcli.dll",   "NetUserSetInfo",          (void*)lsw_NetUserSetInfo},
+    {"samcli.dll",   "NetUserGetGroups",        (void*)lsw_NetUserGetGroups},
+    {"samcli.dll",   "NetUserGetLocalGroups",   (void*)lsw_NetUserGetLocalGroups},
+    {"samcli.dll",   "NetUserEnum",             (void*)lsw_NetUserEnum},
+    {"samcli.dll",   "NetUserModalsGet",        (void*)lsw_NetUserModalsGet},
+    {"samcli.dll",   "NetUserModalsSet",        (void*)lsw_NetUserModalsSet},
+    {"samcli.dll",   "NetGroupAdd",             (void*)lsw_NetGroupAdd},
+    {"samcli.dll",   "NetGroupDel",             (void*)lsw_NetGroupDel},
+    {"samcli.dll",   "NetGroupGetInfo",         (void*)lsw_NetGroupGetInfo},
+    {"samcli.dll",   "NetGroupSetInfo",         (void*)lsw_NetGroupSetInfo},
+    {"samcli.dll",   "NetGroupGetUsers",        (void*)lsw_NetGroupGetUsers},
+    {"samcli.dll",   "NetGroupEnum",            (void*)lsw_NetGroupEnum},
+    {"samcli.dll",   "NetGroupAddUser",         (void*)lsw_NetGroupAddUser},
+    {"samcli.dll",   "NetGroupDelUser",         (void*)lsw_NetGroupDelUser},
+    {"srvcli.dll",   "NetServerGetInfo",        (void*)lsw_NetServerGetInfo},
+    {"srvcli.dll",   "NetShareEnum",            (void*)lsw_NetShareEnum},
+    {"srvcli.dll",   "NetServerEnum",           (void*)lsw_NetServerEnum},
+    {"KERNEL32.dll", "NetServerEnum",           (void*)lsw_NetServerEnum},  /* some binaries import from KERNEL32 */
+    /* credui.dll stubs */
+    {"credui.dll",   "CredUICmdLinePromptForCredentialsW", (void*)lsw_CredUICmdLinePromptForCredentialsW},
+    {"KERNEL32.dll", "CredUICmdLinePromptForCredentialsW", (void*)lsw_CredUICmdLinePromptForCredentialsW},
+    /* MPR stubs */
+    {"MPR.dll",   "WNetGetLastErrorW",       (void*)lsw_WNetGetLastErrorW},
+    {"MPR.dll",   "WNetCancelConnection2W",  (void*)lsw_WNetCancelConnection2W},
+    {"MPR.dll",   "WNetOpenEnumW",           (void*)lsw_WNetOpenEnumW},
+    {"MPR.dll",   "WNetAddConnection4W",     (void*)lsw_WNetAddConnection4W},
+    {"MPR.dll",   "WNetEnumResourceW",       (void*)lsw_WNetEnumResourceW},
+    {"MPR.dll",   "WNetGetConnectionW",      (void*)lsw_WNetGetConnectionW},
+    {"MPR.dll",   "WNetCloseEnum",           (void*)lsw_WNetCloseEnum},
+    /* SspiCli stubs */
+    {"SspiCli.dll", "SspiMarshalAuthIdentity",         (void*)lsw_SspiMarshalAuthIdentity},
+    {"SspiCli.dll", "SsspiFreeAuthIdentity",           (void*)lsw_SsspiFreeAuthIdentity},
+    {"SspiCli.dll", "SspiLocalFree",                   (void*)lsw_SspiLocalFree},
+    {"SspiCli.dll", "SspiEncodeStringsAsAuthIdentity", (void*)lsw_SspiEncodeStringsAsAuthIdentity},
+    {"SspiCli.dll", "SspiFreeAuthIdentity",            (void*)lsw_SspiFreeAuthIdentity},
     
     // COMDLG32.dll - Common Dialogs
     {"COMDLG32.dll", "PrintDlgW", (void*)lsw_PrintDlgW},
@@ -6040,6 +9907,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ws2_32.dll", "inet_addr", (void*)lsw_inet_addr},
     {"ws2_32.dll", "gethostbyname", (void*)lsw_gethostbyname},
     {"ws2_32.dll", "gethostbyaddr", (void*)lsw_gethostbyaddr},
+    {"ws2_32.dll", "GetHostNameW",  (void*)lsw_GetHostNameW},
+    {"ws2_32.dll", "InetNtopW",     (void*)lsw_InetNtopW},
     
     // KERNEL32.dll - continued
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
@@ -6576,6 +10445,13 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "FreeLibrary",              (void*)lsw_FreeLibrary},
     {"KERNEL32.dll", "FreeLibraryAndExitThread", (void*)lsw_FreeLibraryAndExitThread},
     {"KERNEL32.dll", "LoadLibraryExW",           (void*)lsw_LoadLibraryExW},
+    {"KERNEL32.dll", "SetDefaultDllDirectories", (void*)lsw_SetDefaultDllDirectories},
+    {"KERNEL32.dll", "AddDllDirectory",          (void*)lsw_AddDllDirectory},
+    {"KERNEL32.dll", "RemoveDllDirectory",       (void*)lsw_RemoveDllDirectory},
+    {"KERNEL32.dll", "SetDllDirectoryW",         (void*)lsw_SetDllDirectoryW},
+    {"KERNEL32.dll", "SetDllDirectoryA",         (void*)lsw_SetDllDirectoryA},
+    {"KERNEL32.dll", "GetDllDirectoryW",         (void*)lsw_GetDllDirectoryW},
+    {"KERNEL32.dll", "GetDllDirectoryA",         (void*)lsw_GetDllDirectoryA},
     {"KERNEL32.dll", "GetModuleHandleExW",       (void*)lsw_GetModuleHandleExW},
     {"KERNEL32.dll", "GetModuleHandleExA",       (void*)lsw_GetModuleHandleExA},
     {"KERNEL32.dll", "HeapCreate",               (void*)lsw_HeapCreate},
@@ -6746,9 +10622,256 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "SetConsoleCtrlHandler",    (void*)lsw_SetConsoleCtrlHandler},
     {"KERNEL32.dll", "GenerateConsoleCtrlEvent", (void*)lsw_GenerateConsoleCtrlEvent},
     {"KERNEL32.dll", "GetConsoleTitle",          (void*)lsw_GetConsoleTitle},
+    /* New KERNEL32 entries for broader app compat */
+    {"KERNEL32.dll", "GetComputerNameW",         (void*)lsw_GetComputerNameW},
+    {"KERNEL32.dll", "GetComputerNameA",         (void*)lsw_GetComputerNameA},
+    {"KERNEL32.dll", "GetComputerNameExW",       (void*)lsw_GetComputerNameExW},
+    {"KERNEL32.dll", "GetDateFormatW",           (void*)lsw_GetDateFormatW},
+    {"KERNEL32.dll", "RtlCaptureContext",        (void*)lsw_RtlCaptureContext},
+    {"KERNEL32.dll", "RtlLookupFunctionEntry",   (void*)lsw_RtlLookupFunctionEntry},
+    {"KERNEL32.dll", "RtlVirtualUnwind",         (void*)lsw_RtlVirtualUnwind},
+    {"KERNEL32.dll", "GetCPInfo",                (void*)lsw_GetCPInfo},
+    {"KERNEL32.dll", "ApiSetQueryApiSetPresence",(void*)lsw_ApiSetQueryApiSetPresence},
+    {"KERNEL32.dll", "ResolveDelayLoadedAPI",    (void*)lsw_ResolveDelayLoadedAPI},
+    {"KERNEL32.dll", "DelayLoadFailureHook",     (void*)lsw_DelayLoadFailureHook},
+    {"KERNEL32.dll", "PeekConsoleInputW",        (void*)lsw_PeekConsoleInputW},
+    {"ntdll.dll",    "RtlCaptureContext",        (void*)lsw_RtlCaptureContext},
+    {"ntdll.dll",    "RtlLookupFunctionEntry",   (void*)lsw_RtlLookupFunctionEntry},
+    /* msvcrt.dll new entries */
+    {"msvcrt.dll",   "_wcsicmp",    (void*)lsw__wcsicmp},
+    {"msvcrt.dll",   "_wcsnicmp",   (void*)lsw__wcsnicmp},
+    {"msvcrt.dll",   "_write",      (void*)lsw__write},
+    {"msvcrt.dll",   "_setmode",    (void*)lsw__setmode},
+    {"msvcrt.dll",   "setlocale",   (void*)lsw_setlocale},
+    {"msvcrt.dll",   "fgetpos",     (void*)lsw_fgetpos},
+    {"msvcrt.dll",   "_vscwprintf", (void*)lsw__vscwprintf},
+    {"msvcrt.dll",   "vswprintf_s", (void*)lsw_vswprintf_s},
+    {"msvcrt.dll",   "swprintf_s",  (void*)lsw_swprintf_s},
+    {"msvcrt.dll",   "_wcsrev",     (void*)lsw__wcsrev},
+    /* msvcrt.dll — additional missing entries for net.exe and similar */
+    {"msvcrt.dll",   "sprintf_s",   (void*)lsw_sprintf_s},
+    {"msvcrt.dll",   "wcscpy_s",    (void*)lsw_wcscpy_s},
+    {"msvcrt.dll",   "wcscat_s",    (void*)lsw_wcscat_s},
+    {"msvcrt.dll",   "wcsncat_s",   (void*)lsw_wcsncat_s},
+    {"msvcrt.dll",   "wcsncpy_s",   (void*)lsw_wcsncpy_s},
+    {"msvcrt.dll",   "wcsspn",      (void*)lsw_wcsspn},
+    {"msvcrt.dll",   "wcspbrk",     (void*)lsw_wcspbrk},
+    {"msvcrt.dll",   "wcscspn",     (void*)lsw_wcscspn},
+    {"msvcrt.dll",   "_wcsupr",     (void*)lsw__wcsupr},
+    {"msvcrt.dll",   "_wtoi",       (void*)lsw__wtoi},
+    {"msvcrt.dll",   "iswctype",    (void*)lsw_iswctype},
+    {"msvcrt.dll",   "_snwprintf_s",(void*)lsw__snwprintf_s},
+    {"msvcrt.dll",   "_vsnwprintf_s",(void*)lsw__vsnwprintf_s},
+    {"msvcrt.dll",   "_local_unwind",(void*)lsw__local_unwind},
+    {"ucrtbase.dll", "_wcsicmp",    (void*)lsw__wcsicmp},
+    {"ucrtbase.dll", "_wcsnicmp",   (void*)lsw__wcsnicmp},
+    {"ucrtbase.dll", "_write",      (void*)lsw__write},
+    {"ucrtbase.dll", "_setmode",    (void*)lsw__setmode},
+    {"ucrtbase.dll", "setlocale",   (void*)lsw_setlocale},
+    {"ucrtbase.dll", "fgetpos",     (void*)lsw_fgetpos},
+    {"ucrtbase.dll", "_vscwprintf", (void*)lsw__vscwprintf},
+    {"ucrtbase.dll", "vswprintf_s", (void*)lsw_vswprintf_s},
     // USER32 SystemParametersInfo (also lives under user32.dll)
     {"user32.dll",   "SystemParametersInfoW",    (void*)lsw_SystemParametersInfoW},
     {"user32.dll",   "SystemParametersInfoA",    (void*)lsw_SystemParametersInfoA},
+    /* OLEAUT32.dll BSTR API (also exported by name in some DLL chains) */
+    {"OLEAUT32.dll", "SysAllocString",            (void*)lsw_SysAllocString},
+    {"OLEAUT32.dll", "SysAllocStringLen",         (void*)lsw_SysAllocStringLen},
+    {"OLEAUT32.dll", "SysAllocStringByteLen",     (void*)lsw_SysAllocStringByteLen},
+    {"OLEAUT32.dll", "SysReAllocString",          (void*)lsw_SysReAllocString},
+    {"OLEAUT32.dll", "SysReAllocStringLen",       (void*)lsw_SysReAllocStringLen},
+    {"OLEAUT32.dll", "SysFreeString",             (void*)lsw_SysFreeString},
+    {"OLEAUT32.dll", "SysStringLen",              (void*)lsw_SysStringLen},
+    {"OLEAUT32.dll", "SysStringByteLen",          (void*)lsw_SysStringByteLen},
+    /* ADVAPI32.dll — RegOpenKeyW (thin wrapper without SAM/options) */
+    {"ADVAPI32.dll", "RegOpenKeyW",               (void*)lsw_RegOpenKeyW},
+
+    /* wkscli.dll */
+    {"wkscli.dll",   "NetWkstaTransportEnum",      (void*)lsw_NetWkstaTransportEnum},
+    {"wkscli.dll",   "NetWkstaStatisticsGet",      (void*)lsw_NetWkstaStatisticsGet},
+
+    /* netutils.dll */
+    {"netutils.dll", "NetpwListCanonicalize",      (void*)lsw_NetpwListCanonicalize},
+    {"netutils.dll", "NetpwNameCompare",           (void*)lsw_NetpwNameCompare},
+    {"netutils.dll", "NetpwListTraverse",          (void*)lsw_NetpwListTraverse},
+    {"netutils.dll", "NetpwNameCanonicalize",      (void*)lsw_NetpwNameCanonicalize},
+
+    /* DSROLE.dll */
+    {"DSROLE.dll",   "DsRoleGetPrimaryDomainInformation", (void*)lsw_DsRoleGetPrimaryDomainInformation},
+    {"DSROLE.dll",   "DsRoleFreeMemory",           (void*)lsw_DsRoleFreeMemory},
+
+    /* logoncli.dll / netlogon DS client */
+    {"logoncli.dll", "DsGetDcNameW",               (void*)lsw_DsGetDcNameW},
+    {"logoncli.dll", "DsBindWithSpnExW",           (void*)lsw_DsBindWithSpnExW},
+    {"logoncli.dll", "DsUnBindW",                  (void*)lsw_DsUnBindW},
+    {"logoncli.dll", "DsFreeNameResultW",          (void*)lsw_DsFreeNameResultW},
+    {"logoncli.dll", "DsCrackNamesW",              (void*)lsw_DsCrackNamesW},
+
+    /* srvcli.dll */
+    {"srvcli.dll",   "NetFileEnum",                (void*)lsw_NetFileEnum},
+    {"srvcli.dll",   "NetFileGetInfo",             (void*)lsw_NetFileGetInfo},
+    {"srvcli.dll",   "NetFileClose",               (void*)lsw_NetFileClose},
+    {"srvcli.dll",   "NetSessionEnum",             (void*)lsw_NetSessionEnum},
+    {"srvcli.dll",   "NetSessionGetInfo",          (void*)lsw_NetSessionGetInfo},
+    {"srvcli.dll",   "NetSessionDel",              (void*)lsw_NetSessionDel},
+    {"srvcli.dll",   "NetConnectionEnum",          (void*)lsw_NetConnectionEnum},
+    {"srvcli.dll",   "NetServerTransportEnum",     (void*)lsw_NetServerTransportEnum},
+    {"srvcli.dll",   "NetServerSetInfo",           (void*)lsw_NetServerSetInfo},
+    {"srvcli.dll",   "NetShareGetInfo",            (void*)lsw_NetShareGetInfo},
+    {"srvcli.dll",   "NetShareCheck",              (void*)lsw_NetShareCheck},
+    {"srvcli.dll",   "NetShareSetInfo",            (void*)lsw_NetShareSetInfo},
+    {"srvcli.dll",   "NetShareDel",                (void*)lsw_NetShareDel},
+    {"srvcli.dll",   "NetShareDelSticky",          (void*)lsw_NetShareDelSticky},
+    {"srvcli.dll",   "NetShareAdd",                (void*)lsw_NetShareAdd},
+    {"srvcli.dll",   "NetRemoteTOD",               (void*)lsw_NetRemoteTOD},
+
+    /* KERNEL32.dll missing stubs */
+    {"KERNEL32.dll", "SetLocalTime",               (void*)lsw_SetLocalTime},
+    {"KERNEL32.dll", "SetSystemTime",              (void*)lsw_SetSystemTime},
+
+    /* CRYPTBASE.dll — RtlGenRandom alias */
+    {"CRYPTBASE.dll","SystemFunction036",          (void*)lsw_SystemFunction036},
+
+    /* advapi32.dll — same RtlGenRandom export */
+    {"ADVAPI32.dll", "SystemFunction036",          (void*)lsw_SystemFunction036},
+
+    /* api-ms-win-service-management-l1-1-0.dll aliases */
+    {"api-ms-win-service-management-l1-1-0.dll", "GetServiceDisplayNameW", (void*)lsw_GetServiceDisplayNameW},
+    {"api-ms-win-service-management-l1-1-0.dll", "GetServiceKeyNameW",     (void*)lsw_GetServiceKeyNameW},
+    {"api-ms-win-service-management-l1-1-0.dll", "EnumServicesStatusExW",  (void*)lsw_EnumServicesStatusExW},
+    {"api-ms-win-service-management-l1-1-0.dll", "EnumDependentServicesW", (void*)lsw_EnumDependentServicesW},
+
+    /* api-ms-win-service-core-l1-1-1.dll aliases */
+    {"api-ms-win-service-core-l1-1-1.dll",       "GetServiceDisplayNameW", (void*)lsw_GetServiceDisplayNameW},
+    {"api-ms-win-service-core-l1-1-1.dll",       "GetServiceKeyNameW",     (void*)lsw_GetServiceKeyNameW},
+    {"api-ms-win-service-core-l1-1-1.dll",       "EnumServicesStatusExW",  (void*)lsw_EnumServicesStatusExW},
+    {"api-ms-win-service-core-l1-1-1.dll",       "EnumDependentServicesW", (void*)lsw_EnumDependentServicesW},
+
+    /* api-ms-win-service-core-l1-1-2.dll aliases */
+    {"api-ms-win-service-core-l1-1-2.dll",       "GetServiceDisplayNameW", (void*)lsw_GetServiceDisplayNameW},
+    {"api-ms-win-service-core-l1-1-2.dll",       "GetServiceKeyNameW",     (void*)lsw_GetServiceKeyNameW},
+    {"api-ms-win-service-core-l1-1-2.dll",       "EnumServicesStatusExW",  (void*)lsw_EnumServicesStatusExW},
+    {"api-ms-win-service-core-l1-1-2.dll",       "EnumDependentServicesW", (void*)lsw_EnumDependentServicesW},
+
+    /* api-ms-win-security-activedirectoryclient-l1-1-0.dll */
+    {"api-ms-win-security-activedirectoryclient-l1-1-0.dll", "DsGetDcNameW", (void*)lsw_DsGetDcNameW},
+
+    /* ── api-ms-win-core-* DLL aliases ──────────────────────────────── */
+    /* api-ms-win-core-apiquery */
+    {"api-ms-win-core-apiquery-l1-1-0.dll", "ApiSetQueryApiSetPresence", (void*)lsw_ApiSetQueryApiSetPresence},
+
+    /* api-ms-win-core-console */
+    {"api-ms-win-core-console-l1-1-0.dll",  "GetConsoleMode",        (void*)lsw_GetConsoleMode},
+    {"api-ms-win-core-console-l1-1-0.dll",  "SetConsoleMode",        (void*)lsw_SetConsoleMode},
+    {"api-ms-win-core-console-l1-1-0.dll",  "ReadConsoleW",          (void*)lsw_ReadConsoleW},
+    {"api-ms-win-core-console-l1-1-0.dll",  "GetConsoleOutputCP",    (void*)lsw_GetConsoleOutputCP},
+    {"api-ms-win-core-console-l1-1-0.dll",  "WriteConsoleW",         (void*)lsw_WriteConsoleW},
+    {"api-ms-win-core-console-l1-2-0.dll",  "PeekConsoleInputW",     (void*)lsw_PeekConsoleInputW},
+
+    /* api-ms-win-core-datetime */
+    {"api-ms-win-core-datetime-l1-1-0.dll", "GetDateFormatW",        (void*)lsw_GetDateFormatW},
+    {"api-ms-win-core-datetime-l1-1-0.dll", "GetTimeFormatW",        (void*)lsw_GetTimeFormatW},
+
+    /* api-ms-win-core-delayload */
+    {"api-ms-win-core-delayload-l1-1-0.dll","DelayLoadFailureHook",  (void*)lsw_DelayLoadFailureHook},
+    {"api-ms-win-core-delayload-l1-1-1.dll","ResolveDelayLoadedAPI", (void*)lsw_ResolveDelayLoadedAPI},
+
+    /* api-ms-win-core-errorhandling */
+    {"api-ms-win-core-errorhandling-l1-1-0.dll","SetLastError",               (void*)lsw_SetLastError},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll","GetLastError",               (void*)lsw_GetLastError},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll","SetUnhandledExceptionFilter",(void*)lsw_SetUnhandledExceptionFilter},
+    {"api-ms-win-core-errorhandling-l1-1-0.dll","UnhandledExceptionFilter",   (void*)lsw_UnhandledExceptionFilter},
+
+    /* api-ms-win-core-file */
+    {"api-ms-win-core-file-l1-1-0.dll",     "GetFileType",           (void*)lsw_GetFileType},
+    {"api-ms-win-core-file-l1-1-0.dll",     "WriteFile",             (void*)lsw_WriteFile},
+    {"api-ms-win-core-file-l1-1-0.dll",     "GetDriveTypeW",         (void*)lsw_GetDriveTypeW},
+
+    /* api-ms-win-core-heap */
+    {"api-ms-win-core-heap-l1-1-0.dll",     "HeapSetInformation",    (void*)lsw_HeapSetInformation},
+    {"api-ms-win-core-heap-l2-1-0.dll",     "LocalAlloc",            (void*)lsw_LocalAlloc},
+    {"api-ms-win-core-heap-l2-1-0.dll",     "LocalFree",             (void*)lsw_LocalFree},
+    {"api-ms-win-core-heap-l2-1-0.dll",     "GlobalFree",            (void*)lsw_GlobalFree},
+    {"api-ms-win-core-heap-l2-1-0.dll",     "GlobalAlloc",           (void*)lsw_GlobalAlloc},
+
+    /* api-ms-win-core-libraryloader */
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","GetProcAddress",    (void*)lsw_GetProcAddress},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","GetModuleHandleW",  (void*)lsw_GetModuleHandleW},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","GetModuleFileNameW",(void*)lsw_GetModuleFileNameW},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","FreeLibrary",       (void*)lsw_FreeLibrary},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","LoadLibraryExW",    (void*)lsw_LoadLibraryExW},
+
+    /* api-ms-win-core-localization */
+    {"api-ms-win-core-localization-l1-2-0.dll","SetThreadUILanguage",(void*)lsw_SetThreadUILanguage},
+    {"api-ms-win-core-localization-l1-2-0.dll","FormatMessageW",     (void*)lsw_FormatMessageW},
+    {"api-ms-win-core-localization-l1-2-0.dll","GetUserDefaultLCID", (void*)lsw_GetUserDefaultLCID},
+    {"api-ms-win-core-localization-l1-2-0.dll","GetCPInfo",          (void*)lsw_GetCPInfo},
+
+    /* api-ms-win-core-privateprofile */
+    {"api-ms-win-core-privateprofile-l1-1-0.dll","GetProfileStringW",(void*)lsw_GetProfileStringW},
+
+    /* api-ms-win-core-processenvironment */
+    {"api-ms-win-core-processenvironment-l1-1-0.dll","GetCommandLineW",(void*)lsw_GetCommandLineW},
+    {"api-ms-win-core-processenvironment-l1-1-0.dll","GetStdHandle",   (void*)lsw_GetStdHandle},
+
+    /* api-ms-win-core-processthreads */
+    {"api-ms-win-core-processthreads-l1-1-0.dll","TerminateProcess",    (void*)lsw_TerminateProcess},
+    {"api-ms-win-core-processthreads-l1-1-0.dll","GetCurrentThreadId",  (void*)lsw_GetCurrentThreadId},
+    {"api-ms-win-core-processthreads-l1-1-0.dll","GetCurrentProcessId", (void*)lsw_GetCurrentProcessId},
+    {"api-ms-win-core-processthreads-l1-1-0.dll","GetCurrentProcess",   (void*)lsw_GetCurrentProcess},
+
+    /* api-ms-win-core-profile */
+    {"api-ms-win-core-profile-l1-1-0.dll",  "QueryPerformanceCounter",(void*)lsw_QueryPerformanceCounter},
+
+    /* api-ms-win-core-registry */
+    {"api-ms-win-core-registry-l1-1-0.dll", "RegOpenKeyExW",         (void*)lsw_RegOpenKeyExW},
+    {"api-ms-win-core-registry-l1-1-0.dll", "RegQueryValueExW",      (void*)lsw_RegQueryValueExW},
+    {"api-ms-win-core-registry-l1-1-0.dll", "RegCloseKey",           (void*)lsw_RegCloseKey},
+
+    /* api-ms-win-core-rtlsupport */
+    {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlCompareMemory",     (void*)lsw_RtlCompareMemory},
+    {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlLookupFunctionEntry",(void*)lsw_RtlLookupFunctionEntry},
+    {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlCaptureContext",    (void*)lsw_RtlCaptureContext},
+    {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlVirtualUnwind",     (void*)lsw_RtlVirtualUnwind},
+
+    /* api-ms-win-core-string */
+    {"api-ms-win-core-string-l1-1-0.dll",   "CompareStringW",        (void*)lsw_CompareStringW},
+    {"api-ms-win-core-string-l1-1-0.dll",   "WideCharToMultiByte",   (void*)lsw_WideCharToMultiByte},
+
+    /* api-ms-win-core-synch */
+    {"api-ms-win-core-synch-l1-2-0.dll",    "Sleep",                 (void*)lsw_Sleep},
+
+    /* api-ms-win-core-sysinfo */
+    {"api-ms-win-core-sysinfo-l1-1-0.dll",  "GetTickCount",          (void*)lsw_GetTickCount},
+    {"api-ms-win-core-sysinfo-l1-1-0.dll",  "GetSystemTimeAsFileTime",(void*)lsw_GetSystemTimeAsFileTime},
+    {"api-ms-win-core-sysinfo-l1-1-0.dll",  "SetLocalTime",          (void*)lsw_SetLocalTime},
+    {"api-ms-win-core-sysinfo-l1-1-0.dll",  "GetSystemDirectoryW",   (void*)lsw_GetSystemDirectoryW},
+    {"api-ms-win-core-sysinfo-l1-1-0.dll",  "GetComputerNameExW",    (void*)lsw_GetComputerNameExW},
+    {"api-ms-win-core-sysinfo-l1-2-0.dll",  "SetSystemTime",         (void*)lsw_SetSystemTime},
+
+    /* api-ms-win-core-timezone */
+    {"api-ms-win-core-timezone-l1-1-0.dll", "GetTimeZoneInformation",(void*)lsw_GetTimeZoneInformation},
+
+    /* api-ms-win-security-activedirectoryclient (DS bind/crack) */
+    {"api-ms-win-security-activedirectoryclient-l1-1-0.dll","DsBindWithSpnExW", (void*)lsw_DsBindWithSpnExW},
+    {"api-ms-win-security-activedirectoryclient-l1-1-0.dll","DsFreeNameResultW",(void*)lsw_DsFreeNameResultW},
+    {"api-ms-win-security-activedirectoryclient-l1-1-0.dll","DsUnBindW",        (void*)lsw_DsUnBindW},
+    {"api-ms-win-security-activedirectoryclient-l1-1-0.dll","DsCrackNamesW",    (void*)lsw_DsCrackNamesW},
+
+    /* api-ms-win-security-base */
+    {"api-ms-win-security-base-l1-1-0.dll", "InitializeAcl",              (void*)lsw_InitializeAcl},
+    {"api-ms-win-security-base-l1-1-0.dll", "InitializeSecurityDescriptor",(void*)lsw_InitializeSecurityDescriptor},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetSidLengthRequired",       (void*)lsw_GetSidLengthRequired},
+    {"api-ms-win-security-base-l1-1-0.dll", "EqualSid",                   (void*)lsw_EqualSid},
+    {"api-ms-win-security-base-l1-1-0.dll", "CopySid",                    (void*)lsw_CopySid},
+    {"api-ms-win-security-base-l1-1-0.dll", "CreateWellKnownSid",         (void*)lsw_CreateWellKnownSid},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetLengthSid",               (void*)lsw_GetLengthSid},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetAce",                     (void*)lsw_GetAce},
+    {"api-ms-win-security-base-l1-1-0.dll", "AddAccessAllowedAce",        (void*)lsw_AddAccessAllowedAce},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetSecurityDescriptorDacl",  (void*)lsw_GetSecurityDescriptorDacl},
+    {"api-ms-win-security-base-l1-1-0.dll", "SetSecurityDescriptorDacl",  (void*)lsw_SetSecurityDescriptorDacl},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetSidSubAuthorityCount",    (void*)lsw_GetSidSubAuthorityCount},
+    {"api-ms-win-security-base-l1-1-0.dll", "GetSidSubAuthority",         (void*)lsw_GetSidSubAuthority},
 };
 
 #pragma GCC diagnostic pop
@@ -6757,7 +10880,8 @@ static const size_t api_mappings_count = sizeof(api_mappings) / sizeof(api_mappi
 
 // Generic stub for unresolved functions
 static int generic_stub(void) {
-    LSW_LOG_WARN("Called unresolved Win32 API function - returning 0");
+    void* caller = __builtin_return_address(0);
+    LSW_LOG_WARN("Called unresolved Win32 API function (called from %p) - returning 0", caller);
     return 0;
 }
 
@@ -6826,6 +10950,16 @@ static const lsw_ordinal_entry_t ordinal_table[] = {
     /* ntdll.dll — ordinals used by some apps */
     {"ntdll.dll",   0, "RtlAllocateHeap"},
     {"ntdll.dll",   2, "RtlFreeHeap"},
+    /* OLEAUT32.dll BSTR functions — exported by ordinal */
+    {"OLEAUT32.dll",  2, "SysAllocString"},
+    {"OLEAUT32.dll",  3, "SysReAllocString"},
+    {"OLEAUT32.dll",  4, "SysAllocStringLen"},
+    {"OLEAUT32.dll",  5, "SysReAllocStringLen"},
+    {"OLEAUT32.dll",  6, "SysFreeString"},
+    {"OLEAUT32.dll",  7, "SysStringLen"},
+    {"OLEAUT32.dll",  8, "SysStringByteLen"},
+    {"OLEAUT32.dll",  9, "SysAllocStringByteLen"},
+    {"OLEAUT32.dll", 10, "SysAllocStringByteLen"},  /* alias ordinal 10 */
     /* {sentinel} */
     {NULL, 0, NULL}
 };

@@ -168,24 +168,31 @@ int main(int argc, char* argv[]) {
     char* executable_path = NULL;
     int executable_index = -1; // Track where in argv the .exe is
     
-    // Check for help requests (forgiving!)
+    // Check for help requests — but only if --launch is not present
+    // (after --launch, args belong to the Windows program)
+    bool has_launch = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--help") == 0 ||
-            strcmp(argv[i], "--h") == 0 ||
-            strcmp(argv[i], "-h") == 0 ||
-            strcmp(argv[i], "-?") == 0 ||
-            strcmp(argv[i], "?") == 0 ||
-            strcmp(argv[i], "help") == 0 ||
-            strcmp(argv[i], "what") == 0 ||
-            strcmp(argv[i], "how") == 0) {
-            show_help();
-            return 0;
-        }
-        
-        if (strcmp(argv[i], "--version") == 0 ||
-            strcmp(argv[i], "-v") == 0) {
-            show_version();
-            return 0;
+        if (strcmp(argv[i], "--launch") == 0) { has_launch = true; break; }
+    }
+    if (!has_launch) {
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--help") == 0 ||
+                strcmp(argv[i], "--h") == 0 ||
+                strcmp(argv[i], "-h") == 0 ||
+                strcmp(argv[i], "-?") == 0 ||
+                strcmp(argv[i], "?") == 0 ||
+                strcmp(argv[i], "help") == 0 ||
+                strcmp(argv[i], "what") == 0 ||
+                strcmp(argv[i], "how") == 0) {
+                show_help();
+                return 0;
+            }
+            
+            if (strcmp(argv[i], "--version") == 0 ||
+                strcmp(argv[i], "-v") == 0) {
+                show_version();
+                return 0;
+            }
         }
     }
     
@@ -324,24 +331,52 @@ int main(int argc, char* argv[]) {
     printf("Sections: %u\n", image.pe.num_sections);
     printf("\n");
     
-    // Build PE-specific argc/argv (starting from executable, including all args after)
+    // Build PE-specific argc/argv.
+    // Convention: LSW flags go between --launch <exe> and a "--" separator.
+    //   Everything AFTER "--" is passed as arguments to the Windows executable.
+    //   If no "--" separator is present, no extra args are forwarded.
+    //   Example: lsw --launch game.exe -debug -- /arg1 /arg2
     int pe_argc = 0;
     char** pe_argv = NULL;
-    
+
     if (executable_index >= 0) {
-        // Count remaining args after executable
-        pe_argc = argc - executable_index;
-        pe_argv = &argv[executable_index];
+        // Count how many args follow the "--" separator (if any)
+        int sep_index = -1;
+        for (int i = executable_index + 1; i < argc; i++) {
+            if (strcmp(argv[i], "--") == 0) { sep_index = i; break; }
+        }
+        int pe_extra = (sep_index >= 0) ? (argc - sep_index - 1) : 0;
+
+        pe_argv = malloc((pe_extra + 2) * sizeof(char*));
+        if (!pe_argv) {
+            fprintf(stderr, "❌ Out of memory building argument list\n");
+            return 1;
+        }
+        pe_argv[pe_argc++] = argv[executable_index]; // exe path always first
+
+        if (sep_index >= 0) {
+            for (int i = sep_index + 1; i < argc; i++) {
+                pe_argv[pe_argc++] = argv[i];
+            }
+        }
+        pe_argv[pe_argc] = NULL;
     } else {
         // No arguments - just executable
         pe_argc = 1;
-        pe_argv = &executable_path;
+        pe_argv = malloc(2 * sizeof(char*));
+        if (!pe_argv) {
+            fprintf(stderr, "❌ Out of memory building argument list\n");
+            return 1;
+        }
+        pe_argv[0] = executable_path;
+        pe_argv[1] = NULL;
     }
     
     // Execute
     int exit_code = pe_execute(&image, pe_argc, pe_argv);
-    
+
     // Clean up
+    free(pe_argv);
     pe_unload_image(&image);
     
     return exit_code;

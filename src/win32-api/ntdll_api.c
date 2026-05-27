@@ -20,6 +20,8 @@
  *   Windows NTSTATUS convention: 0xC0000xxx.
  */
 
+#define _GNU_SOURCE  /* clock_gettime, timegm, strdup */
+
 #include "win32_api.h"
 #include "lsw_log.h"
 #include <stdint.h>
@@ -32,7 +34,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <time.h>
 #include <sys/time.h>
+#include <arpa/inet.h>
 
 /* NTSTATUS constants */
 #define STATUS_SUCCESS                  0x00000000
@@ -189,6 +193,93 @@ void __attribute__((ms_abi)) lsw_RtlInitUnicodeString(lsw_unicode_string_t* us, 
     us->Length        = (uint16_t)(len * 2);
     us->MaximumLength = (uint16_t)(len * 2 + 2);
     us->Buffer        = (uint16_t*)src; /* points into existing buffer */
+}
+
+/* ------------------------------------------------------------------
+ * IP address conversion stubs (used by ipconfig, netsh, etc.)
+ * ------------------------------------------------------------------ */
+
+/* RtlIpv4AddressToStringExW: IN_ADDR -> wide string with optional port */
+uint16_t* __attribute__((ms_abi)) lsw_RtlIpv4AddressToStringExW(
+    const uint8_t* addr, uint16_t port, uint16_t* buf, uint32_t* buf_len)
+{
+    if (!buf || !buf_len || *buf_len < 22) {
+        if (buf_len) *buf_len = 22;
+        return NULL;
+    }
+    char tmp[22];
+    int n;
+    if (port)
+        n = snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u:%u", addr[0], addr[1], addr[2], addr[3], (unsigned)ntohs(port));
+    else
+        n = snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u", addr[0], addr[1], addr[2], addr[3]);
+    for (int i = 0; i <= n; i++) buf[i] = (uint16_t)(unsigned char)tmp[i];
+    *buf_len = (uint32_t)n + 1;
+    return buf;
+}
+
+/* RtlIpv6AddressToStringW: in6_addr -> wide string (no port) */
+uint16_t* __attribute__((ms_abi)) lsw_RtlIpv6AddressToStringW(
+    const uint8_t* addr, uint16_t* buf)
+{
+    if (!buf) return NULL;
+    char tmp[46];
+    snprintf(tmp, sizeof(tmp), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+        addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
+    for (int i = 0; tmp[i]; i++) buf[i] = (uint16_t)(unsigned char)tmp[i];
+    buf[strlen(tmp)] = 0;
+    return buf;
+}
+
+/* RtlIpv6AddressToStringExW: in6_addr -> wide string with optional port/scope */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlIpv6AddressToStringExW(
+    const uint8_t* addr, uint32_t scope_id, uint16_t port,
+    uint16_t* buf, uint32_t* buf_len)
+{
+    if (!buf || !buf_len || *buf_len < 48) {
+        if (buf_len) *buf_len = 48;
+        return STATUS_INVALID_PARAMETER;
+    }
+    char tmp[64];
+    int n = snprintf(tmp, sizeof(tmp), "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], addr[6], addr[7],
+        addr[8], addr[9], addr[10], addr[11], addr[12], addr[13], addr[14], addr[15]);
+    if (scope_id) n += snprintf(tmp + n, sizeof(tmp) - n, "%%%u", scope_id);
+    if (port)     n += snprintf(tmp + n, sizeof(tmp) - n, ":%u", (unsigned)ntohs(port));
+    for (int i = 0; i <= n; i++) buf[i] = (uint16_t)(unsigned char)tmp[i];
+    *buf_len = (uint32_t)n + 1;
+    return STATUS_SUCCESS;
+}
+
+/* RtlStringFromGUID: GUID -> L"{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlStringFromGUID(
+    const uint8_t* guid, lsw_unicode_string_t* us)
+{
+    if (!guid || !us) return STATUS_INVALID_PARAMETER;
+    /* GUID layout: 4+2+2+8 bytes = Data1 Data2 Data3 Data4[8] */
+    uint32_t d1 = ((uint32_t)guid[0]) | ((uint32_t)guid[1]<<8) | ((uint32_t)guid[2]<<16) | ((uint32_t)guid[3]<<24);
+    uint16_t d2 = (uint16_t)(guid[4] | (guid[5]<<8));
+    uint16_t d3 = (uint16_t)(guid[6] | (guid[7]<<8));
+    char tmp[40];
+    snprintf(tmp, sizeof(tmp), "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        d1, d2, d3, guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
+    int n = (int)strlen(tmp);
+    uint16_t* wbuf = (uint16_t*)malloc((n + 1) * sizeof(uint16_t));
+    if (!wbuf) return STATUS_NO_MEMORY;
+    for (int i = 0; i <= n; i++) wbuf[i] = (uint16_t)(unsigned char)tmp[i];
+    us->Buffer        = wbuf;
+    us->Length        = (uint16_t)(n * 2);
+    us->MaximumLength = (uint16_t)((n + 1) * 2);
+    return STATUS_SUCCESS;
+}
+
+/* RtlQueryFeatureConfiguration: stub — not implemented, return not-found */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlQueryFeatureConfiguration(
+    uint32_t feature_id, uint32_t feature_type, void* change_stamp, void* config)
+{
+    (void)feature_id; (void)feature_type; (void)change_stamp; (void)config;
+    return STATUS_NOT_IMPLEMENTED;
 }
 
 void __attribute__((ms_abi)) lsw_RtlFreeUnicodeString(lsw_unicode_string_t* us) {
@@ -458,6 +549,173 @@ int __attribute__((ms_abi)) lsw_RtlQueryEnvironmentVariable(
 }
 
 /* ------------------------------------------------------------------
+ * String init stubs
+ * ------------------------------------------------------------------ */
+
+typedef struct { uint16_t Length; uint16_t MaximumLength; char* Buffer; } LSW_ANSI_STRING;
+typedef struct { uint16_t Length; uint16_t MaximumLength; uint16_t* Buffer; } LSW_UNICODE_STRING;
+
+void __attribute__((ms_abi)) lsw_RtlInitAnsiString(LSW_ANSI_STRING* s, const char* str) {
+    if (!s) return;
+    s->Buffer = (char*)str;
+    if (str) {
+        size_t len = strlen(str);
+        s->Length = (uint16_t)(len > 65534 ? 65534 : len);
+        s->MaximumLength = s->Length + 1;
+    } else {
+        s->Length = 0; s->MaximumLength = 0;
+    }
+}
+void __attribute__((ms_abi)) lsw_RtlInitString(LSW_ANSI_STRING* s, const char* str) {
+    lsw_RtlInitAnsiString(s, str);
+}
+
+/* RtlxOemStringToUnicodeSize: returns byte size of UTF-16 buffer needed */
+uint32_t __attribute__((ms_abi)) lsw_RtlxOemStringToUnicodeSize(LSW_ANSI_STRING* s) {
+    if (!s) return 2;
+    return (uint32_t)(s->Length + 1) * 2;
+}
+
+/* RtlOemStringToUnicodeString: OEM (Latin-1) → UTF-16LE */
+int __attribute__((ms_abi)) lsw_RtlOemStringToUnicodeString(LSW_UNICODE_STRING* dest,
+    LSW_ANSI_STRING* src, int allocDest) {
+    if (!src || !dest) return (int)STATUS_INVALID_PARAMETER;
+    uint32_t needed = (uint32_t)(src->Length + 1) * 2;
+    if (allocDest) {
+        dest->Buffer = (uint16_t*)malloc(needed);
+        if (!dest->Buffer) return (int)STATUS_NO_MEMORY;
+        dest->MaximumLength = (uint16_t)needed;
+    } else {
+        if (!dest->Buffer || dest->MaximumLength < needed) return (int)STATUS_BUFFER_OVERFLOW;
+    }
+    dest->Length = (uint16_t)(src->Length * 2);
+    for (uint16_t i = 0; i < src->Length; i++)
+        dest->Buffer[i] = (uint16_t)(uint8_t)src->Buffer[i];
+    dest->Buffer[src->Length] = 0;
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
+ * Time stubs
+ * ------------------------------------------------------------------ */
+#define EPOCH_DIFF_100NS  116444736000000000ULL  /* 100-ns intervals 1601→1970 */
+
+void __attribute__((ms_abi)) lsw_NtQuerySystemTime(uint64_t* SystemTime) {
+    if (!SystemTime) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    *SystemTime = (uint64_t)ts.tv_sec * 10000000ULL
+                + (uint64_t)(ts.tv_nsec / 100)
+                + EPOCH_DIFF_100NS;
+}
+
+int __attribute__((ms_abi)) lsw_RtlTimeToSecondsSince1970(uint64_t* Time, uint32_t* Seconds) {
+    if (!Time || !Seconds) return 0; /* FALSE */
+    uint64_t secs = *Time / 10000000ULL;
+    if (secs < (EPOCH_DIFF_100NS / 10000000ULL)) { *Seconds = 0; return 0; }
+    *Seconds = (uint32_t)(secs - (EPOCH_DIFF_100NS / 10000000ULL));
+    return 1; /* TRUE */
+}
+
+/* TIME_FIELDS: Year,Month,Day,Hour,Minute,Second,Milliseconds,Weekday (each 16-bit) */
+typedef struct {
+    uint16_t Year, Month, Day, Hour, Minute, Second, Milliseconds, Weekday;
+} LSW_TIME_FIELDS;
+
+int __attribute__((ms_abi)) lsw_RtlTimeFieldsToTime(LSW_TIME_FIELDS* tf, uint64_t* Time) {
+    if (!tf || !Time) return 0;
+    struct tm t = {0};
+    t.tm_year = tf->Year - 1900;
+    t.tm_mon  = tf->Month - 1;
+    t.tm_mday = tf->Day;
+    t.tm_hour = tf->Hour;
+    t.tm_min  = tf->Minute;
+    t.tm_sec  = tf->Second;
+    time_t unix_t = timegm(&t);
+    if (unix_t == (time_t)-1) { *Time = 0; return 0; }
+    *Time = ((uint64_t)unix_t + EPOCH_DIFF_100NS / 10000000ULL) * 10000000ULL
+            + (uint64_t)tf->Milliseconds * 10000ULL;
+    return 1; /* TRUE */
+}
+
+/* ------------------------------------------------------------------
+ * Thread / token stubs (privilege management — no-ops on Linux)
+ * ------------------------------------------------------------------ */
+int __attribute__((ms_abi)) lsw_NtSetInformationThread(void* hThread, int cls, void* info, uint32_t len) {
+    (void)hThread; (void)cls; (void)info; (void)len;
+    return STATUS_SUCCESS;
+}
+int __attribute__((ms_abi)) lsw_NtAdjustPrivilegesToken(void* TokenHandle, int DisableAllPrivileges,
+    void* NewState, uint32_t BufferLength, void* PreviousState, uint32_t* ReturnLength) {
+    (void)TokenHandle; (void)DisableAllPrivileges; (void)NewState;
+    (void)BufferLength; (void)PreviousState;
+    if (ReturnLength) *ReturnLength = 0;
+    return STATUS_SUCCESS;
+}
+int __attribute__((ms_abi)) lsw_NtDuplicateToken(void* ExistingTokenHandle, uint32_t DesiredAccess,
+    void* ObjectAttributes, int EffectiveOnly, int TokenType, void** NewTokenHandle) {
+    (void)ExistingTokenHandle; (void)DesiredAccess; (void)ObjectAttributes;
+    (void)EffectiveOnly; (void)TokenType;
+    if (NewTokenHandle) *NewTokenHandle = NULL;
+    return (int)STATUS_NOT_IMPLEMENTED;
+}
+int __attribute__((ms_abi)) lsw_NtOpenProcessToken(void* ProcessHandle, uint32_t DesiredAccess,
+    void** TokenHandle) {
+    (void)ProcessHandle; (void)DesiredAccess;
+    if (TokenHandle) *TokenHandle = NULL;
+    return (int)STATUS_NOT_IMPLEMENTED;
+}
+
+/* ------------------------------------------------------------------
+ * SID helper stubs
+ * ------------------------------------------------------------------ */
+typedef struct {
+    uint8_t Revision;
+    uint8_t SubAuthorityCount;
+    uint8_t IdentifierAuthority[6];
+    uint32_t SubAuthority[1]; /* flexible */
+} LSW_SID;
+
+uint8_t* __attribute__((ms_abi)) lsw_RtlSubAuthorityCountSid(LSW_SID* sid) {
+    if (!sid) return NULL;
+    return &sid->SubAuthorityCount;
+}
+int __attribute__((ms_abi)) lsw_RtlInitializeSid(LSW_SID* sid, void* auth, uint8_t nSubAuthority) {
+    if (!sid) return (int)STATUS_INVALID_PARAMETER;
+    sid->Revision = 1;
+    sid->SubAuthorityCount = nSubAuthority;
+    if (auth) memcpy(sid->IdentifierAuthority, auth, 6);
+    else memset(sid->IdentifierAuthority, 0, 6);
+    return STATUS_SUCCESS;
+}
+uint32_t __attribute__((ms_abi)) lsw_RtlLengthRequiredSid(uint32_t nSubAuthority) {
+    return 8 + 4 * nSubAuthority;
+}
+uint32_t* __attribute__((ms_abi)) lsw_RtlSubAuthoritySid(LSW_SID* sid, uint32_t n) {
+    if (!sid) return NULL;
+    return &sid->SubAuthority[n];
+}
+uint32_t __attribute__((ms_abi)) lsw_RtlLengthSid(LSW_SID* sid) {
+    if (!sid) return 0;
+    return 8 + 4 * (uint32_t)sid->SubAuthorityCount;
+}
+int __attribute__((ms_abi)) lsw_RtlCopySid(uint32_t destLen, LSW_SID* dest, LSW_SID* src) {
+    if (!dest || !src) return (int)STATUS_INVALID_PARAMETER;
+    uint32_t needed = lsw_RtlLengthSid(src);
+    if (destLen < needed) return (int)STATUS_BUFFER_OVERFLOW;
+    memcpy(dest, src, needed);
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
+ * RtlGetNtProductType
+ * ------------------------------------------------------------------ */
+int __attribute__((ms_abi)) lsw_RtlGetNtProductType(uint32_t* type) {
+    if (type) *type = 1; /* NtProductWinNt */
+    return 1; /* TRUE */
+}
+
+/* ------------------------------------------------------------------
  * API table — called by win32_api.c win32_api_register_ntdll()
  * The Makefile picks up all .c files in src/win32-api/ so the
  * api_mappings[] table in win32_api.c simply needs additional entries
@@ -490,8 +748,15 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     /* Unicode string */
     {"ntdll.dll", "RtlInitUnicodeString",          (void*)lsw_RtlInitUnicodeString},
     {"ntdll.dll", "RtlFreeUnicodeString",          (void*)lsw_RtlFreeUnicodeString},
+    {"ntdll.dll", "RtlStringFromGUID",             (void*)lsw_RtlStringFromGUID},
     {"ntdll.dll", "RtlUnicodeStringToAnsiString",  (void*)lsw_RtlUnicodeStringToAnsiString},
     {"ntdll.dll", "RtlAnsiStringToUnicodeString",  (void*)lsw_RtlAnsiStringToUnicodeString},
+    /* IP address conversion */
+    {"ntdll.dll", "RtlIpv4AddressToStringExW",     (void*)lsw_RtlIpv4AddressToStringExW},
+    {"ntdll.dll", "RtlIpv6AddressToStringW",       (void*)lsw_RtlIpv6AddressToStringW},
+    {"ntdll.dll", "RtlIpv6AddressToStringExW",     (void*)lsw_RtlIpv6AddressToStringExW},
+    /* Feature configuration */
+    {"ntdll.dll", "RtlQueryFeatureConfiguration",  (void*)lsw_RtlQueryFeatureConfiguration},
     /* NTSTATUS */
     {"ntdll.dll", "RtlNtStatusToDosError",         (void*)lsw_RtlNtStatusToDosError},
     {"ntdll.dll", "RtlNtStatusToDosErrorNoTeb",    (void*)lsw_RtlNtStatusToDosErrorNoTeb},
@@ -530,6 +795,29 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     {"ntdll.dll", "RtlExitUserProcess",            (void*)lsw_RtlExitUserProcess},
     {"ntdll.dll", "RtlExitUserThread",             (void*)lsw_RtlExitUserThread},
     {"ntdll.dll", "RtlQueryEnvironmentVariable",   (void*)lsw_RtlQueryEnvironmentVariable},
+    /* String init */
+    {"ntdll.dll", "RtlInitAnsiString",             (void*)lsw_RtlInitAnsiString},
+    {"ntdll.dll", "RtlInitString",                 (void*)lsw_RtlInitString},
+    {"ntdll.dll", "RtlOemStringToUnicodeString",   (void*)lsw_RtlOemStringToUnicodeString},
+    {"ntdll.dll", "RtlxOemStringToUnicodeSize",    (void*)lsw_RtlxOemStringToUnicodeSize},
+    /* Time */
+    {"ntdll.dll", "NtQuerySystemTime",             (void*)lsw_NtQuerySystemTime},
+    {"ntdll.dll", "RtlTimeToSecondsSince1970",     (void*)lsw_RtlTimeToSecondsSince1970},
+    {"ntdll.dll", "RtlTimeFieldsToTime",           (void*)lsw_RtlTimeFieldsToTime},
+    /* Thread / token (no-ops) */
+    {"ntdll.dll", "NtSetInformationThread",        (void*)lsw_NtSetInformationThread},
+    {"ntdll.dll", "NtAdjustPrivilegesToken",       (void*)lsw_NtAdjustPrivilegesToken},
+    {"ntdll.dll", "NtDuplicateToken",              (void*)lsw_NtDuplicateToken},
+    {"ntdll.dll", "NtOpenProcessToken",            (void*)lsw_NtOpenProcessToken},
+    /* SID helpers */
+    {"ntdll.dll", "RtlSubAuthorityCountSid",       (void*)lsw_RtlSubAuthorityCountSid},
+    {"ntdll.dll", "RtlInitializeSid",              (void*)lsw_RtlInitializeSid},
+    {"ntdll.dll", "RtlLengthRequiredSid",          (void*)lsw_RtlLengthRequiredSid},
+    {"ntdll.dll", "RtlSubAuthoritySid",            (void*)lsw_RtlSubAuthoritySid},
+    {"ntdll.dll", "RtlLengthSid",                  (void*)lsw_RtlLengthSid},
+    {"ntdll.dll", "RtlCopySid",                    (void*)lsw_RtlCopySid},
+    /* Product type */
+    {"ntdll.dll", "RtlGetNtProductType",           (void*)lsw_RtlGetNtProductType},
     /* Sentinel */
     {NULL, NULL, NULL}
 };

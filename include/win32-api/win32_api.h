@@ -46,6 +46,17 @@ void* win32_api_resolve_data(const char* dll_name, const char* sym);
 // the real process argc/argv.  Called after win32_set_command_line().
 void win32_crt_data_init(int argc, char** argv);
 
+// Set the path of the main PE executable (called by the PE loader before import resolution).
+// Used by LoadStringW MUI lookup and GetModuleFileNameW/A.
+void lsw_set_exe_path(const char* path);
+
+// Register PE image info for x64 C++ exception dispatch.
+// Called by the PE loader after mapping the image so that _CxxThrowException
+// can walk the .pdata table to find matching catch blocks.
+void win32_api_set_pe_image_info(uint64_t image_base,
+                                  void*    pdata_va,
+                                  uint32_t pdata_size);
+
 // Get all API mappings
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count);
 

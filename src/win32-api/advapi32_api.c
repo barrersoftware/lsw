@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <pwd.h>
+#include <grp.h>
 #include "../../include/shared/lsw_log.h"
 #include "../../include/shared/lsw_registry.h"
 #include "../../include/shared/lsw_types.h"
@@ -165,6 +167,9 @@ typedef void* HGLOBAL;
 
 static void lsw_zero_u32(DWORD* value) { if (value) *value = 0; }
 static void lsw_zero_ptr(void** value) { if (value) *value = NULL; }
+
+/* Forward declaration for SetLastError (defined in win32_api.c) */
+extern void __attribute__((ms_abi)) lsw_SetLastError(DWORD code);
 
 LSTATUS __attribute__((ms_abi)) lsw_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, HKEY* phkResult) {
     char subkey[512] = {0};
@@ -506,12 +511,226 @@ BOOL __attribute__((ms_abi)) lsw_OpenThreadToken(HANDLE ThreadHandle, DWORD Desi
     return 1;
 }
 
+/* SID structure for Linux UID: S-1-22-1-{uid}
+ * 22 = SECURITY_LINUX_SCOPE_AUTHORITY (used by Samba/WINE for Linux UIDs)
+ * 1  = type subauth (user), uid = the actual Linux UID */
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  Revision;           /* must be 1 */
+    uint8_t  SubAuthorityCount;  /* number of sub-authorities */
+    uint8_t  IdentifierAuthority[6]; /* big-endian 48-bit authority */
+    uint32_t SubAuthority[2];    /* variable length; we use 2 */
+} lsw_SID_t;
+typedef struct {
+    uint64_t Sid;        /* pointer to SID, placed right after this struct */
+    uint32_t Attributes; /* 0 */
+    uint32_t _pad;
+} lsw_TOKEN_USER_t;
+#pragma pack(pop)
+
+/* TokenUser = 1, TokenGroups = 2, TokenPrivileges = 3 */
 BOOL __attribute__((ms_abi)) lsw_GetTokenInformation(HANDLE TokenHandle, int TokenInformationClass, void* TokenInformation, DWORD TokenInformationLength, DWORD* ReturnLength) {
-    LSW_ADVAPI_LOG("GetTokenInformation");
-    LSW_UNUSED(TokenHandle); LSW_UNUSED(TokenInformationClass); LSW_UNUSED(TokenInformationLength);
-    if (TokenInformation) memset(TokenInformation, 0, TokenInformationLength);
-    if (ReturnLength) *ReturnLength = 4;
-    return 1;
+    LSW_LOG_INFO("GetTokenInformation(class=%d) called", TokenInformationClass);
+    LSW_UNUSED(TokenHandle);
+
+    /* TokenUser = 1 */
+    if (TokenInformationClass == 1) {
+        /* Layout: TOKEN_USER (16 bytes) + SID (2-subauth = 20 bytes) */
+        uint32_t uid = (uint32_t)getuid();
+        uint32_t needed = sizeof(lsw_TOKEN_USER_t) + sizeof(lsw_SID_t);
+        if (ReturnLength) *ReturnLength = needed;
+        if (!TokenInformation || TokenInformationLength < needed) {
+            lsw_SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+            return 0;
+        }
+
+        uint8_t* buf = (uint8_t*)TokenInformation;
+        /* SID follows immediately after TOKEN_USER */
+        lsw_TOKEN_USER_t* tu = (lsw_TOKEN_USER_t*)buf;
+        lsw_SID_t* sid = (lsw_SID_t*)(buf + sizeof(lsw_TOKEN_USER_t));
+
+        /* Build SID: S-1-22-1-{uid} */
+        sid->Revision = 1;
+        sid->SubAuthorityCount = 2;
+        /* Authority 22 (SECURITY_LINUX_SCOPE_AUTHORITY) in big-endian */
+        memset(sid->IdentifierAuthority, 0, 6);
+        sid->IdentifierAuthority[5] = 22;
+        sid->SubAuthority[0] = 1;    /* user type */
+        sid->SubAuthority[1] = uid;
+
+        tu->Sid = (uint64_t)(uintptr_t)sid;
+        tu->Attributes = 0;
+        tu->_pad = 0;
+        lsw_SetLastError(0);
+        return 1;
+    }
+
+    /* TokenGroups = 2 — return primary group + a few well-known groups */
+    if (TokenInformationClass == 2) {
+        /*
+         * Layout:
+         *   DWORD GroupCount                           (4 bytes)
+         *   DWORD _pad                                 (4 bytes, alignment)
+         *   GroupCount × { PSID(8) + Attributes(4) + _pad(4) }  (16 each)
+         *   Followed by the SID data for each group
+         *
+         * Groups:
+         *  [0] S-1-22-2-{gid}  Linux primary group (2-subauth)
+         *  [1] S-1-1-0         Everyone              (1-subauth)
+         *  [2] S-1-5-11        Authenticated Users   (2-subauth: auth=5, sa0=11)
+         */
+        typedef struct {
+            uint8_t  Revision;
+            uint8_t  SubAuthorityCount;
+            uint8_t  IdentifierAuthority[6];
+            uint32_t SubAuthority[2];
+        } lsw_SID2_t;
+        typedef struct {
+            uint8_t  Revision;
+            uint8_t  SubAuthorityCount;
+            uint8_t  IdentifierAuthority[6];
+            uint32_t SubAuthority[1];
+        } lsw_SID1_t;
+        typedef struct {
+            uint64_t Sid;
+            uint32_t Attributes;
+            uint32_t _pad;
+        } lsw_SGA_t;
+
+#define LSW_NGROUPS 3
+        uint32_t needed = 8                          /* GroupCount + pad */
+                        + LSW_NGROUPS * sizeof(lsw_SGA_t) /* SID_AND_ATTRIBUTES */
+                        + sizeof(lsw_SID2_t)         /* gid SID (2-subauth) */
+                        + sizeof(lsw_SID1_t)         /* Everyone (1-subauth) */
+                        + sizeof(lsw_SID2_t);        /* Authenticated Users (2-subauth) */
+        if (ReturnLength) *ReturnLength = needed;
+        if (!TokenInformation || TokenInformationLength < needed) {
+            lsw_SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+            return 0;
+        }
+
+        uint8_t* buf = (uint8_t*)TokenInformation;
+        uint32_t* group_count = (uint32_t*)buf;
+        *group_count = LSW_NGROUPS;
+        *(uint32_t*)(buf+4) = 0; /* pad */
+
+        lsw_SGA_t* groups = (lsw_SGA_t*)(buf + 8);
+        uint8_t*   sid_area = buf + 8 + LSW_NGROUPS * sizeof(lsw_SGA_t);
+
+        /* SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED = 7 */
+#define LSW_GRP_ATTRS 7U
+
+        /* [0] Linux primary group: S-1-22-2-{gid} */
+        lsw_SID2_t* sid0 = (lsw_SID2_t*)sid_area;
+        sid_area += sizeof(lsw_SID2_t);
+        sid0->Revision = 1; sid0->SubAuthorityCount = 2;
+        memset(sid0->IdentifierAuthority, 0, 6); sid0->IdentifierAuthority[5] = 22;
+        sid0->SubAuthority[0] = 2; sid0->SubAuthority[1] = (uint32_t)getgid();
+        groups[0].Sid = (uint64_t)(uintptr_t)sid0;
+        groups[0].Attributes = LSW_GRP_ATTRS; groups[0]._pad = 0;
+
+        /* [1] Everyone: S-1-1-0 */
+        lsw_SID1_t* sid1 = (lsw_SID1_t*)sid_area;
+        sid_area += sizeof(lsw_SID1_t);
+        sid1->Revision = 1; sid1->SubAuthorityCount = 1;
+        memset(sid1->IdentifierAuthority, 0, 6); sid1->IdentifierAuthority[5] = 1;
+        sid1->SubAuthority[0] = 0;
+        groups[1].Sid = (uint64_t)(uintptr_t)sid1;
+        groups[1].Attributes = LSW_GRP_ATTRS; groups[1]._pad = 0;
+
+        /* [2] Authenticated Users: S-1-5-11 */
+        lsw_SID2_t* sid2 = (lsw_SID2_t*)sid_area;
+        sid2->Revision = 1; sid2->SubAuthorityCount = 1;
+        memset(sid2->IdentifierAuthority, 0, 6); sid2->IdentifierAuthority[5] = 5;
+        sid2->SubAuthority[0] = 11; sid2->SubAuthority[1] = 0;
+        groups[2].Sid = (uint64_t)(uintptr_t)sid2;
+        groups[2].Attributes = LSW_GRP_ATTRS; groups[2]._pad = 0;
+
+        LSW_LOG_INFO("GetTokenInformation(class=2) -> %d groups", LSW_NGROUPS);
+#undef LSW_NGROUPS
+#undef LSW_GRP_ATTRS
+        lsw_SetLastError(0);
+        return 1;
+    }
+
+    /* TokenPrivileges = 3 — return one common privilege (SeChangeNotifyPrivilege)
+     * so PrivilegeCount > 0 and whoami.exe doesn't call malloc(0).
+     * LUID_AND_ATTRIBUTES layout: LUID(8) + Attributes(4) + pad(4) = 16? No: 8+4=12.
+     * TOKEN_PRIVILEGES: DWORD(4) + N×(LUID(8)+DWORD(4)) = 4 + N×12 */
+    if (TokenInformationClass == 3) {
+#define LSW_NPRIV 5
+        /* SeChangeNotifyPrivilege=23(enabled), SeShutdownPrivilege=19, SeUndockPrivilege=25,
+         * SeIncreaseWorkingSetPrivilege=33, SeTimeZonePrivilege=34 */
+        static const struct { uint32_t luid_lo; uint32_t luid_hi; uint32_t attrs; } privs[LSW_NPRIV] = {
+            {23, 0, 3}, /* SeChangeNotifyPrivilege: ENABLED|ENABLED_BY_DEFAULT */
+            {19, 0, 0}, /* SeShutdownPrivilege: disabled */
+            {25, 0, 0}, /* SeUndockPrivilege: disabled */
+            {33, 0, 0}, /* SeIncreaseWorkingSetPrivilege: disabled */
+            {34, 0, 0}, /* SeTimeZonePrivilege: disabled */
+        };
+        uint32_t needed = 4 + LSW_NPRIV * 12; /* 4 + 5*12 = 64 */
+        if (ReturnLength) *ReturnLength = needed;
+        if (!TokenInformation || TokenInformationLength < needed) {
+            lsw_SetLastError(122);
+            return 0;
+        }
+        uint8_t* buf = (uint8_t*)TokenInformation;
+        *(uint32_t*)buf = LSW_NPRIV;
+        for (int i = 0; i < LSW_NPRIV; i++) {
+            uint8_t* p = buf + 4 + i * 12;
+            *(uint32_t*)(p+0) = privs[i].luid_lo;
+            *(uint32_t*)(p+4) = privs[i].luid_hi;
+            *(uint32_t*)(p+8) = privs[i].attrs;
+        }
+        lsw_SetLastError(0);
+#undef LSW_NPRIV
+        return 1;
+    }
+
+    if (TokenInformationClass == 18 || TokenInformationClass == 25) {
+        if (ReturnLength) *ReturnLength = 4;
+        if (!TokenInformation || TokenInformationLength < 4) {
+            lsw_SetLastError(122);
+            return 0;
+        }
+        *(uint32_t*)TokenInformation = (TokenInformationClass == 25) ? 0x2000 : 1;
+        lsw_SetLastError(0);
+        return 1;
+    }
+
+    /* TokenUserClaimAttributes (33), TokenDeviceClaimAttributes (34):
+     * Return minimal CLAIM_SECURITY_ATTRIBUTES_INFORMATION with zero attributes.
+     * struct layout: Version(2) + Reserved(2) + AttributeCount(4) + pAttributeV1(8) = 16 bytes */
+    if (TokenInformationClass == 33 || TokenInformationClass == 34) {
+        uint32_t needed = 16;
+        if (ReturnLength) *ReturnLength = needed;
+        if (!TokenInformation || TokenInformationLength < needed) {
+            lsw_SetLastError(122);
+            return 0;
+        }
+        uint8_t* buf = (uint8_t*)TokenInformation;
+        *(uint16_t*)(buf+0)  = 1; /* Version = CLAIM_SECURITY_ATTRIBUTES_INFORMATION_VERSION_V1 */
+        *(uint16_t*)(buf+2)  = 0; /* Reserved */
+        *(uint32_t*)(buf+4)  = 0; /* AttributeCount = 0 */
+        *(uint64_t*)(buf+8)  = 0; /* pAttributeV1 = NULL */
+        lsw_SetLastError(0);
+        return 1;
+    }
+
+    /* Default: unknown class — use two-call pattern with minimal 4-byte buffer.
+     * Always returns FALSE+122 on first call (no buffer), TRUE on second. */
+    {
+        uint32_t needed = (TokenInformationLength > 0) ? TokenInformationLength : 4;
+        if (ReturnLength) *ReturnLength = needed;
+        if (!TokenInformation || TokenInformationLength < needed) {
+            if (ReturnLength) *ReturnLength = needed < 4 ? 4 : needed;
+            lsw_SetLastError(122);
+            return 0;
+        }
+        memset(TokenInformation, 0, needed);
+        lsw_SetLastError(0);
+        return 1;
+    }
 }
 
 BOOL __attribute__((ms_abi)) lsw_SetTokenInformation(HANDLE TokenHandle, int TokenInformationClass, void* TokenInformation, DWORD TokenInformationLength) {
@@ -540,9 +759,128 @@ BOOL __attribute__((ms_abi)) lsw_LookupPrivilegeValueA(LPCSTR lpSystemName, LPCS
     return 1;
 }
 
+/* LUID to privilege name / display name table.
+ * Based on Windows SDK winnt.h SE_*_PRIVILEGE constants.
+ * A LUID on Windows is { LowPart(uint32), HighPart(int32) }.  For built-in
+ * privileges HighPart is always 0 and LowPart is the well-known constant. */
+static const struct {
+    uint32_t    luid_lo;
+    const char* name;       /* SE_xxx_NAME canonical form */
+    const char* display;    /* Human-readable description */
+} lsw_priv_table[] = {
+    {  2, "SeCreateTokenPrivilege",          "Create a token object" },
+    {  3, "SeAssignPrimaryTokenPrivilege",   "Replace a process level token" },
+    {  4, "SeLockMemoryPrivilege",           "Lock pages in memory" },
+    {  5, "SeIncreaseQuotaPrivilege",        "Adjust memory quotas for a process" },
+    {  6, "SeMachineAccountPrivilege",       "Add workstations to domain" },
+    {  7, "SeTcbPrivilege",                  "Act as part of the operating system" },
+    {  8, "SeSecurityPrivilege",             "Manage auditing and security log" },
+    {  9, "SeTakeOwnershipPrivilege",        "Take ownership of files or other objects" },
+    { 10, "SeLoadDriverPrivilege",           "Load and unload device drivers" },
+    { 11, "SeSystemProfilePrivilege",        "Profile system performance" },
+    { 12, "SeSystemtimePrivilege",           "Change the system time" },
+    { 13, "SeProfileSingleProcessPrivilege", "Profile single process" },
+    { 14, "SeIncreaseBasePriorityPrivilege", "Increase scheduling priority" },
+    { 15, "SeCreatePagefilePrivilege",       "Create a pagefile" },
+    { 16, "SeCreatePermanentPrivilege",      "Create permanent shared objects" },
+    { 17, "SeBackupPrivilege",               "Back up files and directories" },
+    { 18, "SeRestorePrivilege",              "Restore files and directories" },
+    { 19, "SeShutdownPrivilege",             "Shut down the system" },
+    { 20, "SeDebugPrivilege",                "Debug programs" },
+    { 21, "SeAuditPrivilege",                "Generate security audits" },
+    { 22, "SeSystemEnvironmentPrivilege",    "Modify firmware environment values" },
+    { 23, "SeChangeNotifyPrivilege",         "Bypass traverse checking" },
+    { 24, "SeRemoteShutdownPrivilege",       "Force shutdown from a remote system" },
+    { 25, "SeUndockPrivilege",               "Remove computer from docking station" },
+    { 26, "SeSyncAgentPrivilege",            "Synchronize directory service data" },
+    { 27, "SeEnableDelegationPrivilege",     "Enable computer and user accounts to be trusted for delegation" },
+    { 28, "SeManageVolumePrivilege",         "Perform volume maintenance tasks" },
+    { 29, "SeImpersonatePrivilege",          "Impersonate a client after authentication" },
+    { 30, "SeCreateGlobalPrivilege",         "Create global objects" },
+    { 31, "SeTrustedCredManAccessPrivilege", "Access Credential Manager as a trusted caller" },
+    { 32, "SeRelabelPrivilege",              "Modify an object label" },
+    { 33, "SeIncreaseWorkingSetPrivilege",   "Increase a process working set" },
+    { 34, "SeTimeZonePrivilege",             "Change the time zone" },
+    { 35, "SeCreateSymbolicLinkPrivilege",   "Create symbolic links" },
+    { 36, "SeDelegateSessionUserImpersonatePrivilege", "Obtain an impersonation token for another user in the same session" },
+};
+#define LSW_PRIV_TABLE_SIZE ((int)(sizeof(lsw_priv_table)/sizeof(lsw_priv_table[0])))
+
+/* Helper: write ASCII string as UTF-16LE into buf (at most bufcch chars including NUL).
+ * Returns number of UTF-16 code units written (excluding NUL), or required size if buf==NULL. */
+static uint32_t lsw_ascii_to_u16_buf(const char* src, uint16_t* buf, uint32_t bufcch) {
+    uint32_t n = 0;
+    while (src[n]) n++;          /* strlen */
+    if (!buf) return n + 1;      /* needed length including NUL */
+    if (bufcch < n + 1) return 0;
+    for (uint32_t i = 0; i < n; i++) buf[i] = (uint16_t)(unsigned char)src[i];
+    buf[n] = 0;
+    return n;
+}
+
 BOOL __attribute__((ms_abi)) lsw_LookupPrivilegeNameW(LPCWSTR lpSystemName, void* lpLuid, LPWSTR lpName, DWORD* cchName) {
-    LSW_ADVAPI_LOG("LookupPrivilegeNameW");
-    LSW_UNUSED(lpSystemName); LSW_UNUSED(lpLuid); LSW_UNUSED(lpName); LSW_UNUSED(cchName);
+    LSW_UNUSED(lpSystemName);
+    if (!lpLuid || !cchName) return 0;
+
+    uint32_t luid_lo = *(uint32_t*)lpLuid;
+    /* uint32_t luid_hi = *((uint32_t*)lpLuid + 1); */  /* always 0 for built-ins */
+
+    const char* found = NULL;
+    for (int i = 0; i < LSW_PRIV_TABLE_SIZE; i++) {
+        if (lsw_priv_table[i].luid_lo == luid_lo) { found = lsw_priv_table[i].name; break; }
+    }
+    if (!found) {
+        LSW_LOG_INFO("LookupPrivilegeNameW: unknown LUID %u -> fail", luid_lo);
+        lsw_SetLastError(1313); /* ERROR_NO_SUCH_PRIVILEGE */
+        return 0;
+    }
+
+    /* required length (including NUL) */
+    uint32_t n = 0; while (found[n]) n++; n++; /* strlen+1 */
+
+    if (!lpName || *cchName < n) {
+        *cchName = n;
+        lsw_SetLastError(122); /* ERROR_INSUFFICIENT_BUFFER */
+        return 0;
+    }
+
+    *cchName = lsw_ascii_to_u16_buf(found, (uint16_t*)lpName, *cchName);
+    LSW_LOG_INFO("LookupPrivilegeNameW: LUID %u -> '%s'", luid_lo, found);
+    lsw_SetLastError(0);
+    return 1;
+}
+
+BOOL __attribute__((ms_abi)) lsw_LookupPrivilegeDisplayNameW(LPCWSTR lpSystemName, LPCWSTR lpName, LPWSTR lpDisplayName, DWORD* cchDisplayName, DWORD* lpLanguageId) {
+    LSW_UNUSED(lpSystemName);
+    if (!lpName || !cchDisplayName) return 0;
+
+    /* Convert incoming UTF-16LE name to ASCII for table lookup */
+    char namebuf[128] = {0};
+    uint16_t* p = (uint16_t*)lpName;
+    int i = 0;
+    while (*p && i < 127) { namebuf[i++] = (char)(uint8_t)*p++; }
+
+    const char* found = NULL;
+    for (int k = 0; k < LSW_PRIV_TABLE_SIZE; k++) {
+        if (strcmp(lsw_priv_table[k].name, namebuf) == 0) { found = lsw_priv_table[k].display; break; }
+    }
+    if (!found) {
+        LSW_LOG_INFO("LookupPrivilegeDisplayNameW: '%s' not found", namebuf);
+        lsw_SetLastError(1313);
+        return 0;
+    }
+
+    uint32_t n = 0; while (found[n]) n++; n++;
+    if (!lpDisplayName || *cchDisplayName < n) {
+        *cchDisplayName = n;
+        lsw_SetLastError(122);
+        return 0;
+    }
+
+    *cchDisplayName = lsw_ascii_to_u16_buf(found, (uint16_t*)lpDisplayName, *cchDisplayName);
+    if (lpLanguageId) *lpLanguageId = 0x0409; /* English */
+    LSW_LOG_INFO("LookupPrivilegeDisplayNameW: '%s' -> '%s'", namebuf, found);
+    lsw_SetLastError(0);
     return 1;
 }
 
@@ -632,47 +970,93 @@ void* __attribute__((ms_abi)) lsw_FreeSid(void* pSid) {
 
 DWORD __attribute__((ms_abi)) lsw_GetLengthSid(void* pSid) {
     LSW_ADVAPI_LOG("GetLengthSid");
-    LSW_UNUSED(pSid);
-    return 28;
+    if (!pSid) return 0;
+    /* SID layout: [Revision(1)][SubAuthorityCount(1)][Authority(6)][SubAuthority[N](4*N)] */
+    uint8_t sub_count = ((uint8_t*)pSid)[1];
+    return (DWORD)(8 + sub_count * 4);
 }
 
 BOOL __attribute__((ms_abi)) lsw_IsValidSid(void* pSid) {
     LSW_ADVAPI_LOG("IsValidSid");
-    return pSid != NULL;
+    if (!pSid) return 0;
+    return ((uint8_t*)pSid)[0] == 1; /* Revision must be 1 */
 }
 
 BOOL __attribute__((ms_abi)) lsw_CopySid(DWORD nDestinationSidLength, void* pDestinationSid, void* pSourceSid) {
     LSW_ADVAPI_LOG("CopySid");
-    LSW_UNUSED(nDestinationSidLength);
-    if (pDestinationSid && pSourceSid) memcpy(pDestinationSid, pSourceSid, 28);
+    if (!pDestinationSid || !pSourceSid) return 0;
+    uint8_t sub_count = ((uint8_t*)pSourceSid)[1];
+    DWORD sid_len = (DWORD)(8 + sub_count * 4);
+    if (nDestinationSidLength < sid_len) return 0;
+    memcpy(pDestinationSid, pSourceSid, sid_len);
     return 1;
 }
 
 BOOL __attribute__((ms_abi)) lsw_EqualSid(void* pSid1, void* pSid2) {
     LSW_ADVAPI_LOG("EqualSid");
-    LSW_UNUSED(pSid1); LSW_UNUSED(pSid2);
-    return 0;
+    if (!pSid1 || !pSid2) return 0;
+    uint8_t n1 = ((uint8_t*)pSid1)[1];
+    uint8_t n2 = ((uint8_t*)pSid2)[1];
+    if (n1 != n2) return 0;
+    return memcmp(pSid1, pSid2, 8 + n1 * 4) == 0;
 }
 
 DWORD* __attribute__((ms_abi)) lsw_GetSidSubAuthority(void* pSid, DWORD nSubAuthority) {
-    static DWORD value = 0;
-    LSW_ADVAPI_LOG("GetSidSubAuthority");
-    LSW_UNUSED(pSid); LSW_UNUSED(nSubAuthority);
-    return &value;
+    static DWORD fallback = 0;
+    if (!pSid) return &fallback;
+    /* SubAuthority array starts at offset 8 (after Revision+Count+Authority) */
+    uint8_t count = ((uint8_t*)pSid)[1];
+    if (nSubAuthority >= count) return &fallback;
+    DWORD* p = (DWORD*)((uint8_t*)pSid + 8 + nSubAuthority * 4);
+    return p;
 }
 
 uint8_t* __attribute__((ms_abi)) lsw_GetSidSubAuthorityCount(void* pSid) {
-    static uint8_t count = 0;
+    static uint8_t fallback = 0;
     LSW_ADVAPI_LOG("GetSidSubAuthorityCount");
-    LSW_UNUSED(pSid);
-    return &count;
+    if (!pSid) return &fallback;
+    return (uint8_t*)pSid + 1; /* SubAuthorityCount is byte 1 */
 }
 
 BOOL __attribute__((ms_abi)) lsw_ConvertSidToStringSidW(void* Sid, uint16_t** StringSid) {
-    LSW_ADVAPI_LOG("ConvertSidToStringSidW");
-    LSW_UNUSED(Sid);
-    if (StringSid) *StringSid = NULL;
-    return 0;
+    if (!StringSid) return 0;
+    *StringSid = NULL;
+    if (!Sid) { lsw_SetLastError(87); return 0; }
+
+    /* Parse the SID binary format:
+     *  offset 0: Revision (1 byte)
+     *  offset 1: SubAuthorityCount (1 byte)
+     *  offset 2: IdentifierAuthority[6] (big-endian 48-bit value)
+     *  offset 8: SubAuthority[0..SubAuthorityCount-1] (4 bytes each, LE)
+     */
+    uint8_t* s = (uint8_t*)Sid;
+    uint8_t  revision   = s[0];
+    uint8_t  sub_count  = s[1];
+    /* authority is big-endian 6 bytes — for well-known authorities fits in 32 bits */
+    uint64_t auth = ((uint64_t)s[2] << 40) | ((uint64_t)s[3] << 32) |
+                    ((uint64_t)s[4] << 24) | ((uint64_t)s[5] << 16) |
+                    ((uint64_t)s[6] <<  8) | ((uint64_t)s[7]);
+
+    /* Build "S-{rev}-{auth}-sa0-sa1-..." in ASCII first */
+    char tmp[256];
+    int  pos = 0;
+    pos += snprintf(tmp + pos, sizeof(tmp) - pos, "S-%u-%llu", (unsigned)revision, (unsigned long long)auth);
+    for (int i = 0; i < (int)sub_count && i < 8; i++) {
+        uint32_t sa;
+        memcpy(&sa, s + 8 + i * 4, 4);
+        pos += snprintf(tmp + pos, sizeof(tmp) - pos, "-%u", sa);
+    }
+
+    /* Allocate UTF-16LE buffer via lsw_LocalAlloc; caller frees via LocalFree */
+    uint32_t len = (uint32_t)pos;           /* chars excluding NUL */
+    uint16_t* buf = (uint16_t*)lsw_LocalAlloc(0x40 /*LPTR*/, (len + 1) * sizeof(uint16_t));
+    if (!buf) { lsw_SetLastError(8); return 0; }
+    for (uint32_t i = 0; i < len; i++) buf[i] = (uint16_t)(unsigned char)tmp[i];
+    buf[len] = 0;
+    *StringSid = buf;
+    LSW_LOG_INFO("ConvertSidToStringSidW -> '%s'", tmp);
+    lsw_SetLastError(0);
+    return 1;
 }
 
 BOOL __attribute__((ms_abi)) lsw_ConvertStringSidToSidW(LPCWSTR StringSid, void** Sid) {
@@ -695,20 +1079,31 @@ BOOL __attribute__((ms_abi)) lsw_GetUserNameA(LPSTR lpBuffer, DWORD* pcbBuffer) 
 }
 
 BOOL __attribute__((ms_abi)) lsw_GetComputerNameW(LPWSTR lpBuffer, DWORD* nSize) {
-    LSW_ADVAPI_LOG("GetComputerNameW");
-    if (lpBuffer && nSize && *nSize > 4) { lpBuffer[0] = 'L'; lpBuffer[1] = 'S'; lpBuffer[2] = 'W'; lpBuffer[3] = 0; *nSize = 4; }
+    char hname[64] = "LSW";
+    gethostname(hname, sizeof(hname) - 1);
+    int hlen = (int)strlen(hname);
+    if (lpBuffer && nSize && (int)*nSize > hlen) {
+        for (int i = 0; i < hlen; i++) lpBuffer[i] = (uint16_t)(unsigned char)hname[i];
+        lpBuffer[hlen] = 0;
+        *nSize = (DWORD)hlen;
+    }
+    LSW_LOG_INFO("GetComputerNameW → \"%s\" (len=%d)", hname, hlen);
     return 1;
 }
 
 BOOL __attribute__((ms_abi)) lsw_GetComputerNameA(LPSTR lpBuffer, DWORD* nSize) {
-    LSW_ADVAPI_LOG("GetComputerNameA");
-    if (lpBuffer && nSize && *nSize > 4) { memcpy(lpBuffer, "LSW", 4); *nSize = 4; }
+    char hname[64] = "LSW";
+    gethostname(hname, sizeof(hname) - 1);
+    int hlen = (int)strlen(hname);
+    if (lpBuffer && nSize && (int)*nSize > hlen) {
+        memcpy(lpBuffer, hname, hlen + 1);
+        *nSize = (DWORD)hlen;
+    }
     return 1;
 }
 
 BOOL __attribute__((ms_abi)) lsw_GetComputerNameExW(int NameType, LPWSTR lpBuffer, DWORD* nSize) {
-    LSW_ADVAPI_LOG("GetComputerNameExW");
-    LSW_UNUSED(NameType);
+    LSW_LOG_INFO("GetComputerNameExW(type=%d)", NameType);
     return lsw_GetComputerNameW(lpBuffer, nSize);
 }
 
@@ -725,9 +1120,101 @@ BOOL __attribute__((ms_abi)) lsw_LookupAccountNameW(LPCWSTR lpSystemName, LPCWST
 }
 
 BOOL __attribute__((ms_abi)) lsw_LookupAccountSidW(LPCWSTR lpSystemName, void* lpSid, LPWSTR lpName, DWORD* cchName, LPWSTR lpReferencedDomainName, DWORD* cchReferencedDomainName, int* peUse) {
-    LSW_ADVAPI_LOG("LookupAccountSidW");
-    LSW_UNUSED(lpSystemName); LSW_UNUSED(lpSid); LSW_UNUSED(lpName); LSW_UNUSED(cchName); LSW_UNUSED(lpReferencedDomainName); LSW_UNUSED(cchReferencedDomainName); LSW_UNUSED(peUse);
-    return 0;
+    LSW_UNUSED(lpSystemName);
+
+    /* Parse the SID to return meaningful names for well-known SIDs */
+    const char* name   = NULL;
+    const char* domain = NULL;
+    int         use    = 1; /* SidTypeUser default */
+
+    if (lpSid) {
+        uint8_t* s = (uint8_t*)lpSid;
+        uint8_t  rev   = s[0];
+        uint8_t  subs  = s[1];
+        uint64_t auth  = ((uint64_t)s[2]<<40)|((uint64_t)s[3]<<32)|
+                         ((uint64_t)s[4]<<24)|((uint64_t)s[5]<<16)|
+                         ((uint64_t)s[6]<< 8)|((uint64_t)s[7]);
+        uint32_t sa0 = (subs >= 1) ? (*(uint32_t*)(s+8))    : 0;
+        uint32_t sa1 = (subs >= 2) ? (*(uint32_t*)(s+12))   : 0;
+        (void)rev;
+
+        /* S-1-1-0: Everyone */
+        if (auth == 1 && subs == 1 && sa0 == 0) {
+            name = "Everyone"; domain = ""; use = 5; /* SidTypeWellKnownGroup */
+        }
+        /* S-1-5-11: NT AUTHORITY\Authenticated Users */
+        else if (auth == 5 && subs == 1 && sa0 == 11) {
+            name = "Authenticated Users"; domain = "NT AUTHORITY"; use = 5;
+        }
+        /* S-1-5-18: NT AUTHORITY\SYSTEM */
+        else if (auth == 5 && subs == 1 && sa0 == 18) {
+            name = "SYSTEM"; domain = "NT AUTHORITY"; use = 1;
+        }
+        /* S-1-5-4: NT AUTHORITY\INTERACTIVE */
+        else if (auth == 5 && subs == 1 && sa0 == 4) {
+            name = "INTERACTIVE"; domain = "NT AUTHORITY"; use = 5;
+        }
+        /* S-1-22-1-{uid}: Linux user (from TokenUser) */
+        else if (auth == 22 && subs == 2 && sa0 == 1) {
+            struct passwd* pw = getpwuid((uid_t)sa1);
+            /* static buffer is fine — single-threaded PE loader */
+            static char uname_buf[128];
+            snprintf(uname_buf, sizeof(uname_buf), "%s",
+                     (pw && pw->pw_name) ? pw->pw_name : "user");
+            name = uname_buf; domain = "LSW"; use = 1;
+        }
+        /* S-1-22-2-{gid}: Linux primary group */
+        else if (auth == 22 && subs == 2 && sa0 == 2) {
+            struct group* gr = getgrgid((gid_t)sa1);
+            static char gname_buf[128];
+            snprintf(gname_buf, sizeof(gname_buf), "%s",
+                     (gr && gr->gr_name) ? gr->gr_name : "group");
+            name = gname_buf; domain = "LSW"; use = 2; /* SidTypeGroup */
+        }
+    }
+
+    /* Fallback: Linux user name */
+    if (!name) {
+        struct passwd* pw = getpwuid(getuid());
+        static char fb_name[64]; static char fb_dom[32];
+        snprintf(fb_name, sizeof(fb_name), "%s", (pw && pw->pw_name) ? pw->pw_name : "user");
+        snprintf(fb_dom, sizeof(fb_dom), "LSW");
+        name = fb_name; domain = fb_dom; use = 1;
+    }
+
+    uint32_t n_len = (uint32_t)strlen(name);
+    uint32_t d_len = (uint32_t)strlen(domain);
+
+    if (!lpName || (cchName && *cchName < n_len + 1)) {
+        if (cchName) *cchName = n_len + 1;
+        if (cchReferencedDomainName) *cchReferencedDomainName = d_len + 1;
+        lsw_SetLastError(122); return 0;
+    }
+    if (!lpReferencedDomainName || (cchReferencedDomainName && *cchReferencedDomainName < d_len + 1)) {
+        if (cchReferencedDomainName) *cchReferencedDomainName = d_len + 1;
+        lsw_SetLastError(122); return 0;
+    }
+
+    for (uint32_t i = 0; i < n_len; i++) ((uint16_t*)lpName)[i] = (uint16_t)(unsigned char)name[i];
+    ((uint16_t*)lpName)[n_len] = 0;
+    if (cchName) *cchName = n_len;
+
+    for (uint32_t i = 0; i < d_len; i++) ((uint16_t*)lpReferencedDomainName)[i] = (uint16_t)(unsigned char)domain[i];
+    ((uint16_t*)lpReferencedDomainName)[d_len] = 0;
+    if (cchReferencedDomainName) *cchReferencedDomainName = d_len;
+
+    if (peUse) *peUse = use;
+    LSW_LOG_INFO("LookupAccountSidW -> '%s\\%s' (type=%d)", domain, name, use);
+    lsw_SetLastError(0);
+    return 1;
+}
+
+/* LocalW variants — same as their non-local counterparts */
+BOOL __attribute__((ms_abi)) lsw_LookupAccountNameLocalW(LPCWSTR lpAccountName, void* Sid, DWORD* cbSid, LPWSTR ReferencedDomainName, DWORD* cchReferencedDomainName, int* peUse) {
+    return lsw_LookupAccountNameW(NULL, lpAccountName, Sid, cbSid, ReferencedDomainName, cchReferencedDomainName, peUse);
+}
+BOOL __attribute__((ms_abi)) lsw_LookupAccountSidLocalW(void* lpSid, LPWSTR lpName, DWORD* cchName, LPWSTR lpReferencedDomainName, DWORD* cchReferencedDomainName, int* peUse) {
+    return lsw_LookupAccountSidW(NULL, lpSid, lpName, cchName, lpReferencedDomainName, cchReferencedDomainName, peUse);
 }
 
 BOOL __attribute__((ms_abi)) lsw_SetFileSecurityW(LPCWSTR lpFileName, DWORD SecurityInformation, void* pSecurityDescriptor) {
@@ -1106,6 +1593,7 @@ win32_api_mapping_t win32_api_advapi32_mappings[] = {
     {"advapi32.dll", "RegGetValueA", (void*)lsw_RegGetValueA},
     {"advapi32.dll", "OpenProcessToken", (void*)lsw_OpenProcessToken},
     {"advapi32.dll", "OpenThreadToken", (void*)lsw_OpenThreadToken},
+    {"KERNEL32.dll", "OpenThreadToken", (void*)lsw_OpenThreadToken},  /* some DLLs import from KERNEL32 */
     {"advapi32.dll", "GetTokenInformation", (void*)lsw_GetTokenInformation},
     {"advapi32.dll", "SetTokenInformation", (void*)lsw_SetTokenInformation},
     {"advapi32.dll", "AdjustTokenPrivileges", (void*)lsw_AdjustTokenPrivileges},
@@ -1141,6 +1629,10 @@ win32_api_mapping_t win32_api_advapi32_mappings[] = {
     {"advapi32.dll", "GetComputerNameExA", (void*)lsw_GetComputerNameExA},
     {"advapi32.dll", "LookupAccountNameW", (void*)lsw_LookupAccountNameW},
     {"advapi32.dll", "LookupAccountSidW", (void*)lsw_LookupAccountSidW},
+    {"advapi32.dll", "LookupAccountNameLocalW", (void*)lsw_LookupAccountNameLocalW},
+    {"advapi32.dll", "LookupAccountSidLocalW", (void*)lsw_LookupAccountSidLocalW},
+    {"ADVAPI32.dll", "LookupAccountNameLocalW", (void*)lsw_LookupAccountNameLocalW},
+    {"ADVAPI32.dll", "LookupAccountSidLocalW", (void*)lsw_LookupAccountSidLocalW},
     {"advapi32.dll", "SetFileSecurityW", (void*)lsw_SetFileSecurityW},
     {"advapi32.dll", "SetFileSecurityA", (void*)lsw_SetFileSecurityA},
     {"advapi32.dll", "GetFileSecurityW", (void*)lsw_GetFileSecurityW},
@@ -1195,6 +1687,7 @@ win32_api_mapping_t win32_api_advapi32_mappings[] = {
     {"advapi32.dll", "ReportEventW", (void*)lsw_ReportEventW},
     {"advapi32.dll", "RegisterEventSourceW", (void*)lsw_RegisterEventSourceW},
     {"advapi32.dll", "DeregisterEventSource", (void*)lsw_DeregisterEventSource},
+
     {NULL, NULL, NULL}
 };
 
