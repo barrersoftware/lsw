@@ -2,6 +2,8 @@
 *.ko
 *.so
 *.a
+*.exe
 build/
 .vscode/
 .idea/
+tools/
