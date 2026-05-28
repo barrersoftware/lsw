@@ -5258,7 +5258,7 @@ uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(
         ((DestinationAddress >> 16) & 0xFF), ((DestinationAddress >> 24) & 0xFF),
         RequestSize, Timeout);
 
-    if (!ReplyBuffer || ReplySize < 28) { g_last_wsa_error = 87; return 0; }
+    if (!ReplyBuffer || ReplySize < 28) { g_last_error = 87; return 0; }
 
     /* Use SOCK_DGRAM + IPPROTO_ICMP (unprivileged ICMP on Linux) */
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
@@ -5267,7 +5267,7 @@ uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(
         sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
         if (sock < 0) {
             LSW_LOG_WARN("IcmpSendEcho: cannot create ICMP socket: %s", strerror(errno));
-            g_last_wsa_error = 5; /* ERROR_ACCESS_DENIED */
+            g_last_error = 5; /* ERROR_ACCESS_DENIED */
             return 0;
         }
     }
@@ -5308,7 +5308,7 @@ uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(
     if (sent < 0) {
         LSW_LOG_WARN("IcmpSendEcho: sendto failed: %s", strerror(errno));
         close(sock);
-        g_last_wsa_error = 5;
+        g_last_error = 5;
         return 0;
     }
 
@@ -5322,7 +5322,7 @@ uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(
 
     if (rlen < 0) {
         LSW_LOG_WARN("IcmpSendEcho: recvfrom failed: %s", strerror(errno));
-        g_last_wsa_error = 11010; /* WSAETIMEDOUT */
+        g_last_error = 11010; /* IP_REQ_TIMED_OUT */
         return 0;
     }
 
