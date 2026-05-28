@@ -229,6 +229,13 @@ int lsw_memory_read(__u32 pid, __u64 base, void *buffer, __u64 size)
             
             /* Calculate offset and size */
             offset = base - region->base_address;
+
+            /* Explicit bounds validation to prevent out-of-bounds kernel read */
+            if (offset >= region->size) {
+                mutex_unlock(&lsw_memory_mutex);
+                return -EINVAL;
+            }
+
             bytes_to_read = region->size - offset;
             if (bytes_to_read > size) {
                 bytes_to_read = size;
