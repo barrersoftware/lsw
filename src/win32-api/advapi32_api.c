@@ -1318,6 +1318,57 @@ BOOL __attribute__((ms_abi)) lsw_GetSecurityDescriptorDacl(void* pSecurityDescri
     return 1;
 }
 
+/* GetSecurityDescriptorControl — return empty control bits */
+BOOL __attribute__((ms_abi)) lsw_GetSecurityDescriptorControl(
+    void* pSecurityDescriptor, uint16_t* pControl, uint32_t* lpdwRevision)
+{
+    LSW_ADVAPI_LOG("GetSecurityDescriptorControl");
+    (void)pSecurityDescriptor;
+    if (pControl) *pControl = 0;
+    if (lpdwRevision) *lpdwRevision = 1; /* SECURITY_DESCRIPTOR_REVISION */
+    return 1;
+}
+
+/* EFS stubs — EFS not supported on Linux; return ERROR_NOT_SUPPORTED */
+BOOL __attribute__((ms_abi)) lsw_EncryptFileW(const wchar_t* lpFileName) {
+    LSW_ADVAPI_LOG("EncryptFileW (stub)");
+    (void)lpFileName;
+    lsw_SetLastError(50); /* ERROR_NOT_SUPPORTED */
+    return 0;
+}
+BOOL __attribute__((ms_abi)) lsw_DecryptFileW(const wchar_t* lpFileName, uint32_t dwReserved) {
+    LSW_ADVAPI_LOG("DecryptFileW (stub)");
+    (void)lpFileName; (void)dwReserved;
+    lsw_SetLastError(50);
+    return 0;
+}
+uint32_t __attribute__((ms_abi)) lsw_OpenEncryptedFileRawW(
+    const wchar_t* lpFileName, uint32_t ulFlags, void** pvContext)
+{
+    LSW_ADVAPI_LOG("OpenEncryptedFileRawW (stub)");
+    (void)lpFileName; (void)ulFlags;
+    if (pvContext) *pvContext = NULL;
+    return 50; /* ERROR_NOT_SUPPORTED */
+}
+uint32_t __attribute__((ms_abi)) lsw_ReadEncryptedFileRaw(
+    void* pfExportCallback, void* pvCallbackContext, void* pvContext)
+{
+    LSW_ADVAPI_LOG("ReadEncryptedFileRaw (stub)");
+    (void)pfExportCallback; (void)pvCallbackContext; (void)pvContext;
+    return 50;
+}
+uint32_t __attribute__((ms_abi)) lsw_WriteEncryptedFileRaw(
+    void* pfImportCallback, void* pvCallbackContext, void* pvContext)
+{
+    LSW_ADVAPI_LOG("WriteEncryptedFileRaw (stub)");
+    (void)pfImportCallback; (void)pvCallbackContext; (void)pvContext;
+    return 50;
+}
+void __attribute__((ms_abi)) lsw_CloseEncryptedFileRaw(void* pvContext) {
+    LSW_ADVAPI_LOG("CloseEncryptedFileRaw (stub)");
+    (void)pvContext;
+}
+
 BOOL __attribute__((ms_abi)) lsw_MakeAbsoluteSD(void* pSelfRelativeSecurityDescriptor, void* pAbsoluteSecurityDescriptor, DWORD* lpdwAbsoluteSecurityDescriptorSize, void* pDacl, DWORD* lpdwDaclSize, void* pSacl, DWORD* lpdwSaclSize, void* pOwner, DWORD* lpdwOwnerSize, void* pPrimaryGroup, DWORD* lpdwPrimaryGroupSize) {
     LSW_ADVAPI_LOG("MakeAbsoluteSD");
     LSW_UNUSED(pSelfRelativeSecurityDescriptor); LSW_UNUSED(pAbsoluteSecurityDescriptor); LSW_UNUSED(lpdwAbsoluteSecurityDescriptorSize); LSW_UNUSED(pDacl); LSW_UNUSED(lpdwDaclSize); LSW_UNUSED(pSacl); LSW_UNUSED(lpdwSaclSize); LSW_UNUSED(pOwner); LSW_UNUSED(lpdwOwnerSize); LSW_UNUSED(pPrimaryGroup); LSW_UNUSED(lpdwPrimaryGroupSize);
@@ -1745,6 +1796,16 @@ win32_api_mapping_t win32_api_advapi32_mappings[] = {
     {"advapi32.dll", "ReportEventW", (void*)lsw_ReportEventW},
     {"advapi32.dll", "RegisterEventSourceW", (void*)lsw_RegisterEventSourceW},
     {"advapi32.dll", "DeregisterEventSource", (void*)lsw_DeregisterEventSource},
+
+    /* Security descriptor control */
+    {"ADVAPI32.dll", "GetSecurityDescriptorControl", (void*)lsw_GetSecurityDescriptorControl},
+    /* EFS stubs — return ERROR_NOT_SUPPORTED (50) */
+    {"ADVAPI32.dll", "EncryptFileW",               (void*)lsw_EncryptFileW},
+    {"ADVAPI32.dll", "DecryptFileW",               (void*)lsw_DecryptFileW},
+    {"ADVAPI32.dll", "OpenEncryptedFileRawW",       (void*)lsw_OpenEncryptedFileRawW},
+    {"ADVAPI32.dll", "ReadEncryptedFileRaw",        (void*)lsw_ReadEncryptedFileRaw},
+    {"ADVAPI32.dll", "WriteEncryptedFileRaw",       (void*)lsw_WriteEncryptedFileRaw},
+    {"ADVAPI32.dll", "CloseEncryptedFileRaw",       (void*)lsw_CloseEncryptedFileRaw},
 
     {NULL, NULL, NULL}
 };

@@ -884,6 +884,272 @@ int __attribute__((ms_abi)) lsw_RtlGetNtProductType(uint32_t* type) {
 }
 
 /* ------------------------------------------------------------------
+ * Rtl Dynamic Hash Table
+ *
+ * netstat.exe and other tools use RtlCreateHashTableEx +
+ * RtlEnumerateEntryHashTable to walk the TCP/UDP connection tables
+ * via IPHLPAPI.  On Linux there are no such tables, so we provide
+ * a minimal implementation that returns an empty (but valid) table.
+ * This prevents the NULL-deref crash while still letting netstat
+ * run to completion (it will show "no connections").
+ * ------------------------------------------------------------------ */
+
+/* Minimal opaque hash-table header — callers just need a non-NULL
+ * pointer and NumEntries == 0 to skip the enumeration loop. */
+typedef struct {
+    uint32_t Flags;
+    uint32_t Shift;
+    uint32_t TableSize;
+    uint32_t Pivot;
+    uint32_t DivisorMask;
+    uint32_t NumEntries;        /* 0 — empty table */
+    uint32_t NonEmptyBuckets;
+    uint32_t NumEnumerators;
+    void*    Directory;
+} lsw_rtl_hash_table_t;
+
+/* bool RtlCreateHashTableEx(table**, tableSize, divisor, flags) */
+int __attribute__((ms_abi)) lsw_RtlCreateHashTableEx(
+    lsw_rtl_hash_table_t** out, uint32_t table_size, uint32_t divisor, uint32_t flags)
+{
+    (void)table_size; (void)divisor; (void)flags;
+    if (!out) return 0;
+    lsw_rtl_hash_table_t* t = calloc(1, sizeof(*t));
+    if (!t) return 0;
+    t->TableSize = 1;
+    *out = t;
+    return 1; /* TRUE */
+}
+
+/* void RtlDeleteHashTable(table) */
+void __attribute__((ms_abi)) lsw_RtlDeleteHashTable(lsw_rtl_hash_table_t* table) {
+    free(table);
+}
+
+/* entry* RtlEnumerateEntryHashTable(table, enumerator) — always empty */
+void* __attribute__((ms_abi)) lsw_RtlEnumerateEntryHashTable(
+    lsw_rtl_hash_table_t* table, void* enumerator)
+{
+    (void)table; (void)enumerator;
+    return NULL; /* no entries */
+}
+
+/* entry* RtlGetNextEntryHashTable(table, enumerator) — always empty */
+void* __attribute__((ms_abi)) lsw_RtlGetNextEntryHashTable(
+    lsw_rtl_hash_table_t* table, void* enumerator)
+{
+    (void)table; (void)enumerator;
+    return NULL;
+}
+
+/* void RtlEndEnumerationHashTable(table, enumerator) */
+void __attribute__((ms_abi)) lsw_RtlEndEnumerationHashTable(
+    lsw_rtl_hash_table_t* table, void* enumerator)
+{
+    (void)table; (void)enumerator;
+}
+
+/* void RtlInitEnumerationHashTable / RtlInitHashTableEnumeration — alias */
+void __attribute__((ms_abi)) lsw_RtlInitEnumerationHashTable(
+    lsw_rtl_hash_table_t* table, void* enumerator)
+{
+    (void)table; (void)enumerator;
+}
+
+/* entry* RtlLookupEntryHashTable(table, signature, context) */
+void* __attribute__((ms_abi)) lsw_RtlLookupEntryHashTable(
+    lsw_rtl_hash_table_t* table, uintptr_t signature, void* context)
+{
+    (void)table; (void)signature; (void)context;
+    return NULL;
+}
+
+/* bool RtlRemoveEntryHashTable(table, entry, context) */
+int __attribute__((ms_abi)) lsw_RtlRemoveEntryHashTable(
+    lsw_rtl_hash_table_t* table, void* entry, void* context)
+{
+    (void)table; (void)entry; (void)context;
+    return 0; /* FALSE — entry not found */
+}
+
+/* bool RtlInsertEntryHashTable(table, entry, signature, context) */
+int __attribute__((ms_abi)) lsw_RtlInsertEntryHashTable(
+    lsw_rtl_hash_table_t* table, void* entry, uintptr_t signature, void* context)
+{
+    (void)table; (void)entry; (void)signature; (void)context;
+    return 0; /* FALSE — not supported */
+}
+
+/* ------------------------------------------------------------------
+ * RtlResourceX stubs (RtlAcquireResourceExclusive, etc.)
+ * ------------------------------------------------------------------ */
+int __attribute__((ms_abi)) lsw_RtlAcquireResourceExclusive(void* resource, int wait) {
+    (void)resource; (void)wait;
+    return 1; /* TRUE */
+}
+
+int __attribute__((ms_abi)) lsw_RtlAcquireResourceShared(void* resource, int wait) {
+    (void)resource; (void)wait;
+    return 1;
+}
+
+void __attribute__((ms_abi)) lsw_RtlReleaseResource(void* resource) {
+    (void)resource;
+}
+
+void __attribute__((ms_abi)) lsw_RtlDeleteResource(void* resource) {
+    (void)resource;
+}
+
+int __attribute__((ms_abi)) lsw_RtlInitializeResource(void* resource) {
+    (void)resource;
+    return 1;
+}
+
+/* ------------------------------------------------------------------
+ * NT file/security stubs (used by robocopy, xcopy, etc.)
+ * ------------------------------------------------------------------ */
+/* NtOpenFile — stub returns STATUS_NOT_SUPPORTED */
+int32_t __attribute__((ms_abi)) lsw_NtOpenFile(
+    void** handle, uint32_t access, void* obj_attrs,
+    void* io_status, uint32_t share, uint32_t open_opts)
+{
+    (void)handle; (void)access; (void)obj_attrs;
+    (void)io_status; (void)share; (void)open_opts;
+    return (int32_t)0xC00000BB; /* STATUS_NOT_SUPPORTED */
+}
+
+/* NtQueryDirectoryFile — stub returns STATUS_NO_MORE_FILES */
+int32_t __attribute__((ms_abi)) lsw_NtQueryDirectoryFile(
+    void* handle, void* event, void* apc_routine, void* apc_ctx,
+    void* io_status, void* file_info, uint32_t len, int info_class,
+    int single, void* file_name, int restart)
+{
+    (void)handle; (void)event; (void)apc_routine; (void)apc_ctx;
+    (void)io_status; (void)file_info; (void)len; (void)info_class;
+    (void)single; (void)file_name; (void)restart;
+    return (int32_t)0x80000006; /* STATUS_NO_MORE_FILES */
+}
+
+/* NtQueryInformationFile — stub returns STATUS_NOT_SUPPORTED */
+int32_t __attribute__((ms_abi)) lsw_NtQueryInformationFile(
+    void* handle, void* io_status, void* file_info, uint32_t len, int info_class)
+{
+    (void)handle; (void)io_status; (void)file_info; (void)len; (void)info_class;
+    return (int32_t)0xC00000BB; /* STATUS_NOT_SUPPORTED */
+}
+
+/* NtSetInformationProcess — stub returns STATUS_SUCCESS */
+int32_t __attribute__((ms_abi)) lsw_NtSetInformationProcess(
+    void* handle, int info_class, void* info, uint32_t len)
+{
+    (void)handle; (void)info_class; (void)info; (void)len;
+    return 0; /* STATUS_SUCCESS */
+}
+
+/* NtQuerySecurityObject — stub returns STATUS_NOT_SUPPORTED */
+int32_t __attribute__((ms_abi)) lsw_NtQuerySecurityObject(
+    void* handle, uint32_t info, void* sec_desc, uint32_t len, uint32_t* needed)
+{
+    (void)handle; (void)info; (void)sec_desc; (void)len;
+    if (needed) *needed = 0;
+    return (int32_t)0xC00000BB;
+}
+
+/* RtlGetDaclSecurityDescriptor — stub; sets output to NULL (no DACL) */
+int32_t __attribute__((ms_abi)) lsw_RtlGetDaclSecurityDescriptor(
+    void* sec_desc, int* dacl_present, void** dacl, int* defaulted)
+{
+    (void)sec_desc;
+    if (dacl_present) *dacl_present = 0;
+    if (dacl) *dacl = NULL;
+    if (defaulted) *defaulted = 0;
+    return 0;
+}
+
+/* RtlSetControlSecurityDescriptor — stub; returns success */
+int32_t __attribute__((ms_abi)) lsw_RtlSetControlSecurityDescriptor(
+    void* sec_desc, uint16_t ctrl_bits_of_interest, uint16_t ctrl_bits_to_set)
+{
+    (void)sec_desc; (void)ctrl_bits_of_interest; (void)ctrl_bits_to_set;
+    return 0;
+}
+
+/* RtlGetSaclSecurityDescriptor — stub; reports no SACL */
+int32_t __attribute__((ms_abi)) lsw_RtlGetSaclSecurityDescriptor(
+    void* sec_desc, int* sacl_present, void** sacl, int* defaulted)
+{
+    (void)sec_desc;
+    if (sacl_present) *sacl_present = 0;
+    if (sacl) *sacl = NULL;
+    if (defaulted) *defaulted = 0;
+    return 0;
+}
+
+/* RtlGetControlSecurityDescriptor — stub; returns SE_SELF_RELATIVE (0x8000) */
+int32_t __attribute__((ms_abi)) lsw_RtlGetControlSecurityDescriptor(
+    void* sec_desc, uint16_t* control, uint32_t* revision)
+{
+    (void)sec_desc;
+    if (control) *control = 0x8000; /* SE_SELF_RELATIVE */
+    if (revision) *revision = 1;
+    return 0;
+}
+
+/* RtlDosPathNameToRelativeNtPathName_U — stub; return FALSE (no translation) */
+int __attribute__((ms_abi)) lsw_RtlDosPathNameToRelativeNtPathName_U(
+    const wchar_t* dos_path, void* nt_path, wchar_t** part_name, void* rel_name)
+{
+    (void)dos_path; (void)nt_path; (void)part_name; (void)rel_name;
+    return 0;
+}
+
+/* NtSetSecurityObject — stub; returns STATUS_SUCCESS */
+int32_t __attribute__((ms_abi)) lsw_NtSetSecurityObject(
+    void* handle, uint32_t info, void* sec_desc)
+{
+    (void)handle; (void)info; (void)sec_desc;
+    return 0;
+}
+
+/* NtSetEaFile — stub; returns STATUS_SUCCESS */
+int32_t __attribute__((ms_abi)) lsw_NtSetEaFile(
+    void* handle, void* io_status, void* buf, uint32_t len)
+{
+    (void)handle; (void)io_status; (void)buf; (void)len;
+    return 0;
+}
+
+/* NtSetInformationFile — stub; returns STATUS_SUCCESS */
+int32_t __attribute__((ms_abi)) lsw_NtSetInformationFile(
+    void* handle, void* io_status, void* info, uint32_t len, int info_class)
+{
+    (void)handle; (void)io_status; (void)info; (void)len; (void)info_class;
+    return 0;
+}
+
+/* NtQueryVolumeInformationFile — stub; returns STATUS_NOT_SUPPORTED */
+int32_t __attribute__((ms_abi)) lsw_NtQueryVolumeInformationFile(
+    void* handle, void* io_status, void* info, uint32_t len, int info_class)
+{
+    (void)handle; (void)io_status; (void)info; (void)len; (void)info_class;
+    return (int32_t)0xC00000BB;
+}
+
+/* NtQueryEaFile — stub; returns STATUS_NO_EAS_ON_FILE */
+int32_t __attribute__((ms_abi)) lsw_NtQueryEaFile(
+    void* handle, void* io_status, void* buf, uint32_t len,
+    int ret_single, void* ea_list, uint32_t ea_list_len,
+    uint32_t* ea_index, int restart)
+{
+    (void)handle; (void)io_status; (void)buf; (void)len;
+    (void)ret_single; (void)ea_list; (void)ea_list_len;
+    (void)ea_index; (void)restart;
+    return (int32_t)0xC0000052; /* STATUS_NO_EAS_ON_FILE */
+}
+
+
+/* ------------------------------------------------------------------
  * API table — called by win32_api.c win32_api_register_ntdll()
  * The Makefile picks up all .c files in src/win32-api/ so the
  * api_mappings[] table in win32_api.c simply needs additional entries
@@ -996,6 +1262,38 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     {"ntdll.dll", "RtlUnicodeToOemN",              (void*)lsw_RtlUnicodeToOemN},
     {"ntdll.dll", "RtlMultiByteToUnicodeN",        (void*)lsw_RtlMultiByteToUnicodeN},
     {"ntdll.dll", "RtlIpv4StringToAddressW",       (void*)lsw_RtlIpv4StringToAddressW},
+    /* Rtl Dynamic Hash Table */
+    {"ntdll.dll", "RtlCreateHashTableEx",          (void*)lsw_RtlCreateHashTableEx},
+    {"ntdll.dll", "RtlDeleteHashTable",             (void*)lsw_RtlDeleteHashTable},
+    {"ntdll.dll", "RtlEnumerateEntryHashTable",     (void*)lsw_RtlEnumerateEntryHashTable},
+    {"ntdll.dll", "RtlGetNextEntryHashTable",       (void*)lsw_RtlGetNextEntryHashTable},
+    {"ntdll.dll", "RtlEndEnumerationHashTable",     (void*)lsw_RtlEndEnumerationHashTable},
+    {"ntdll.dll", "RtlInitEnumerationHashTable",    (void*)lsw_RtlInitEnumerationHashTable},
+    {"ntdll.dll", "RtlLookupEntryHashTable",        (void*)lsw_RtlLookupEntryHashTable},
+    {"ntdll.dll", "RtlRemoveEntryHashTable",        (void*)lsw_RtlRemoveEntryHashTable},
+    {"ntdll.dll", "RtlInsertEntryHashTable",        (void*)lsw_RtlInsertEntryHashTable},
+    /* Rtl Resource */
+    {"ntdll.dll", "RtlAcquireResourceExclusive",   (void*)lsw_RtlAcquireResourceExclusive},
+    {"ntdll.dll", "RtlAcquireResourceShared",       (void*)lsw_RtlAcquireResourceShared},
+    {"ntdll.dll", "RtlReleaseResource",             (void*)lsw_RtlReleaseResource},
+    {"ntdll.dll", "RtlDeleteResource",              (void*)lsw_RtlDeleteResource},
+    {"ntdll.dll", "RtlInitializeResource",          (void*)lsw_RtlInitializeResource},
+    /* NT file/security stubs */
+    {"ntdll.dll", "NtOpenFile",                     (void*)lsw_NtOpenFile},
+    {"ntdll.dll", "NtQueryDirectoryFile",            (void*)lsw_NtQueryDirectoryFile},
+    {"ntdll.dll", "NtQueryInformationFile",          (void*)lsw_NtQueryInformationFile},
+    {"ntdll.dll", "NtSetInformationProcess",                (void*)lsw_NtSetInformationProcess},
+    {"ntdll.dll", "NtQuerySecurityObject",                  (void*)lsw_NtQuerySecurityObject},
+    {"ntdll.dll", "RtlGetDaclSecurityDescriptor",           (void*)lsw_RtlGetDaclSecurityDescriptor},
+    {"ntdll.dll", "RtlSetControlSecurityDescriptor",        (void*)lsw_RtlSetControlSecurityDescriptor},
+    {"ntdll.dll", "RtlGetSaclSecurityDescriptor",           (void*)lsw_RtlGetSaclSecurityDescriptor},
+    {"ntdll.dll", "RtlGetControlSecurityDescriptor",        (void*)lsw_RtlGetControlSecurityDescriptor},
+    {"ntdll.dll", "RtlDosPathNameToRelativeNtPathName_U",   (void*)lsw_RtlDosPathNameToRelativeNtPathName_U},
+    {"ntdll.dll", "NtSetSecurityObject",                    (void*)lsw_NtSetSecurityObject},
+    {"ntdll.dll", "NtSetEaFile",                            (void*)lsw_NtSetEaFile},
+    {"ntdll.dll", "NtSetInformationFile",                   (void*)lsw_NtSetInformationFile},
+    {"ntdll.dll", "NtQueryVolumeInformationFile",           (void*)lsw_NtQueryVolumeInformationFile},
+    {"ntdll.dll", "NtQueryEaFile",                          (void*)lsw_NtQueryEaFile},
     /* Sentinel */
     {NULL, NULL, NULL}
 };

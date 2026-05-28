@@ -52,6 +52,28 @@
 #include <setjmp.h>      /* longjmp — for C++ exception delivery */
 #include <pwd.h>         /* getpwuid — for username lookup */
 
+/* ---- DllMain crash recovery ----
+ * Some DLLs (e.g. inetmib1.dll, snmpapi.dll) access kernel facilities that
+ * don't exist on Linux and crash in DllMain.  We wrap every DllMain call with
+ * sigsetjmp so a SIGSEGV/SIGBUS can be caught, logged, and skipped instead of
+ * killing the whole process.
+ */
+static __thread volatile int       g_in_dllmain = 0;
+static __thread sigjmp_buf         g_dllmain_recovery;
+
+static void dllmain_recovery_sighandler(int sig, siginfo_t *si, void *ctx) {
+    (void)sig; (void)si; (void)ctx;
+    if (g_in_dllmain) {
+        siglongjmp(g_dllmain_recovery, 1);
+    }
+    /* Not in DllMain — re-raise with default action so pe_loader handles it */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof(dfl));
+    dfl.sa_handler = SIG_DFL;
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
 /* ---- ms_abi va_list → sysv va_list conversion ----
  * GCC generates broken sysv va_list when va_start is used inside __attribute__((ms_abi))
  * variadic functions. Fix: use __builtin_ms_va_start to get a proper ms_abi va_list (just a
@@ -4431,6 +4453,95 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
     return 0;
 }
 
+/* WaitForSingleObjectEx — alertable wait; alertable flag ignored on Linux */
+uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObjectEx(void* handle, uint32_t ms, int alertable) {
+    (void)alertable;
+    return lsw_WaitForSingleObject(handle, ms);
+}
+
+/* WaitForMultipleObjectsEx — alertable multi-wait */
+extern uint32_t __attribute__((ms_abi)) lsw_WaitForMultipleObjects(uint32_t n, void** handles, int waitAll, uint32_t ms);
+uint32_t __attribute__((ms_abi)) lsw_WaitForMultipleObjectsEx(uint32_t n, void** handles, int waitAll, uint32_t ms, int alertable) {
+    (void)alertable;
+    return lsw_WaitForMultipleObjects(n, handles, waitAll, ms);
+}
+
+/* CreateSemaphoreExW — extended CreateSemaphoreW, flags ignored */
+extern void* __attribute__((ms_abi)) lsw_CreateSemaphoreW(void*, long, long, const uint16_t*);
+void* __attribute__((ms_abi)) lsw_CreateSemaphoreExW(void* sa, long init, long max, const uint16_t* name, uint32_t flags, uint32_t access) {
+    (void)flags; (void)access;
+    return lsw_CreateSemaphoreW(sa, init, max, name);
+}
+
+/* OpenSemaphoreW — open named semaphore; stub returns NULL */
+void* __attribute__((ms_abi)) lsw_OpenSemaphoreW(uint32_t access, int inherit, const uint16_t* name) {
+    (void)access; (void)inherit; (void)name;
+    return NULL; /* no cross-process semaphores on Linux stub */
+}
+
+/* CreateMutexExW — extended CreateMutexW */
+extern void* __attribute__((ms_abi)) lsw_CreateMutexW(void*, int, const uint16_t*);
+void* __attribute__((ms_abi)) lsw_CreateMutexExW(void* sa, const uint16_t* name, uint32_t flags, uint32_t access) {
+    (void)flags; (void)access;
+    return lsw_CreateMutexW(sa, 0, name);
+}
+
+/* DebugBreak — no-op on Linux */
+void __attribute__((ms_abi)) lsw_DebugBreak(void) {
+    LSW_LOG_WARN("DebugBreak called — ignored");
+}
+
+/* File change notification stubs */
+void* __attribute__((ms_abi)) lsw_FindFirstChangeNotificationW(const uint16_t* path, int watchSubtree, uint32_t filter) {
+    (void)path; (void)watchSubtree; (void)filter;
+    return (void*)(intptr_t)-1; /* INVALID_HANDLE_VALUE */
+}
+int __attribute__((ms_abi)) lsw_FindNextChangeNotification(void* handle) {
+    (void)handle; return 0;
+}
+int __attribute__((ms_abi)) lsw_FindCloseChangeNotification(void* handle) {
+    (void)handle; return 1;
+}
+
+/* Resource API stubs — robocopy/ulib uses these for string resources */
+void* __attribute__((ms_abi)) lsw_FindResourceExW(void* hmod, const uint16_t* type, const uint16_t* name, uint16_t lang) {
+    (void)hmod; (void)type; (void)name; (void)lang; return NULL;
+}
+void* __attribute__((ms_abi)) lsw_LoadResource(void* hmod, void* hresinfo) {
+    (void)hmod; (void)hresinfo; return NULL;
+}
+void* __attribute__((ms_abi)) lsw_LockResource(void* hres) {
+    (void)hres; return NULL;
+}
+uint32_t __attribute__((ms_abi)) lsw_SizeofResource(void* hmod, void* hresinfo) {
+    (void)hmod; (void)hresinfo; return 0;
+}
+
+/* CopyFile2 — modern file copy; stub delegates to CopyFileW */
+int32_t __attribute__((ms_abi)) lsw_CopyFile2(const wchar_t* src, const wchar_t* dst, void* params) {
+    (void)params;
+    return lsw_CopyFileW(src, dst, 0) ? 0 : (int32_t)0x80070000; /* S_OK or HRESULT failure */
+}
+
+/* BackupRead/BackupWrite — stream-based file copy for ACL/ADS; basic stubs */
+int __attribute__((ms_abi)) lsw_BackupRead(void* hFile, uint8_t* buf, uint32_t nBytesToRead, uint32_t* nBytesRead, int bAbort, int bProcessSecurity, void** lpContext) {
+    (void)hFile; (void)buf; (void)nBytesToRead; (void)bAbort; (void)bProcessSecurity; (void)lpContext;
+    if (nBytesRead) *nBytesRead = 0;
+    return 1; /* success, EOF */
+}
+int __attribute__((ms_abi)) lsw_BackupWrite(void* hFile, uint8_t* buf, uint32_t nBytesToWrite, uint32_t* nBytesWritten, int bAbort, int bProcessSecurity, void** lpContext) {
+    (void)hFile; (void)buf; (void)nBytesToWrite; (void)bAbort; (void)bProcessSecurity; (void)lpContext;
+    if (nBytesWritten) *nBytesWritten = 0;
+    return 1;
+}
+
+/* Thread pool cleanup group stubs */
+void* __attribute__((ms_abi)) lsw_CreateThreadpoolCleanupGroup(void) { return (void*)0xB002; }
+void __attribute__((ms_abi)) lsw_CloseThreadpoolCleanupGroupMembers(void* grp, int cancelPending, void* ctx) {
+    (void)grp; (void)cancelPending; (void)ctx;
+}
+void __attribute__((ms_abi)) lsw_CloseThreadpoolCleanupGroup(void* grp) { (void)grp; }
+
 /*
  * PE DLL handle table — maps "fake" HMODULE handles to PE images loaded via
  * the DLL chain loader.  Allows GetProcAddress to look up exported symbols.
@@ -4488,12 +4599,20 @@ static int pe_has_message_table(const uint8_t* image, size_t image_size)
     if (dd2_off + 4 > (uint32_t)image_size) return 0;
     uint32_t rsrc_rva = *(const uint32_t*)(image + dd2_off);
     if (!rsrc_rva) return 0;
-    const uint8_t* rsrc = pe_raw_rva_to_ptr(image, image_size, rsrc_rva);
+    /* Use VA-based lookup: this is always a memory-mapped PE where sections
+     * are already at their VirtualAddress offsets, not raw file offsets. */
+    const uint8_t* rsrc = pe_va_rva_to_ptr(image, image_size, rsrc_rva);
     if (!rsrc) return 0;
+    /* Bounds-check header fields before reading */
+    if ((size_t)(rsrc - image) + 16 > image_size) return 0;
     uint16_t n_named = *(const uint16_t*)(rsrc + 12);
     uint16_t n_id    = *(const uint16_t*)(rsrc + 14);
-    for (int i = 0; i < n_named + n_id; i++) {
-        uint32_t name_id = *(const uint32_t*)(rsrc + 16 + (uint32_t)i * 8);
+    uint32_t total   = (uint32_t)n_named + (uint32_t)n_id;
+    /* Each entry is 8 bytes; cap to avoid walking off the end */
+    uint32_t max_entries = (uint32_t)((image_size - (size_t)(rsrc - image) - 16u) / 8u);
+    if (total > max_entries) total = max_entries;
+    for (uint32_t i = 0; i < total; i++) {
+        uint32_t name_id = *(const uint32_t*)(rsrc + 16 + i * 8);
         if (!(name_id & 0x80000000u) && (name_id & 0x7FFFFFFFu) == 11u) return 1;
     }
     return 0;
@@ -4787,19 +4906,21 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
 
                             /* Try to allocate at preferred base first (no relocation needed
                              * if we succeed — critical for DLLs without a reloc table) */
+                            /* Allocate image_size + one extra page as guard zone for edge reads */
+                            size_t alloc_size = (size_t)image_size2 + 0x1000;
                             void* image = NULL;
                             if (pref_base_req) {
-                                image = mmap((void*)(uintptr_t)pref_base_req, (size_t)image_size2,
+                                image = mmap((void*)(uintptr_t)pref_base_req, alloc_size,
                                     PROT_READ|PROT_WRITE|PROT_EXEC,
                                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
                                 /* If we didn't get the preferred base, discard and try anywhere */
                                 if (image != MAP_FAILED && (uintptr_t)image != pref_base_req) {
-                                    munmap(image, (size_t)image_size2);
+                                    munmap(image, alloc_size);
                                     image = MAP_FAILED;
                                 }
                             }
                             if (image == MAP_FAILED || !image)
-                                image = mmap(NULL, (size_t)image_size2,
+                                image = mmap(NULL, alloc_size,
                                     PROT_READ|PROT_WRITE|PROT_EXEC,
                                     MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
                             if (image == MAP_FAILED) {
@@ -4901,7 +5022,7 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
                                 mod->magic = LSW_PE_HMODULE_MAGIC;
                                 strncpy(mod->dll_name, base, sizeof(mod->dll_name)-1);
                                 mod->image_base = image;
-                                mod->image_size = (size_t)image_size2;
+                                mod->image_size = alloc_size; /* includes guard page */
                                 mod->mapped_va  = 1; /* sections mapped at VAs */
                                 mod->sec_hdrs     = b + sec_off2;
                                 mod->num_sections = num_sec2;
@@ -4924,7 +5045,9 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
                                  * look for en-US/<name>.dll.mui in the same directory */
                                 mod->mui_image = NULL;
                                 mod->mui_image_size = 0;
+                                LSW_LOG_DEBUG("LoadLibraryA: checking message table for %s", base);
                                 if (!pe_has_message_table((const uint8_t*)image, (size_t)image_size2)) {
+                                     LSW_LOG_DEBUG("LoadLibraryA: no message table in %s, checking MUI", base);
                                      char dir_part[512]; strncpy(dir_part, found, sizeof(dir_part)-1);
                                      char* sl = strrchr(dir_part, '/');
                                      if (sl) *sl = '\0'; else dir_part[0] = '\0';
@@ -4955,18 +5078,42 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
                                         }
                                     }
                                 }
-                                /* Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL) */
+                                /* Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL)
+                                 * Wrapped with sigsetjmp so a crashing DllMain
+                                 * (e.g. inetmib1.dll accessing SNMP kernel objects
+                                 *  that don't exist on Linux) doesn't kill the process. */
                                 if (ep_rva) {
                                     typedef int (__attribute__((ms_abi)) *dll_entry_fn)(void* hinstDLL, uint32_t fdwReason, void* lpvReserved);
                                     dll_entry_fn dll_entry = (dll_entry_fn)(b + ep_rva);
                                     LSW_LOG_INFO("LoadLibraryA: calling DllMain %s at %p (rva 0x%x) DLL_PROCESS_ATTACH",
                                                  base, (void*)dll_entry, ep_rva);
-                                    int r = dll_entry((void*)mod, 1 /* DLL_PROCESS_ATTACH */, NULL);
-                                    LSW_LOG_INFO("LoadLibraryA: DllMain %s returned %d", base, r);
+
+                                    /* Install temporary recovery handler */
+                                    struct sigaction sa_rec, sa_old_segv, sa_old_bus;
+                                    memset(&sa_rec, 0, sizeof(sa_rec));
+                                    sa_rec.sa_sigaction = dllmain_recovery_sighandler;
+                                    sa_rec.sa_flags = SA_SIGINFO;
+                                    sigemptyset(&sa_rec.sa_mask);
+                                    sigaction(SIGSEGV, &sa_rec, &sa_old_segv);
+                                    sigaction(SIGBUS,  &sa_rec, &sa_old_bus);
+
+                                    g_in_dllmain = 1;
+                                    if (sigsetjmp(g_dllmain_recovery, 1) == 0) {
+                                        int r = dll_entry(image /* hinstDLL = image base */, 1 /* DLL_PROCESS_ATTACH */, NULL);
+                                        LSW_LOG_INFO("LoadLibraryA: DllMain %s returned %d", base, r);
+                                    } else {
+                                        LSW_LOG_WARN("LoadLibraryA: DllMain %s crashed (SIGSEGV/SIGBUS) — DLL partially initialized, continuing",
+                                                     base);
+                                    }
+                                    g_in_dllmain = 0;
+
+                                    /* Restore original handlers */
+                                    sigaction(SIGSEGV, &sa_old_segv, NULL);
+                                    sigaction(SIGBUS,  &sa_old_bus,  NULL);
                                 }
                                 return (void*)mod;
                             }
-                            munmap(image, (size_t)image_size2);
+                            munmap(image, alloc_size);
                             } /* end else (image != MAP_FAILED) */
                         }
                     }
@@ -7464,6 +7611,38 @@ int __attribute__((ms_abi)) lsw_memcpy_s(void* dst, size_t dsz, const void* src,
 int __attribute__((ms_abi)) lsw_memmove_s(void* dst, size_t dsz, const void* src, size_t cnt) {
     if (cnt > dsz) return 22;
     memmove(dst, src, cnt); return 0;
+}
+
+/* Wide char file / string helpers for msvcrt.dll */
+wchar_t* __attribute__((ms_abi)) lsw_fgetws(wchar_t* buf, int n, void* stream) {
+    return fgetws(buf, n, (FILE*)stream);
+}
+int __attribute__((ms_abi)) lsw_fputws(const wchar_t* s, void* stream) {
+    return fputws(s, (FILE*)stream);
+}
+wchar_t* __attribute__((ms_abi)) lsw__wsetlocale(int cat, const wchar_t* locale) {
+    /* Convert wide locale to narrow, call setlocale, return wide copy */
+    (void)cat; (void)locale;
+    return NULL; /* stub — locale stays as-is */
+}
+int __attribute__((ms_abi)) lsw__wcsupr_s(wchar_t* s, size_t sz) {
+    if (!s) return 22;
+    for (size_t i = 0; i < sz && s[i]; i++) s[i] = towupper((wint_t)s[i]);
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_fwprintf_s(void* stream, const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vfwprintf((FILE*)stream, fmt, ap);
+    va_end(ap);
+    return r;
+}
+int __attribute__((ms_abi)) lsw__vsnprintf(char* buf, size_t n, const char* fmt, va_list ap) {
+    return vsnprintf(buf, n, fmt, ap);
+}
+char* __attribute__((ms_abi)) lsw__strupr(char* s) {
+    if (s) for (char* p = s; *p; p++) *p = (char)toupper((unsigned char)*p);
+    return s;
 }
 int __attribute__((ms_abi)) lsw_wcscpy_s(wchar_t* dst, size_t sz, const wchar_t* src) {
     if (!dst || !sz) return 22;
@@ -11793,6 +11972,21 @@ extern long   __attribute__((ms_abi)) lsw_RegCloseKey(void*);
 /* ntdll memory */
 extern size_t __attribute__((ms_abi)) lsw_RtlCompareMemory(const void*, const void*, size_t);
 
+/* ------------------------------------------------------------------
+ * snmpapi.dll stubs (used by inetmib1.dll)
+ * ------------------------------------------------------------------ */
+/* SNMP_OID / ASN_ANY are opaque blobs; just memcpy for "copy", free for "free" */
+void __attribute__((ms_abi)) lsw_SnmpUtilOidCpy(void* dst, const void* src) {
+    if (dst && src) memcpy(dst, src, 12); /* sizeof(RFC_1157_OBJECTNAME) = 12 */
+}
+void __attribute__((ms_abi)) lsw_SnmpUtilOidFree(void* oid) { (void)oid; }
+void __attribute__((ms_abi)) lsw_SnmpUtilVarBindFree(void* vb) { (void)vb; }
+void __attribute__((ms_abi)) lsw_SnmpUtilVarBindListFree(void* vbl) { (void)vbl; }
+void __attribute__((ms_abi)) lsw_SnmpUtilAsnAnyCpy(void* dst, const void* src) {
+    if (dst && src) memcpy(dst, src, 16);
+}
+void __attribute__((ms_abi)) lsw_SnmpUtilAsnAnyFree(void* any) { (void)any; }
+
 // Global API mapping table
 static const win32_api_mapping_t api_mappings[] = {
     // msvcrt.dll - CRT functions
@@ -11886,7 +12080,19 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll", "??0exception@@QEAA@AEBV0@@Z",   (void*)lsw_exception_copy_ctor},
     {"msvcrt.dll", "??1exception@@UEAA@XZ",          (void*)lsw_exception_dtor},
     {"msvcrt.dll", "?what@exception@@UEBAPEBDXZ",    (void*)lsw_exception_what},
-    
+    /* Additional msvcrt stubs for robocopy/ulib */
+    {"msvcrt.dll", "ctime",          (void*)lsw_ctime},
+    {"msvcrt.dll", "fgetws",         (void*)lsw_fgetws},
+    {"msvcrt.dll", "fputws",         (void*)lsw_fputws},
+    {"msvcrt.dll", "_wsetlocale",    (void*)lsw__wsetlocale},
+    {"msvcrt.dll", "_wcsupr_s",      (void*)lsw__wcsupr_s},
+    {"msvcrt.dll", "_wfopen",        (void*)lsw__wfopen},
+    {"msvcrt.dll", "fwprintf_s",     (void*)lsw_fwprintf_s},
+    {"msvcrt.dll", "memcpy_s",       (void*)lsw_memcpy_s},
+    {"msvcrt.dll", "memmove_s",      (void*)lsw_memmove_s},
+    {"msvcrt.dll", "_vsnprintf",     (void*)lsw__vsnprintf},
+    {"msvcrt.dll", "_strupr",        (void*)lsw__strupr},
+
     // KERNEL32.dll
     {"KERNEL32.dll", "Sleep", (void*)lsw_Sleep},
     {"KERNEL32.dll", "GetLastError", (void*)lsw_GetLastError},
@@ -12055,7 +12261,9 @@ static const win32_api_mapping_t api_mappings[] = {
     // KERNEL32.dll - continued
     {"KERNEL32.dll", "CreateThread", (void*)lsw_CreateThread},
     {"KERNEL32.dll", "ExitThread", (void*)lsw_ExitThread},
-    {"KERNEL32.dll", "WaitForSingleObject", (void*)lsw_WaitForSingleObject},
+    {"KERNEL32.dll", "WaitForSingleObject",    (void*)lsw_WaitForSingleObject},
+    {"KERNEL32.dll", "WaitForSingleObjectEx",  (void*)lsw_WaitForSingleObjectEx},
+    {"KERNEL32.dll", "WaitForMultipleObjectsEx",(void*)lsw_WaitForMultipleObjectsEx},
     {"KERNEL32.dll", "WriteFile", (void*)lsw_WriteFile},
     {"KERNEL32.dll", "ReadFile", (void*)lsw_ReadFile},
     {"KERNEL32.dll", "GetFileSize", (void*)lsw_GetFileSize},
@@ -12594,7 +12802,29 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "ReleaseMutex",             (void*)lsw_ReleaseMutex},
     {"KERNEL32.dll", "CreateSemaphoreA",         (void*)lsw_CreateSemaphoreA},
     {"KERNEL32.dll", "CreateSemaphoreW",         (void*)lsw_CreateSemaphoreW},
+    {"KERNEL32.dll", "CreateSemaphoreExW",       (void*)lsw_CreateSemaphoreExW},
+    {"KERNEL32.dll", "OpenSemaphoreW",           (void*)lsw_OpenSemaphoreW},
     {"KERNEL32.dll", "ReleaseSemaphore",         (void*)lsw_ReleaseSemaphore},
+    {"KERNEL32.dll", "CreateMutexExW",           (void*)lsw_CreateMutexExW},
+    {"KERNEL32.dll", "DebugBreak",               (void*)lsw_DebugBreak},
+    /* File change notifications */
+    {"KERNEL32.dll", "FindFirstChangeNotificationW", (void*)lsw_FindFirstChangeNotificationW},
+    {"KERNEL32.dll", "FindNextChangeNotification",   (void*)lsw_FindNextChangeNotification},
+    {"KERNEL32.dll", "FindCloseChangeNotification",  (void*)lsw_FindCloseChangeNotification},
+    /* Resource API */
+    {"KERNEL32.dll", "FindResourceExW",          (void*)lsw_FindResourceExW},
+    {"KERNEL32.dll", "LoadResource",             (void*)lsw_LoadResource},
+    {"KERNEL32.dll", "LockResource",             (void*)lsw_LockResource},
+    {"KERNEL32.dll", "SizeofResource",           (void*)lsw_SizeofResource},
+    /* Modern file copy */
+    {"KERNEL32.dll", "CopyFile2",                (void*)lsw_CopyFile2},
+    /* Backup stream file copy */
+    {"KERNEL32.dll", "BackupRead",               (void*)lsw_BackupRead},
+    {"KERNEL32.dll", "BackupWrite",              (void*)lsw_BackupWrite},
+    /* Thread pool cleanup groups */
+    {"KERNEL32.dll", "CreateThreadpoolCleanupGroup",        (void*)lsw_CreateThreadpoolCleanupGroup},
+    {"KERNEL32.dll", "CloseThreadpoolCleanupGroupMembers",  (void*)lsw_CloseThreadpoolCleanupGroupMembers},
+    {"KERNEL32.dll", "CloseThreadpoolCleanupGroup",         (void*)lsw_CloseThreadpoolCleanupGroup},
     {"KERNEL32.dll", "ResetEvent",               (void*)lsw_ResetEvent},
     /* Condition variables */
     {"KERNEL32.dll", "InitializeConditionVariable",   (void*)lsw_InitializeConditionVariable},
@@ -13049,6 +13279,7 @@ static const win32_api_mapping_t api_mappings[] = {
 
     /* api-ms-win-core-rtlsupport */
     {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlCompareMemory",     (void*)lsw_RtlCompareMemory},
+    {"KERNEL32.dll", "RtlCompareMemory",                             (void*)lsw_RtlCompareMemory},
     {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlLookupFunctionEntry",(void*)lsw_RtlLookupFunctionEntry},
     {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlCaptureContext",    (void*)lsw_RtlCaptureContext},
     {"api-ms-win-core-rtlsupport-l1-1-0.dll","RtlVirtualUnwind",     (void*)lsw_RtlVirtualUnwind},
@@ -13122,6 +13353,16 @@ static const win32_api_mapping_t api_mappings[] = {
     {"iphlpapi.dll", "Icmp6CreateFile",           (void*)lsw_Icmp6CreateFile},
     {"iphlpapi.dll", "Icmp6SendEcho2",            (void*)lsw_Icmp6SendEcho2},
     {"iphlpapi.dll", "GetIpErrorString",          (void*)lsw_GetIpErrorString},
+    /* snmpapi.dll — used by inetmib1.dll */
+    {"snmpapi.dll", "SnmpUtilMemAlloc",  (void*)malloc},
+    {"snmpapi.dll", "SnmpUtilMemFree",   (void*)free},
+    {"snmpapi.dll", "SnmpUtilMemReAlloc",(void*)realloc},
+    {"snmpapi.dll", "SnmpUtilOidCpy",    (void*)lsw_SnmpUtilOidCpy},
+    {"snmpapi.dll", "SnmpUtilOidFree",   (void*)lsw_SnmpUtilOidFree},
+    {"snmpapi.dll", "SnmpUtilVarBindFree",(void*)lsw_SnmpUtilVarBindFree},
+    {"snmpapi.dll", "SnmpUtilVarBindListFree",(void*)lsw_SnmpUtilVarBindListFree},
+    {"snmpapi.dll", "SnmpUtilAsnAnyCpy", (void*)lsw_SnmpUtilAsnAnyCpy},
+    {"snmpapi.dll", "SnmpUtilAsnAnyFree",(void*)lsw_SnmpUtilAsnAnyFree},
 };
 
 #pragma GCC diagnostic pop

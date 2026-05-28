@@ -25,10 +25,10 @@
 #include <sys/resource.h>
 #include <pthread.h>
 
-/* Get the actual Linux stack limits for the current thread so that
- * Windows code using TEB.StackBase/StackLimit doesn't crash when it
- * tries to walk the stack (e.g., SEH handler search). */
-static void lsw_get_stack_limits(void** out_base, void** out_limit) {
+/* Get the actual Linux stack TOP for the current thread.
+ * Only StackBase (top) is used — StackLimit is forced to NULL so that
+ * Windows __chkstk always skips its probe loop on Linux. */
+static void lsw_get_stack_base(void** out_base) {
     /* Read actual stack limits from /proc/self/maps or pthread attributes */
     pthread_attr_t attr;
     void* stack_addr = NULL;
@@ -39,23 +39,18 @@ static void lsw_get_stack_limits(void** out_base, void** out_limit) {
     if (pthread_getattr_np(pthread_self(), &attr) == 0) {
         pthread_attr_getstack(&attr, &stack_addr, &stack_size);
         pthread_attr_destroy(&attr);
-        /* stack_addr = low address of stack region; stack grows down.
-         * StackLimit (lowest valid address) = stack_addr
-         * StackBase  (initial RSP, highest address) = stack_addr + stack_size */
-        *out_limit = stack_addr;
-        *out_base  = (char*)stack_addr + stack_size;
+        /* stack_addr = low address; stack grows down; base = top */
+        *out_base = (char*)stack_addr + stack_size;
         return;
     }
 #endif
-    /* Fallback: use rlimit to size estimate */
+    /* Fallback: approximate base from current RSP */
     struct rlimit rl;
     getrlimit(RLIMIT_STACK, &rl);
     size_t sz = (rl.rlim_cur == RLIM_INFINITY) ? (8 * 1024 * 1024) : rl.rlim_cur;
-    /* Approximate: current RSP is near top of stack */
     uintptr_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
-    *out_base  = (void*)((rsp + 0x1000) & ~0xFFFF);
-    *out_limit = (void*)((uintptr_t)*out_base - sz);
+    *out_base = (void*)((rsp + sz + 0xFFFF) & ~0xFFFF);
 }
 
 // Thread-local storage for TEB
@@ -96,11 +91,21 @@ int win32_teb_init(void) {
     
     // Set StackBase/StackLimit to the real Linux thread stack so that
     // Windows code walking the stack (e.g. SEH) doesn't SIGSEGV.
-    void* stack_base = NULL, *stack_limit = NULL;
-    lsw_get_stack_limits(&stack_base, &stack_limit);
+    //
+    // IMPORTANT: We intentionally set StackLimit = NULL (0) rather than
+    // the real bottom-of-stack address.  Windows __chkstk reads gs:0x10
+    // (TEB.StackLimit) to determine the lowest committed stack page, then
+    // probes one page *below* StackLimit to trigger the kernel's guard-page
+    // expansion.  On Linux the kernel extends the stack automatically on any
+    // access — we never need to probe.  If StackLimit is non-zero, __chkstk
+    // will try to probe StackLimit-0x1000, which is below the mapped stack
+    // region and causes SIGSEGV.  Setting StackLimit = 0 makes the
+    // "cmp r10,r11; jae <end>" branch always take the skip path (r10 > 0).
+    void* stack_base = NULL;
+    lsw_get_stack_base(&stack_base);
     current_teb->StackBase  = stack_base;
-    current_teb->StackLimit = stack_limit;
-    LSW_LOG_INFO("TEB stack: base=%p limit=%p", stack_base, stack_limit);
+    current_teb->StackLimit = NULL;    /* 0 → __chkstk always skips probe loop */
+    LSW_LOG_INFO("TEB stack: base=%p limit=%p (limit forced to 0 for Linux)", stack_base, (void*)NULL);
     
     // Initialize all TLS slots to NULL
     memset(current_teb->TlsSlots, 0, sizeof(current_teb->TlsSlots));

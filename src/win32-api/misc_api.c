@@ -667,6 +667,84 @@ uint32_t LSW_MSABI lsw_Dhcpv6SetUserClass(void* a, void* b, void* c) { (void)a;(
 uint32_t LSW_MSABI lsw_GetIfTable(void* pIfTable, uint32_t* pdwSize, int bOrder) { (void)pIfTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
 uint32_t LSW_MSABI lsw_GetIpAddrTable(void* pIpAddrTable, uint32_t* pdwSize, int bOrder) { (void)pIpAddrTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
 uint32_t LSW_MSABI lsw_GetIpForwardTable(void* pIpForwardTable, uint32_t* pdwSize, int bOrder) { (void)pIpForwardTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
+
+/* InternalGetBound*EndpointTable — used by netstat to list connections.
+ * We return an empty (but valid) dummy hash table so that
+ * RtlEnumerateEntryHashTable returns NULL (no connections) without crashing.
+ * The allocated block is freed by RtlDeleteHashTable. */
+uint32_t LSW_MSABI lsw_InternalGetBoundTcpEndpointTable(void** ppTable, void* heap, uint32_t flags) {
+    (void)heap; (void)flags;
+    if (!ppTable) return 2;
+    void* t = calloc(1, 256); /* dummy empty hash-table token */
+    if (!t) return 8;
+    *ppTable = t;
+    return 0; /* NO_ERROR */
+}
+uint32_t LSW_MSABI lsw_InternalGetBoundTcp6EndpointTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetBoundTcpEndpointTable(ppTable, heap, flags);
+}
+/* InternalGetTcpTable / InternalGetUdpTable variants — return NO_ERROR with
+ * an empty MIB table (NumEntries = 0) so callers don't deref NULL. */
+uint32_t LSW_MSABI lsw_InternalGetTcpTable(void** ppTable, void* heap, uint32_t flags) {
+    (void)heap; (void)flags;
+    if (!ppTable) return 2;
+    uint32_t* t = calloc(1, 256); /* first uint32 = NumEntries = 0 */
+    if (!t) return 8;
+    *ppTable = t;
+    return 0;
+}
+uint32_t LSW_MSABI lsw_InternalGetTcpTableEx(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetTcpTable2(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetTcpTableWithOwnerModule(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetTcp6Table2(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetTcp6TableWithOwnerModule(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetUdpTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetUdpTable2(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetUdp6Table2(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+/* Statistics functions — return ERROR_NO_DATA (232) */
+uint32_t LSW_MSABI lsw_GetTcpStatisticsEx(void* stats, uint32_t family) { (void)stats; (void)family; return 232; }
+uint32_t LSW_MSABI lsw_GetUdpStatistics(void* stats) { (void)stats; return 232; }
+uint32_t LSW_MSABI lsw_GetUdpStatisticsEx(void* stats, uint32_t family) { (void)stats; (void)family; return 232; }
+uint32_t LSW_MSABI lsw_GetIpStatistics(void* stats) { (void)stats; return 232; }
+uint32_t LSW_MSABI lsw_GetIpStatisticsEx(void* stats, uint32_t family) { (void)stats; (void)family; return 232; }
+uint32_t LSW_MSABI lsw_GetIcmpStatistics(void* stats) { (void)stats; return 232; }
+uint32_t LSW_MSABI lsw_GetIcmpStatisticsEx(void* stats, uint32_t family) { (void)stats; (void)family; return 232; }
+/* Internal If/IpAddr/IpForward/IpNet tables — return empty */
+uint32_t LSW_MSABI lsw_InternalGetIfTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetIpAddrTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetIpForwardTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+uint32_t LSW_MSABI lsw_InternalGetIpNetTable(void** ppTable, void* heap, uint32_t flags) {
+    return lsw_InternalGetTcpTable(ppTable, heap, flags);
+}
+/* ConvertInterfaceLuidToNameA */
+uint32_t LSW_MSABI lsw_ConvertInterfaceLuidToNameA(void* luid, char* name, uint32_t len) {
+    (void)luid;
+    if (name && len > 0) name[0] = '\0';
+    return 1; /* ERROR_GEN_FAILURE */
+}
+
 void* LSW_MSABI lsw_IcmpCreateFile(void) { return (void*)0xB001; }
 int LSW_MSABI lsw_IcmpCloseHandle(void* IcmpHandle) { (void)IcmpHandle; return 1; }
 /* lsw_IcmpSendEcho implemented in win32_api.c (full ICMP socket implementation) */
@@ -910,6 +988,31 @@ const win32_api_mapping_t win32_api_misc_mappings[] = {
     MAP("iphlpapi.dll", "SetCurrentThreadCompartmentId", lsw_SetCurrentThreadCompartmentId),
     MAP("iphlpapi.dll", "GetInterfaceDnsSettings", lsw_GetInterfaceDnsSettings),
     MAP("iphlpapi.dll", "FreeInterfaceDnsSettings", lsw_FreeInterfaceDnsSettings),
+    /* Internal endpoint/connection table stubs (used by netstat, tasklist, etc.) */
+    MAP("iphlpapi.dll", "InternalGetBoundTcpEndpointTable",           lsw_InternalGetBoundTcpEndpointTable),
+    MAP("iphlpapi.dll", "InternalGetBoundTcp6EndpointTable",          lsw_InternalGetBoundTcp6EndpointTable),
+    MAP("iphlpapi.dll", "InternalGetTcpTable",                        lsw_InternalGetTcpTable),
+    MAP("iphlpapi.dll", "InternalGetTcpTableEx",                      lsw_InternalGetTcpTableEx),
+    MAP("iphlpapi.dll", "InternalGetTcpTable2",                       lsw_InternalGetTcpTable2),
+    MAP("iphlpapi.dll", "InternalGetTcpTableWithOwnerModule",         lsw_InternalGetTcpTableWithOwnerModule),
+    MAP("iphlpapi.dll", "InternalGetTcp6Table2",                      lsw_InternalGetTcp6Table2),
+    MAP("iphlpapi.dll", "InternalGetTcp6TableWithOwnerModule",        lsw_InternalGetTcp6TableWithOwnerModule),
+    MAP("iphlpapi.dll", "InternalGetUdpTable",                        lsw_InternalGetUdpTable),
+    MAP("iphlpapi.dll", "InternalGetUdpTable2",                       lsw_InternalGetUdpTable2),
+    MAP("iphlpapi.dll", "InternalGetUdp6Table2",                      lsw_InternalGetUdp6Table2),
+    MAP("iphlpapi.dll", "InternalGetIfTable",                         lsw_InternalGetIfTable),
+    MAP("iphlpapi.dll", "InternalGetIpAddrTable",                     lsw_InternalGetIpAddrTable),
+    MAP("iphlpapi.dll", "InternalGetIpForwardTable",                  lsw_InternalGetIpForwardTable),
+    MAP("iphlpapi.dll", "InternalGetIpNetTable",                      lsw_InternalGetIpNetTable),
+    /* Network statistics stubs */
+    MAP("iphlpapi.dll", "GetTcpStatisticsEx",                         lsw_GetTcpStatisticsEx),
+    MAP("iphlpapi.dll", "GetUdpStatistics",                           lsw_GetUdpStatistics),
+    MAP("iphlpapi.dll", "GetUdpStatisticsEx",                         lsw_GetUdpStatisticsEx),
+    MAP("iphlpapi.dll", "GetIpStatistics",                            lsw_GetIpStatistics),
+    MAP("iphlpapi.dll", "GetIpStatisticsEx",                          lsw_GetIpStatisticsEx),
+    MAP("iphlpapi.dll", "GetIcmpStatistics",                          lsw_GetIcmpStatistics),
+    MAP("iphlpapi.dll", "GetIcmpStatisticsEx",                        lsw_GetIcmpStatisticsEx),
+    MAP("iphlpapi.dll", "ConvertInterfaceLuidToNameA",                lsw_ConvertInterfaceLuidToNameA),
     /* NSI.dll */
     MAP("nsi.dll", "NsiAllocateAndGetTable", lsw_NsiAllocateAndGetTable),
     MAP("nsi.dll", "NsiFreeTable", lsw_NsiFreeTable),
