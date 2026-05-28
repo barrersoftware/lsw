@@ -669,7 +669,8 @@ uint32_t LSW_MSABI lsw_GetIpAddrTable(void* pIpAddrTable, uint32_t* pdwSize, int
 uint32_t LSW_MSABI lsw_GetIpForwardTable(void* pIpForwardTable, uint32_t* pdwSize, int bOrder) { (void)pIpForwardTable; (void)bOrder; if (pdwSize) *pdwSize = 0; return 122; }
 void* LSW_MSABI lsw_IcmpCreateFile(void) { return (void*)0xB001; }
 int LSW_MSABI lsw_IcmpCloseHandle(void* IcmpHandle) { (void)IcmpHandle; return 1; }
-uint32_t LSW_MSABI lsw_IcmpSendEcho(void* IcmpHandle, uint32_t DestinationAddress, void* RequestData, uint16_t RequestSize, void* RequestOptions, void* ReplyBuffer, uint32_t ReplySize, uint32_t Timeout) { (void)IcmpHandle; (void)DestinationAddress; (void)RequestData; (void)RequestSize; (void)RequestOptions; (void)ReplyBuffer; (void)ReplySize; (void)Timeout; return 0; }
+/* lsw_IcmpSendEcho implemented in win32_api.c (full ICMP socket implementation) */
+extern uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(void*, uint32_t, void*, uint16_t, void*, void*, uint32_t, uint32_t);
 uint32_t LSW_MSABI lsw_GetNetworkParams(void* pFixedInfo, uint32_t* pOutBufLen) { (void)pFixedInfo; if (pOutBufLen) *pOutBufLen = 256; return 111; }
 uint32_t LSW_MSABI lsw_NotifyAddrChange(void* Handle, void* overlapped) { (void)Handle; (void)overlapped; return 0; }
 int LSW_MSABI lsw_CancelIPChangeNotify(void* overlapped) { (void)overlapped; return 1; }

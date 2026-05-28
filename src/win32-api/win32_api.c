@@ -73,6 +73,19 @@
 
 /* Forward declarations */
 static void createprocess_win_to_linux(const char* wpath, char* out, size_t outsz);
+int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceW(const uint16_t* lpRootPathName, uint32_t* lpSectorsPerCluster, uint32_t* lpBytesPerSector, uint32_t* lpNumberOfFreeClusters, uint32_t* lpTotalNumberOfClusters);
+int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsigned long flags, const wchar_t* src, int srclen, char* dst, int dstlen, const char* defchar, int* used_default);
+int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* src, int srclen, uint16_t* dst, int dstlen);
+
+/* Windows pseudo-handle constants: STD_INPUT=-10, STD_OUTPUT=-11, STD_ERROR=-12 */
+#define LSW_IS_PSEUDO_HANDLE(h) ((intptr_t)(uintptr_t)(h) >= -12 && (intptr_t)(uintptr_t)(h) <= -10)
+static inline int lsw_pseudo_handle_to_fd(void* handle) {
+    intptr_t h = (intptr_t)(uintptr_t)handle;
+    if (h == -10) return STDIN_FILENO;
+    if (h == -11) return STDOUT_FILENO;
+    if (h == -12) return STDERR_FILENO;
+    return -1;
+}
 
 /* ---- Global exe path (set by PE loader at startup) ---- */
 static char g_lsw_exe_path[4096] = {0};
@@ -2127,22 +2140,25 @@ int __attribute__((ms_abi)) lsw_IsDBCSLeadByteEx(unsigned int codepage, unsigned
     return 0; // Not DBCS for now
 }
 
-int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* src, int srclen, wchar_t* dst, int dstlen) {
+int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsigned long flags, const char* src, int srclen, uint16_t* dst, int dstlen) {
     (void)codepage;
     (void)flags;
-    
+
+    int len = srclen >= 0 ? srclen : (src ? (int)strlen(src) : 0);
+
     if (!dst) {
-        // Return required size
-        return srclen >= 0 ? srclen : (int)strlen(src);
+        LSW_LOG_INFO("MultiByteToWideChar: query size for %d chars", len);
+        return len;
     }
-    
-    int len = srclen >= 0 ? srclen : (int)strlen(src);
+
     if (len > dstlen) len = dstlen;
-    
+    LSW_LOG_INFO("MultiByteToWideChar: cp=%u srclen=%d dstlen=%d -> %d chars", codepage, srclen, dstlen, len);
+
+    /* Write UTF-16LE (2-byte) characters into dst — caller is Windows code expecting uint16_t */
     for (int i = 0; i < len; i++) {
-        dst[i] = (wchar_t)(unsigned char)src[i];
+        dst[i] = (uint16_t)(unsigned char)src[i];
     }
-    
+
     return len;
 }
 
@@ -2150,73 +2166,52 @@ int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsig
     (void)codepage;
     (void)flags;
     (void)defchar;
-    
-    if (!src) {
-        return 0;
-    }
-    
-    // Windows wchar_t is UTF-16 (2 bytes), Linux wchar_t is UTF-32 (4 bytes)
-    // We need to treat the input as uint16_t* (UTF-16)
+
+    if (!src) return 0;
+
+    /* Windows wchar_t is UTF-16 (2 bytes); Linux wchar_t is 4 bytes — treat as uint16_t* */
     const uint16_t* src16 = (const uint16_t*)src;
-    
-    // Calculate source length if not provided
+
     size_t actual_srclen;
     if (srclen == -1) {
-        // Count UTF-16 characters until null terminator
         actual_srclen = 0;
-        while (src16[actual_srclen] != 0) {
-            actual_srclen++;
-        }
+        while (src16[actual_srclen] != 0) actual_srclen++;
+        actual_srclen++; /* include null terminator */
     } else {
         actual_srclen = (size_t)srclen;
     }
-    
-    if (!dst) {
-        // Return required size (pessimistic: assume each char needs 3 bytes in UTF-8)
-        return (int)(actual_srclen * 3 + 1);
+
+    if (!dst || dstlen == 0) {
+        /* Query required size */
+        return (int)actual_srclen; /* Conservative: 1 byte per wide char for BMP */
     }
-    
-    // UTF-16 to UTF-8 conversion
-    size_t src_idx = 0;
-    size_t dst_idx = 0;
-    
-    while (src_idx < actual_srclen && dst_idx < (size_t)(dstlen - 1)) {
-        uint16_t wc = src16[src_idx];
-        
-        // Check for null terminator
+
+    LSW_LOG_INFO("WideCharToMultiByte: cp=%u srclen=%d dstlen=%d actual=%zu", codepage, srclen, dstlen, actual_srclen);
+
+    size_t src_idx = 0, dst_idx = 0;
+    while (src_idx < actual_srclen && dst_idx < (size_t)dstlen) {
+        uint16_t wc = src16[src_idx++];
+
         if (wc == 0) {
+            if (srclen == -1) dst[dst_idx++] = '\0'; /* include null only if source was null-terminated */
             break;
-        }
-        
-        if (wc < 0x80) {
-            // ASCII range (0x00-0x7F) - 1 byte
+        } else if (wc < 0x80) {
             dst[dst_idx++] = (char)wc;
         } else if (wc < 0x800) {
-            // 2-byte UTF-8 sequence (0x80-0x7FF)
             if (dst_idx + 2 > (size_t)dstlen) break;
             dst[dst_idx++] = (char)(0xC0 | ((wc >> 6) & 0x1F));
             dst[dst_idx++] = (char)(0x80 | (wc & 0x3F));
         } else if (wc < 0xD800 || wc >= 0xE000) {
-            // 3-byte UTF-8 sequence (0x800-0xFFFF, excluding surrogates)
             if (dst_idx + 3 > (size_t)dstlen) break;
             dst[dst_idx++] = (char)(0xE0 | ((wc >> 12) & 0x0F));
             dst[dst_idx++] = (char)(0x80 | ((wc >> 6) & 0x3F));
             dst[dst_idx++] = (char)(0x80 | (wc & 0x3F));
         } else {
-            // Surrogate pair handling (for characters > 0xFFFF)
-            // For now, replace with '?'
             dst[dst_idx++] = '?';
         }
-        
-        src_idx++;
     }
-    
-    dst[dst_idx] = '\0';
-    
-    if (used_default) {
-        *used_default = 0;
-    }
-    
+
+    if (used_default) *used_default = 0;
     return (int)dst_idx;
 }
 
@@ -2385,6 +2380,9 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
 int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
     if (handle == INVALID_HANDLE_VALUE || !handle) return 0;
 
+    /* Windows pseudo-handles (STD_*) are not closeable */
+    if (LSW_IS_PSEUDO_HANDLE(handle)) return 1;
+
     /* Raw file descriptor — small integer, not a heap struct */
     if (!IS_TYPED_HANDLE(handle)) {
         intptr_t fd = (intptr_t)handle;
@@ -2520,12 +2518,14 @@ void* __attribute__((ms_abi)) lsw_GetModuleHandleA(const char* module_name) {
 #define STD_ERROR_HANDLE  ((void*)(uintptr_t)(-12))
 
 void* __attribute__((ms_abi)) lsw_GetStdHandle(uint32_t std_handle) {
-    // Win32: STD_INPUT_HANDLE = -10, STD_OUTPUT_HANDLE = -11, STD_ERROR_HANDLE = -12
+    // Return Windows-compatible pseudo-handle constants so callers that
+    // pass them directly to ReadFile/WriteFile without going through GetStdHandle
+    // get consistent behavior. -10=stdin, -11=stdout, -12=stderr.
     switch (std_handle) {
-        case (uint32_t)-10: return STD_INPUT_HANDLE;
-        case (uint32_t)-11: return STD_OUTPUT_HANDLE;
-        case (uint32_t)-12: return STD_ERROR_HANDLE;
-        default: return NULL;
+        case (uint32_t)-10: return (void*)(intptr_t)-10;
+        case (uint32_t)-11: return (void*)(intptr_t)-11;
+        case (uint32_t)-12: return (void*)(intptr_t)-12;
+        default: return (void*)(intptr_t)-1;  /* INVALID_HANDLE_VALUE */
     }
 }
 
@@ -2563,6 +2563,17 @@ int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint
     (void)overlapped;
     
     if (!handle || !buffer) { if (bytes_written) *bytes_written = 0; return 0; }
+
+    /* Windows pseudo-handles: STD_OUTPUT_HANDLE=-11, STD_ERROR_HANDLE=-12 */
+    {
+        int pfd = lsw_pseudo_handle_to_fd(handle);
+        if (pfd >= 0) {
+            LSW_LOG_INFO("WriteFile pseudo-handle %p (fd=%d): write=%u bytes '%.*s'", handle, pfd, bytes_to_write, (int)(bytes_to_write > 40 ? 40 : bytes_to_write), (const char*)buffer);
+            ssize_t r = write(pfd, buffer, bytes_to_write);
+            if (bytes_written) *bytes_written = r < 0 ? 0 : (uint32_t)r;
+            return r >= 0 ? 1 : 0;
+        }
+    }
 
     /* Named pipe handle — write to Unix domain socket fd */
     {
@@ -2609,16 +2620,7 @@ int __attribute__((ms_abi)) lsw_WriteFile(void* handle, const void* buffer, uint
     // Fallback to direct userspace implementation
     LSW_LOG_WARN("Using userspace fallback for WriteFile");
     
-    // Map Win32 handles to file descriptors
-    int fd = -1;
-    if (handle == STD_OUTPUT_HANDLE) {
-        fd = STDOUT_FILENO;
-    } else if (handle == STD_ERROR_HANDLE) {
-        fd = STDERR_FILENO;
-    } else {
-        // Assume it's a raw file descriptor for now
-        fd = (int)(uintptr_t)handle;
-    }
+    int fd = (int)(uintptr_t)handle;
     
     ssize_t result = write(fd, buffer, bytes_to_write);
     if (result < 0) {
@@ -2634,6 +2636,17 @@ int __attribute__((ms_abi)) lsw_ReadFile(void* handle, void* buffer, uint32_t by
     (void)overlapped;
     
     if (!handle || !buffer) { if (bytes_read) *bytes_read = 0; return 0; }
+
+    /* Windows pseudo-handles: STD_INPUT_HANDLE=-10, STD_OUTPUT_HANDLE=-11, STD_ERROR_HANDLE=-12 */
+    {
+        int pfd = lsw_pseudo_handle_to_fd(handle);
+        if (pfd >= 0) {
+            ssize_t r = read(pfd, buffer, bytes_to_read);
+            LSW_LOG_INFO("ReadFile pseudo-handle %p (fd=%d): read=%zd/%u", handle, pfd, r, bytes_to_read);
+            if (bytes_read) *bytes_read = r < 0 ? 0 : (uint32_t)r;
+            return r >= 0 ? 1 : 0;
+        }
+    }
 
     /* Named pipe handle — read from Unix domain socket fd */
     {
@@ -2676,12 +2689,7 @@ int __attribute__((ms_abi)) lsw_ReadFile(void* handle, void* buffer, uint32_t by
     // Fallback to userspace implementation
     LSW_LOG_WARN("Using userspace fallback for ReadFile");
     
-    int fd = -1;
-    if (handle == STD_INPUT_HANDLE) {
-        fd = STDIN_FILENO;
-    } else {
-        fd = (int)(uintptr_t)handle;
-    }
+    int fd = (int)(uintptr_t)handle;
     
     ssize_t result = read(fd, buffer, bytes_to_read);
     if (result < 0) {
@@ -3295,6 +3303,54 @@ DWORD __attribute__((ms_abi)) lsw_GetTempPathW(DWORD size, wchar_t* buffer) {
     lsw_MultiByteToWideChar(CP_UTF8, 0, temp_ansi, -1, buffer, size);
     LSW_LOG_INFO("GetTempPathW: returning wide-char path");
     return (DWORD)(wide_len - 1); // Don't count null terminator
+}
+
+// KERNEL32.dll!GetTempPath2A/W - Windows 10 2004+ variant; same semantics as GetTempPathA/W
+DWORD __attribute__((ms_abi)) lsw_GetTempPath2A(DWORD size, char* buffer) {
+    return lsw_GetTempPathA(size, buffer);
+}
+DWORD __attribute__((ms_abi)) lsw_GetTempPath2W(DWORD size, wchar_t* buffer) {
+    return lsw_GetTempPathW(size, buffer);
+}
+
+// KERNEL32.dll!GetTempFileNameA/W - Create a temporary file name
+uint32_t __attribute__((ms_abi)) lsw_GetTempFileNameA(const char* lpPathName, const char* lpPrefixString,
+                                                   uint32_t uUnique, char* lpTempFileName) {
+    if (!lpTempFileName) return 0;
+    const char* dir = (lpPathName && lpPathName[0]) ? lpPathName : "/tmp";
+    const char* pfx = (lpPrefixString && lpPrefixString[0]) ? lpPrefixString : "tmp";
+    if (uUnique == 0) {
+        uUnique = (uint32_t)((getpid() ^ (unsigned long)time(NULL)) & 0xFFFF);
+        if (uUnique == 0) uUnique = 1;
+    }
+    // Build Windows-style temp path: dir\pfxXXXX.tmp
+    snprintf(lpTempFileName, LSW_MAX_PATH, "%s\\%s%04X.tmp", dir, pfx, uUnique & 0xFFFF);
+    // Create the file so the name is reserved
+    char linux_path[LSW_MAX_PATH];
+    lsw_fs_win_to_linux(lpTempFileName, linux_path, sizeof(linux_path));
+    int fd = open(linux_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fd >= 0) close(fd);
+    LSW_LOG_INFO("GetTempFileNameA: '%s' (unique=%u)", lpTempFileName, uUnique);
+    return uUnique;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetTempFileNameW(const wchar_t* lpPathName, const wchar_t* lpPrefixString,
+                                                    uint32_t uUnique, wchar_t* lpTempFileName) {
+    if (!lpTempFileName) return 0;
+    char dirA[LSW_MAX_PATH] = {0}, pfxA[32] = {0}, outA[LSW_MAX_PATH] = {0};
+    if (lpPathName) lsw_WideCharToMultiByte(CP_UTF8, 0, lpPathName, -1, dirA, sizeof(dirA), NULL, NULL);
+    if (lpPrefixString) lsw_WideCharToMultiByte(CP_UTF8, 0, lpPrefixString, -1, pfxA, sizeof(pfxA), NULL, NULL);
+    uint32_t r = lsw_GetTempFileNameA(dirA, pfxA, uUnique, outA);
+    if (r) lsw_MultiByteToWideChar(CP_UTF8, 0, outA, -1, lpTempFileName, LSW_MAX_PATH);
+    return r;
+}
+
+// KERNEL32.dll!GetDiskFreeSpaceA - ANSI wrapper for GetDiskFreeSpaceW
+int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceA(const char* lpRootPathName,
+                                                    uint32_t* lpSectorsPerCluster, uint32_t* lpBytesPerSector,
+                                                    uint32_t* lpNumberOfFreeClusters, uint32_t* lpTotalNumberOfClusters) {
+    (void)lpRootPathName;
+    return lsw_GetDiskFreeSpaceW(NULL, lpSectorsPerCluster, lpBytesPerSector,
+                                 lpNumberOfFreeClusters, lpTotalNumberOfClusters);
 }
 
 // KERNEL32.dll!GetEnvironmentVariableA - Get environment variable
@@ -4902,9 +4958,300 @@ lsw_hostent_t* __attribute__((ms_abi)) lsw_gethostbyaddr(const char* addr, int l
     return (lsw_hostent_t*)h;
 }
 
-// ============================================================================
-// END Winsock APIs
-// ============================================================================
+/* ---- GetAddrInfoW / FreeAddrInfoW / GetNameInfoW ---- */
+
+/* Windows ADDRINFOW layout (x64, 48 bytes) */
+typedef struct lsw_addrinfow {
+    int                    ai_flags;
+    int                    ai_family;
+    int                    ai_socktype;
+    int                    ai_protocol;
+    uint64_t               ai_addrlen;   /* size_t = 8 bytes on x64 */
+    uint16_t*              ai_canonname;
+    struct sockaddr*       ai_addr;
+    struct lsw_addrinfow*  ai_next;
+} lsw_addrinfow_t;
+
+static uint16_t* lsw_utf8_to_u16_alloc(const char* s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    uint16_t* w = malloc(n * sizeof(uint16_t));
+    if (!w) return NULL;
+    for (size_t i = 0; i < n; i++) w[i] = (uint16_t)(unsigned char)s[i];
+    return w;
+}
+
+static void lsw_u16_to_utf8(const uint16_t* src, char* dst, size_t maxbytes) {
+    size_t n = 0;
+    for (; *src && n < maxbytes - 4; src++) {
+        uint32_t c = *src;
+        if (c < 0x80)       { dst[n++] = (char)c; }
+        else if (c < 0x800) { dst[n++] = (char)(0xC0|(c>>6)); dst[n++] = (char)(0x80|(c&0x3F)); }
+        else                { dst[n++] = (char)(0xE0|(c>>12)); dst[n++] = (char)(0x80|((c>>6)&0x3F)); dst[n++] = (char)(0x80|(c&0x3F)); }
+    }
+    dst[n] = '\0';
+}
+
+int __attribute__((ms_abi)) lsw_GetAddrInfoW(const uint16_t* pNodeName, const uint16_t* pServiceName,
+                                               const lsw_addrinfow_t* pHints, lsw_addrinfow_t** ppResult) {
+    if (!ppResult) { g_last_wsa_error = WSAEFAULT; return WSAEFAULT; }
+    *ppResult = NULL;
+
+    char node[256] = {0}, service[64] = {0};
+    if (pNodeName) lsw_u16_to_utf8(pNodeName, node, sizeof(node));
+    if (pServiceName) lsw_u16_to_utf8(pServiceName, service, sizeof(service));
+
+    struct addrinfo hints = {0};
+    if (pHints) {
+        hints.ai_flags    = pHints->ai_flags;
+        hints.ai_family   = pHints->ai_family;
+        hints.ai_socktype = pHints->ai_socktype;
+        hints.ai_protocol = pHints->ai_protocol;
+    }
+
+    LSW_LOG_INFO("GetAddrInfoW: node='%s' service='%s'", node, service);
+
+    struct addrinfo* res = NULL;
+    int err = getaddrinfo(pNodeName ? node : NULL, pServiceName ? service : NULL, &hints, &res);
+    if (err != 0) {
+        LSW_LOG_WARN("GetAddrInfoW: getaddrinfo failed: %s", gai_strerror(err));
+        g_last_wsa_error = WSAHOST_NOT_FOUND;
+        return WSAHOST_NOT_FOUND;
+    }
+
+    lsw_addrinfow_t** tail = ppResult;
+    for (struct addrinfo* ai = res; ai; ai = ai->ai_next) {
+        lsw_addrinfow_t* w = calloc(1, sizeof(*w));
+        if (!w) { freeaddrinfo(res); return ENOBUFS; }
+        w->ai_flags    = ai->ai_flags;
+        w->ai_family   = ai->ai_family;
+        w->ai_socktype = ai->ai_socktype;
+        w->ai_protocol = ai->ai_protocol;
+        w->ai_addrlen  = ai->ai_addrlen;
+        if (ai->ai_canonname) w->ai_canonname = lsw_utf8_to_u16_alloc(ai->ai_canonname);
+        if (ai->ai_addrlen > 0 && ai->ai_addr) {
+            w->ai_addr = malloc(ai->ai_addrlen);
+            if (w->ai_addr) memcpy(w->ai_addr, ai->ai_addr, ai->ai_addrlen);
+        }
+        *tail = w;
+        tail = &w->ai_next;
+    }
+    freeaddrinfo(res);
+    return 0;
+}
+
+void __attribute__((ms_abi)) lsw_FreeAddrInfoW(lsw_addrinfow_t* pAddrInfo) {
+    while (pAddrInfo) {
+        lsw_addrinfow_t* next = pAddrInfo->ai_next;
+        if (pAddrInfo->ai_canonname) free(pAddrInfo->ai_canonname);
+        if (pAddrInfo->ai_addr) free(pAddrInfo->ai_addr);
+        free(pAddrInfo);
+        pAddrInfo = next;
+    }
+}
+
+int __attribute__((ms_abi)) lsw_GetNameInfoW(const struct sockaddr* pSockaddr, int SockaddrLength,
+                                               uint16_t* pNodeBuffer, uint32_t NodeBufferSize,
+                                               uint16_t* pServiceBuffer, uint32_t ServiceBufferSize, int Flags) {
+    char node[256] = {0}, service[64] = {0};
+    int err = getnameinfo(pSockaddr, (socklen_t)SockaddrLength,
+                          node, sizeof(node), service, sizeof(service), Flags);
+    if (err != 0) { g_last_wsa_error = WSAHOST_NOT_FOUND; return WSAHOST_NOT_FOUND; }
+    if (pNodeBuffer && NodeBufferSize > 0) {
+        uint32_t i;
+        for (i = 0; i < NodeBufferSize - 1 && node[i]; i++) pNodeBuffer[i] = (uint16_t)(unsigned char)node[i];
+        pNodeBuffer[i] = 0;
+    }
+    if (pServiceBuffer && ServiceBufferSize > 0) {
+        uint32_t i;
+        for (i = 0; i < ServiceBufferSize - 1 && service[i]; i++) pServiceBuffer[i] = (uint16_t)(unsigned char)service[i];
+        pServiceBuffer[i] = 0;
+    }
+    return 0;
+}
+
+/* ---- ICMP helpers ---- */
+#include <netinet/ip_icmp.h>
+#include <sys/select.h>
+
+static uint16_t lsw_icmp_checksum(const void* data, int len) {
+    const uint16_t* p = data;
+    uint32_t sum = 0;
+    while (len > 1) { sum += *p++; len -= 2; }
+    if (len == 1) sum += *(uint8_t*)p;
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* Windows ICMP_ECHO_REPLY layout (x64):
+ * +0  uint32 Address
+ * +4  uint32 Status
+ * +8  uint32 RoundTripTime
+ * +12 uint16 DataSize
+ * +14 uint16 Reserved
+ * +16 void*  Data         (8 bytes)
+ * +24 uint8  Ttl
+ * +25 uint8  Tos
+ * +26 uint8  Flags
+ * +27 uint8  OptionsSize
+ * +28 (4 bytes pad)
+ * +32 void*  OptionsData  (8 bytes)
+ * = 40 bytes total */
+
+uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho(
+    void* IcmpHandle, uint32_t DestinationAddress,
+    void* RequestData, uint16_t RequestSize,
+    void* RequestOptions, void* ReplyBuffer, uint32_t ReplySize, uint32_t Timeout)
+{
+    (void)IcmpHandle; (void)RequestOptions;
+
+    LSW_LOG_INFO("IcmpSendEcho: dest=%u.%u.%u.%u size=%u timeout=%u",
+        (DestinationAddress & 0xFF), ((DestinationAddress >> 8) & 0xFF),
+        ((DestinationAddress >> 16) & 0xFF), ((DestinationAddress >> 24) & 0xFF),
+        RequestSize, Timeout);
+
+    if (!ReplyBuffer || ReplySize < 28) { g_last_wsa_error = 87; return 0; }
+
+    /* Use SOCK_DGRAM + IPPROTO_ICMP (unprivileged ICMP on Linux) */
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (sock < 0) {
+        /* Fall back to SOCK_RAW if DGRAM fails */
+        sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (sock < 0) {
+            LSW_LOG_WARN("IcmpSendEcho: cannot create ICMP socket: %s", strerror(errno));
+            g_last_wsa_error = 5; /* ERROR_ACCESS_DENIED */
+            return 0;
+        }
+    }
+
+    /* Set timeout */
+    struct timeval tv = { (long)(Timeout / 1000), (long)((Timeout % 1000) * 1000) };
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) { tv.tv_sec = 4; }
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* Build ICMP echo request */
+    uint16_t payload = RequestSize > 0 ? RequestSize : 32;
+    uint8_t* packet = calloc(8 + payload, 1);
+    if (!packet) { close(sock); g_last_wsa_error = 8; return 0; }
+
+    uint16_t ident = (uint16_t)getpid();
+    uint16_t seq   = 1;
+    packet[0] = 8;  /* ICMP_ECHO = 8 */
+    packet[1] = 0;  /* code */
+    packet[2] = 0;  packet[3] = 0;  /* checksum placeholder */
+    packet[4] = (uint8_t)(ident >> 8);   packet[5] = (uint8_t)ident;
+    packet[6] = (uint8_t)(seq >> 8);     packet[7] = (uint8_t)seq;
+    if (RequestData && RequestSize > 0) memcpy(packet + 8, RequestData, payload);
+    else memset(packet + 8, 'A', payload);
+
+    uint16_t csum = lsw_icmp_checksum(packet, 8 + payload);
+    packet[2] = (uint8_t)(csum >> 8);
+    packet[3] = (uint8_t)csum;
+
+    struct sockaddr_in dest = {0};
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = DestinationAddress; /* already in network byte order for IPv4 */
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ssize_t sent = sendto(sock, packet, 8 + payload, 0, (struct sockaddr*)&dest, sizeof(dest));
+    free(packet);
+    if (sent < 0) {
+        LSW_LOG_WARN("IcmpSendEcho: sendto failed: %s", strerror(errno));
+        close(sock);
+        g_last_wsa_error = 5;
+        return 0;
+    }
+
+    /* Receive reply (may have IP header if SOCK_RAW) */
+    uint8_t recv_buf[256];
+    struct sockaddr_in src;
+    socklen_t srclen = sizeof(src);
+    ssize_t rlen = recvfrom(sock, recv_buf, sizeof(recv_buf), 0, (struct sockaddr*)&src, &srclen);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    close(sock);
+
+    if (rlen < 0) {
+        LSW_LOG_WARN("IcmpSendEcho: recvfrom failed: %s", strerror(errno));
+        g_last_wsa_error = 11010; /* WSAETIMEDOUT */
+        return 0;
+    }
+
+    uint64_t rtt_us = ((uint64_t)(t1.tv_sec - t0.tv_sec)) * 1000000 +
+                      ((uint64_t)(t1.tv_nsec - t0.tv_nsec)) / 1000;
+    uint32_t rtt_ms = (uint32_t)(rtt_us / 1000);
+
+    /* Parse reply — skip IP header if present (SOCK_RAW includes 20-byte IP header) */
+    uint8_t* icmp_reply = recv_buf;
+    ssize_t icmp_len = rlen;
+    if (rlen >= 20 && (recv_buf[0] >> 4) == 4) {
+        int ihl = (recv_buf[0] & 0xF) * 4;
+        if (ihl < rlen) { icmp_reply = recv_buf + ihl; icmp_len = rlen - ihl; }
+    }
+
+    /* Fill ICMP_ECHO_REPLY at ReplyBuffer (Windows x64 layout) */
+    uint8_t* rb = (uint8_t*)ReplyBuffer;
+    memset(rb, 0, ReplySize < 40 ? ReplySize : 40);
+    *(uint32_t*)(rb + 0)  = src.sin_addr.s_addr;  /* Address */
+    *(uint32_t*)(rb + 4)  = 0;                     /* Status = IP_SUCCESS */
+    *(uint32_t*)(rb + 8)  = rtt_ms;                /* RoundTripTime */
+    *(uint16_t*)(rb + 12) = (uint16_t)(icmp_len > 8 ? icmp_len - 8 : 0); /* DataSize */
+    *(uint16_t*)(rb + 14) = 0;                     /* Reserved */
+    *(void**)(rb + 16)    = rb + 40;               /* Data pointer (after struct) */
+    rb[24] = 64;  /* Ttl */
+    rb[25] = 0;   /* Tos */
+    rb[26] = 0;   /* Flags */
+    rb[27] = 0;   /* OptionsSize */
+
+    /* Copy echo reply payload into reply buffer after struct */
+    if (icmp_len > 8 && ReplySize >= 40 + (uint32_t)(icmp_len - 8)) {
+        memcpy(rb + 40, icmp_reply + 8, icmp_len - 8);
+    }
+
+    LSW_LOG_INFO("IcmpSendEcho: reply from %s rtt=%ums", inet_ntoa(src.sin_addr), rtt_ms);
+    return 1; /* 1 reply received */
+}
+
+/* IcmpSendEcho2Ex — extended version with source address selection */
+uint32_t __attribute__((ms_abi)) lsw_IcmpSendEcho2Ex(
+    void* IcmpHandle, void* hEvent, void* ApcRoutine, void* ApcContext,
+    uint32_t SourceAddress, uint32_t DestinationAddress,
+    void* RequestData, uint16_t RequestSize,
+    void* RequestOptions, void* ReplyBuffer, uint32_t ReplySize, uint32_t Timeout)
+{
+    (void)hEvent; (void)ApcRoutine; (void)ApcContext; (void)SourceAddress;
+    /* Delegate to synchronous version */
+    return lsw_IcmpSendEcho(IcmpHandle, DestinationAddress, RequestData, RequestSize,
+                            RequestOptions, ReplyBuffer, ReplySize, Timeout);
+}
+
+/* IPv6 ICMP stubs (no real implementation for now) */
+void* __attribute__((ms_abi)) lsw_Icmp6CreateFile(void) { return (void*)0xB002; }
+uint32_t __attribute__((ms_abi)) lsw_Icmp6SendEcho2(
+    void* h, void* ev, void* apc, void* ctx,
+    const struct sockaddr* src, const struct sockaddr* dst,
+    void* req_data, uint16_t req_size, void* req_opts,
+    void* reply_buf, uint32_t reply_size, uint32_t timeout)
+{
+    (void)h;(void)ev;(void)apc;(void)ctx;(void)src;(void)dst;
+    (void)req_data;(void)req_size;(void)req_opts;(void)reply_buf;(void)reply_size;(void)timeout;
+    g_last_wsa_error = 50; /* ERROR_NOT_SUPPORTED */
+    return 0;
+}
+
+uint32_t __attribute__((ms_abi)) lsw_GetIpErrorString(uint32_t ErrorCode, uint16_t* pBuffer, uint32_t* pSize) {
+    const char* msg = "IP error";
+    if (ErrorCode == 11010) msg = "Request timed out.";
+    else if (ErrorCode == 0) msg = "Success.";
+    if (pBuffer && pSize && *pSize > 0) {
+        uint32_t i;
+        for (i = 0; i < *pSize - 1 && msg[i]; i++) pBuffer[i] = (uint16_t)(unsigned char)msg[i];
+        pBuffer[i] = 0;
+        *pSize = i;
+    }
+    return 0;
+}
 
 // ============================================================================
 // SECTION: OLEAUT32 BSTR APIs
@@ -6523,6 +6870,7 @@ static int lsw_ms_cmp_bridge(const void* a, const void* b) {
 }
 void __attribute__((ms_abi)) lsw_qsort(void* base, size_t n, size_t size,
     lsw_ms_cmp_t cmp) {
+    LSW_LOG_INFO("qsort: n=%zu size=%zu", n, size);
     lsw_ms_cmp_t saved = tls_ms_cmp;
     tls_ms_cmp = cmp;
     qsort(base, n, size, lsw_ms_cmp_bridge);
@@ -6691,6 +7039,77 @@ int __attribute__((ms_abi)) lsw_swprintf_s(wchar_t* dst, size_t sz, const wchar_
     __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
     int r = lsw__vsnwprintf(dst, sz, fmt, (char*)ms_ap);
     __builtin_ms_va_end(ms_ap); return r;
+}
+
+// String collation functions (locale-aware comparison)
+// Use simple strcmp/wcscmp semantics - good enough for most sort use cases
+int __attribute__((ms_abi)) lsw_strcoll(const char* s1, const char* s2) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    LSW_LOG_INFO("strcoll('%s', '%s')", s1, s2);
+    return strcoll(s1, s2);
+}
+int __attribute__((ms_abi)) lsw__stricoll(const char* s1, const char* s2) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    return strcasecmp(s1, s2);
+}
+int __attribute__((ms_abi)) lsw__strncoll(const char* s1, const char* s2, size_t n) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    return strncmp(s1, s2, n);
+}
+int __attribute__((ms_abi)) lsw__strnicoll(const char* s1, const char* s2, size_t n) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    return strncasecmp(s1, s2, n);
+}
+int __attribute__((ms_abi)) lsw_wcscoll(const wchar_t* s1, const wchar_t* s2) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    return wcscoll(s1, s2);
+}
+int __attribute__((ms_abi)) lsw__wcsicoll(const wchar_t* s1, const wchar_t* s2) {
+    // Wide case-insensitive collation - compare using _wcsicmp semantics
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    const u16* a = (const u16*)s1;
+    const u16* b = (const u16*)s2;
+    while (*a && *b) {
+        u16 ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+        u16 cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
+        if (ca != cb) return (int)ca - (int)cb;
+        a++; b++;
+    }
+    return (int)*a - (int)*b;
+}
+int __attribute__((ms_abi)) lsw__wcsncoll(const wchar_t* s1, const wchar_t* s2, size_t n) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    return wcsncmp(s1, s2, n);
+}
+int __attribute__((ms_abi)) lsw__wcsnicoll(const wchar_t* s1, const wchar_t* s2, size_t n) {
+    if (!s1 || !s2) return s1 ? 1 : (s2 ? -1 : 0);
+    const u16* a = (const u16*)s1;
+    const u16* b = (const u16*)s2;
+    for (size_t i = 0; i < n && *a && *b; i++, a++, b++) {
+        u16 ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+        u16 cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
+        if (ca != cb) return (int)ca - (int)cb;
+    }
+    if (n == 0) return 0;
+    u16 ca = (*a >= 'A' && *a <= 'Z') ? (*a + 32) : *a;
+    u16 cb = (*b >= 'A' && *b <= 'Z') ? (*b + 32) : *b;
+    return (int)ca - (int)cb;
+}
+
+// ADVAPI32.dll!IsTextUnicode - Heuristic check if buffer contains Unicode text
+// Returns TRUE/FALSE; sets out_result flags if provided
+int __attribute__((ms_abi)) lsw_IsTextUnicode(const void* lpv, int iSize, int* lpiResult) {
+    if (!lpv || iSize <= 0) { if (lpiResult) *lpiResult = 0; return 0; }
+    const unsigned char* p = (const unsigned char*)lpv;
+    int is_unicode = (iSize >= 2 && p[0] == 0xFF && p[1] == 0xFE);
+    if (!is_unicode && iSize >= 2) {
+        int zero_count = 0;
+        for (int i = 0; i < iSize && i < 256; i += 2)
+            if (p[i] == 0 || (i + 1 < iSize && p[i+1] == 0)) zero_count++;
+        is_unicode = (zero_count > iSize / 8);
+    }
+    if (lpiResult) *lpiResult = is_unicode ? 1 : 0;
+    return is_unicode ? 1 : 0;
 }
 
 // Wide I/O
@@ -10902,6 +11321,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetSystemDirectoryW", (void*)lsw_GetSystemDirectoryW},
     {"KERNEL32.dll", "GetTempPathA", (void*)lsw_GetTempPathA},
     {"KERNEL32.dll", "GetTempPathW", (void*)lsw_GetTempPathW},
+    {"KERNEL32.dll", "GetTempPath2A", (void*)lsw_GetTempPath2A},
+    {"KERNEL32.dll", "GetTempPath2W", (void*)lsw_GetTempPath2W},
+    {"KERNEL32.dll", "GetTempFileNameA", (void*)lsw_GetTempFileNameA},
+    {"KERNEL32.dll", "GetTempFileNameW", (void*)lsw_GetTempFileNameW},
     {"KERNEL32.dll", "GetEnvironmentVariableA", (void*)lsw_GetEnvironmentVariableA},
     {"KERNEL32.dll", "GetEnvironmentVariableW", (void*)lsw_GetEnvironmentVariableW},
     {"KERNEL32.dll", "SetEnvironmentVariableA", (void*)lsw_SetEnvironmentVariableA},
@@ -10987,6 +11410,17 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll",   "_strdup",      (void*)lsw__strdup},
     {"msvcrt.dll",   "_stricmp",     (void*)lsw__stricmp},
     {"msvcrt.dll",   "_strnicmp",    (void*)lsw__strnicmp},
+    {"msvcrt.dll",   "strcpy_s",     (void*)lsw_strcpy_s},
+    {"msvcrt.dll",   "strncpy_s",    (void*)lsw_strncpy_s},
+    {"msvcrt.dll",   "strcat_s",     (void*)lsw_strcat_s},
+    {"msvcrt.dll",   "strcoll",      (void*)lsw_strcoll},
+    {"msvcrt.dll",   "_stricoll",    (void*)lsw__stricoll},
+    {"msvcrt.dll",   "_strncoll",    (void*)lsw__strncoll},
+    {"msvcrt.dll",   "_strnicoll",   (void*)lsw__strnicoll},
+    {"msvcrt.dll",   "wcscoll",      (void*)lsw_wcscoll},
+    {"msvcrt.dll",   "_wcsicoll",    (void*)lsw__wcsicoll},
+    {"msvcrt.dll",   "_wcsncoll",    (void*)lsw__wcsncoll},
+    {"msvcrt.dll",   "_wcsnicoll",   (void*)lsw__wcsnicoll},
     {"msvcrt.dll",   "wcscpy",       (void*)lsw_wcscpy},
     {"msvcrt.dll",   "wcsncpy",      (void*)lsw_wcsncpy},
     {"msvcrt.dll",   "wcscat",       (void*)lsw_wcscat},
@@ -11487,6 +11921,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetDiskFreeSpaceExW",      (void*)lsw_GetDiskFreeSpaceExW},
     {"KERNEL32.dll", "GetDiskFreeSpaceExA",      (void*)lsw_GetDiskFreeSpaceExA},
     {"KERNEL32.dll", "GetDiskFreeSpaceW",        (void*)lsw_GetDiskFreeSpaceW},
+    {"KERNEL32.dll", "GetDiskFreeSpaceA",        (void*)lsw_GetDiskFreeSpaceA},
     {"KERNEL32.dll", "InitializeCriticalSectionAndSpinCount",(void*)lsw_InitializeCriticalSectionAndSpinCount},
     {"KERNEL32.dll", "InitializeCriticalSectionEx",(void*)lsw_InitializeCriticalSectionEx},
     {"KERNEL32.dll", "TryEnterCriticalSection",  (void*)lsw_TryEnterCriticalSection},
@@ -11656,6 +12091,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"OLEAUT32.dll", "SysStringByteLen",          (void*)lsw_SysStringByteLen},
     /* ADVAPI32.dll — RegOpenKeyW (thin wrapper without SAM/options) */
     {"ADVAPI32.dll", "RegOpenKeyW",               (void*)lsw_RegOpenKeyW},
+    {"ADVAPI32.dll", "IsTextUnicode",             (void*)lsw_IsTextUnicode},
 
     /* wkscli.dll */
     {"wkscli.dll",   "NetWkstaTransportEnum",      (void*)lsw_NetWkstaTransportEnum},
@@ -11856,6 +12292,24 @@ static const win32_api_mapping_t api_mappings[] = {
     {"dbghelp.dll",  "EnumerateLoadedModulesW64", (void*)lsw_EnumerateLoadedModulesW64},
     {"dbghelp.dll",  "EnumerateLoadedModules64",  (void*)lsw_EnumerateLoadedModulesW64},
     {"dbghelp.dll",  "ImagehlpApiVersion",        (void*)lsw_ImagehlpApiVersion},
+
+    /* ws2_32.dll — wide-char address/name resolution */
+    {"ws2_32.dll",   "GetAddrInfoW",              (void*)lsw_GetAddrInfoW},
+    {"ws2_32.dll",   "FreeAddrInfoW",             (void*)lsw_FreeAddrInfoW},
+    {"ws2_32.dll",   "GetNameInfoW",              (void*)lsw_GetNameInfoW},
+    {"WS2_32.dll",   "GetAddrInfoW",              (void*)lsw_GetAddrInfoW},
+    {"WS2_32.dll",   "FreeAddrInfoW",             (void*)lsw_FreeAddrInfoW},
+    {"WS2_32.dll",   "GetNameInfoW",              (void*)lsw_GetNameInfoW},
+
+    /* IPHLPAPI.DLL — extended ICMP */
+    {"IPHLPAPI.DLL", "IcmpSendEcho2Ex",           (void*)lsw_IcmpSendEcho2Ex},
+    {"IPHLPAPI.DLL", "Icmp6CreateFile",           (void*)lsw_Icmp6CreateFile},
+    {"IPHLPAPI.DLL", "Icmp6SendEcho2",            (void*)lsw_Icmp6SendEcho2},
+    {"IPHLPAPI.DLL", "GetIpErrorString",          (void*)lsw_GetIpErrorString},
+    {"iphlpapi.dll", "IcmpSendEcho2Ex",           (void*)lsw_IcmpSendEcho2Ex},
+    {"iphlpapi.dll", "Icmp6CreateFile",           (void*)lsw_Icmp6CreateFile},
+    {"iphlpapi.dll", "Icmp6SendEcho2",            (void*)lsw_Icmp6SendEcho2},
+    {"iphlpapi.dll", "GetIpErrorString",          (void*)lsw_GetIpErrorString},
 };
 
 #pragma GCC diagnostic pop

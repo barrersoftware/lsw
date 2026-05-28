@@ -305,8 +305,76 @@ NTSTATUS __attribute__((ms_abi)) lsw_RtlAnsiStringToUnicodeString(
     return STATUS_NOT_IMPLEMENTED; /* stub */
 }
 
-/* ------------------------------------------------------------------
- * NtStatus → Win32 error code conversion
+/* RtlUnicodeToOemN — convert UTF-16LE buffer to OEM/ANSI
+ * Prototype: NTSTATUS RtlUnicodeToOemN(PCHAR OemString, ULONG MaxBytesInOemString,
+ *                                       PULONG BytesInOemString, PCWCH UnicodeString,
+ *                                       ULONG BytesInUnicodeString)
+ */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlUnicodeToOemN(
+    char* OemString, uint32_t MaxBytes, uint32_t* BytesOut,
+    const uint16_t* UnicodeString, uint32_t BytesIn)
+{
+    if (!OemString || !UnicodeString || MaxBytes == 0) return 0xC000000D; /* STATUS_INVALID_PARAMETER */
+    uint32_t src_chars = BytesIn / 2;
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < src_chars && out + 1 < MaxBytes; i++) {
+        uint16_t c = UnicodeString[i];
+        if (c == 0) break;
+        OemString[out++] = (c < 0x100) ? (char)c : '?';
+    }
+    OemString[out] = '\0';
+    if (BytesOut) *BytesOut = out;
+    return 0; /* STATUS_SUCCESS */
+}
+
+/* RtlMultiByteToUnicodeN — convert ANSI/OEM to UTF-16LE
+ * Prototype: NTSTATUS RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString,
+ *                                             PULONG BytesInUnicodeString, PCSTR MultiByteString,
+ *                                             ULONG BytesInMultiByteString)
+ */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlMultiByteToUnicodeN(
+    uint16_t* UnicodeString, uint32_t MaxBytes, uint32_t* BytesOut,
+    const char* MultiByteString, uint32_t BytesIn)
+{
+    if (!UnicodeString || !MultiByteString || MaxBytes < 2) return 0xC000000D;
+    uint32_t max_chars = MaxBytes / 2;
+    uint32_t out = 0;
+    for (uint32_t i = 0; i < BytesIn && out + 1 < max_chars; i++) {
+        unsigned char c = (unsigned char)MultiByteString[i];
+        if (c == 0) break;
+        UnicodeString[out++] = (uint16_t)c;
+    }
+    UnicodeString[out] = 0;
+    if (BytesOut) *BytesOut = out * 2;
+    return 0; /* STATUS_SUCCESS */
+}
+
+/* RtlIpv4StringToAddressW — parse IPv4 dotted-decimal string
+ * Prototype: NTSTATUS RtlIpv4StringToAddressW(PCWSTR S, BOOLEAN Strict,
+ *                                              PCWSTR *Terminator, IN_ADDR *Addr)
+ */
+NTSTATUS __attribute__((ms_abi)) lsw_RtlIpv4StringToAddressW(
+    const uint16_t* S, uint8_t Strict, const uint16_t** Terminator, uint32_t* Addr)
+{
+    if (!S || !Addr) return 0xC000000D;
+    // Convert wide to narrow
+    char narrow[64] = {0};
+    for (int i = 0; i < 63 && S[i]; i++) narrow[i] = (char)S[i];
+    struct in_addr a;
+    if (inet_pton(AF_INET, narrow, &a) == 1) {
+        *Addr = a.s_addr;
+        if (Terminator) {
+            // Advance past the address string
+            int i = 0;
+            while (S[i] && (S[i] == '.' || (S[i] >= '0' && S[i] <= '9'))) i++;
+            *Terminator = S + i;
+        }
+        return 0;
+    }
+    return 0xC0000005; /* STATUS_ACCESS_VIOLATION placeholder - invalid format */
+}
+
+/* ------------------------------------------------------------------ * NtStatus → Win32 error code conversion
  * ------------------------------------------------------------------ */
 uint32_t __attribute__((ms_abi)) lsw_RtlNtStatusToDosError(NTSTATUS status) {
     if (status == STATUS_SUCCESS)         return 0;   /* ERROR_SUCCESS */
@@ -924,6 +992,10 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     {"ntdll.dll", "RtlLargeIntegerToChar",         (void*)lsw_RtlLargeIntegerToChar},
     /* Package identity — always fails, not a packaged app */
     {"ntdll.dll", "RtlQueryPackageIdentity",       (void*)lsw_RtlQueryPackageIdentity},
+    /* String conversion */
+    {"ntdll.dll", "RtlUnicodeToOemN",              (void*)lsw_RtlUnicodeToOemN},
+    {"ntdll.dll", "RtlMultiByteToUnicodeN",        (void*)lsw_RtlMultiByteToUnicodeN},
+    {"ntdll.dll", "RtlIpv4StringToAddressW",       (void*)lsw_RtlIpv4StringToAddressW},
     /* Sentinel */
     {NULL, NULL, NULL}
 };
