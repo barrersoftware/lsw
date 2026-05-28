@@ -96,22 +96,9 @@ static uint32_t g_lsw_image_size  = 0;   /* SizeOfImage from PE header */
 static void*    g_lsw_pdata_va    = NULL;
 static uint32_t g_lsw_pdata_size  = 0;
 
-void win32_api_set_pe_image_info(uint64_t image_base,
-                                  void*    pdata_va,
-                                  uint32_t pdata_size,
-                                  uint32_t image_size)
-{
-    g_lsw_image_base = image_base;
-    g_lsw_image_size = image_size;
-    g_lsw_pdata_va   = pdata_va;
-    g_lsw_pdata_size = pdata_size;
-    LSW_LOG_INFO("[exception] PE image info: base=0x%lx pdata=%p size=%u",
-                 (unsigned long)image_base, pdata_va, pdata_size);
-}
-
-void lsw_set_exe_path(const char* path) {
-    if (path) strncpy(g_lsw_exe_path, path, sizeof(g_lsw_exe_path) - 1);
-}
+/* Forward declaration (struct defined below) */
+struct lsw_pe_hmodule_s;
+typedef struct lsw_pe_hmodule_s lsw_pe_hmodule_t;
 
 /* ---- PE module handle ---- */
 #define LSW_PE_HMODULE_MAGIC 0x5045484DU  /* "PEHM" */
@@ -123,13 +110,127 @@ struct lsw_pe_hmodule_s {
     void*  export_dir;
     uint32_t export_dir_size;
     /* resource section: NULL if the DLL has no .rsrc section */
-    void*    rsrc_raw;   /* pointer into image_base at PointerToRawData */
-    uint32_t rsrc_rva;   /* VirtualAddress of .rsrc section (for RVA→ptr translation) */
+    void*    rsrc_raw;   /* pointer into image_base at VirtualAddress of .rsrc */
+    uint32_t rsrc_rva;   /* VirtualAddress of .rsrc section */
     /* MUI satellite image (for message-only DLLs on Vista+) */
     void*    mui_image;
     size_t   mui_image_size;
+    /* 1 if sections are already mapped at VAs (in-memory PE, e.g. main exe);
+     * 0 if flat file layout where RVA must be translated via section raw offsets. */
+    int      mapped_va;
 };
-typedef struct lsw_pe_hmodule_s lsw_pe_hmodule_t;
+
+/* ---- Typed handle for the main executable (returned by GetModuleHandle(NULL)) ---- */
+/* Defined as a static so it lives forever and can be safely returned as an HMODULE */
+static lsw_pe_hmodule_t g_main_exe_hmodule;
+static int               g_main_exe_hmodule_ready = 0;
+
+void win32_api_set_pe_image_info(uint64_t image_base,
+                                  void*    pdata_va,
+                                  uint32_t pdata_size,
+                                  uint32_t image_size)
+{
+    g_lsw_image_base = image_base;
+    g_lsw_image_size = image_size;
+    g_lsw_pdata_va   = pdata_va;
+    g_lsw_pdata_size = pdata_size;
+    LSW_LOG_INFO("[exception] PE image info: base=0x%lx pdata=%p size=%u",
+                 (unsigned long)image_base, pdata_va, pdata_size);
+
+    /* Build typed HMODULE for the main executable so that
+     * GetModuleHandleA(NULL) returns a handle that FormatMessageW(FROM_HMODULE)
+     * can use to find RT_MESSAGETABLE resources (e.g. ping.exe, ipconfig.exe). */
+    if (image_base && !g_main_exe_hmodule_ready) {
+        /* defined as 0x5045484DU below — replicate literal to avoid forward-ref */
+        g_main_exe_hmodule.magic      = 0x5045484DU; /* LSW_PE_HMODULE_MAGIC */
+        strncpy(g_main_exe_hmodule.dll_name, "<main>", sizeof(g_main_exe_hmodule.dll_name)-1);
+        g_main_exe_hmodule.image_base = (void*)(uintptr_t)image_base;
+        g_main_exe_hmodule.image_size = image_size;
+        g_main_exe_hmodule.export_dir = NULL;
+        g_main_exe_hmodule.export_dir_size = 0;
+        g_main_exe_hmodule.rsrc_raw   = NULL;
+        g_main_exe_hmodule.rsrc_rva   = 0;
+        g_main_exe_hmodule.mui_image  = NULL;
+        g_main_exe_hmodule.mui_image_size = 0;
+        g_main_exe_hmodule.mapped_va  = 1; /* sections mapped at VAs, not raw offsets */
+        /* Walk PE section headers to find .rsrc */
+        uint8_t* b = (uint8_t*)(uintptr_t)image_base;
+        uint32_t pe_off = *(uint32_t*)(b + 0x3C);
+        if (pe_off + 4 < image_size && b[pe_off] == 'P' && b[pe_off+1] == 'E') {
+            uint16_t opt_size  = *(uint16_t*)(b + pe_off + 4 + 16);
+            uint16_t num_sec   = *(uint16_t*)(b + pe_off + 4 + 2);
+            uint32_t sec_off   = pe_off + 4 + 20 + opt_size;
+            for (uint16_t si = 0; si < num_sec; si++) {
+                uint8_t* sh = b + sec_off + (uint32_t)si * 40;
+                if (memcmp(sh, ".rsrc\0\0\0", 8) == 0) {
+                    g_main_exe_hmodule.rsrc_rva = *(uint32_t*)(sh + 12);
+                    g_main_exe_hmodule.rsrc_raw = b + g_main_exe_hmodule.rsrc_rva;
+                    break;
+                }
+            }
+        }
+        g_main_exe_hmodule_ready = 1;
+        LSW_LOG_INFO("[exception] main exe HMODULE ready: rsrc_raw=%p rsrc_rva=0x%x",
+                     g_main_exe_hmodule.rsrc_raw, g_main_exe_hmodule.rsrc_rva);
+
+        /* If the main exe has no RT_MESSAGETABLE (Vista+ MUI pattern),
+         * look for en-US/<basename>.mui in the same directory as the exe. */
+        if (g_lsw_exe_path[0]) {
+            char dir_part[4096]; strncpy(dir_part, g_lsw_exe_path, sizeof(dir_part)-1);
+            char* sl = strrchr(dir_part, '/');
+            if (!sl) sl = strrchr(dir_part, '\\');
+            char lower_base[128] = {0};
+            const char* base = g_lsw_exe_path;
+            if (sl) {
+                *sl = '\0';
+                base = sl + 1;
+            } else {
+                dir_part[0] = '\0';
+            }
+            strncpy(lower_base, base, sizeof(lower_base)-1);
+            for (char* p = lower_base; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+            char mui_path[4352];
+            if (dir_part[0])
+                snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, lower_base);
+            else
+                snprintf(mui_path, sizeof(mui_path), "en-US/%s.mui", lower_base);
+
+            /* Also try mixed-case basename */
+            char mui_path2[4352];
+            if (dir_part[0])
+                snprintf(mui_path2, sizeof(mui_path2), "%s/en-US/%s.mui", dir_part, base);
+            else
+                snprintf(mui_path2, sizeof(mui_path2), "en-US/%s.mui", base);
+
+            const char* mui_try = (access(mui_path, R_OK) == 0) ? mui_path :
+                                  (access(mui_path2, R_OK) == 0) ? mui_path2 : NULL;
+            if (mui_try) {
+                int mfd = open(mui_try, O_RDONLY);
+                if (mfd >= 0) {
+                    struct stat st2;
+                    if (fstat(mfd, &st2) == 0 && st2.st_size > 0) {
+                        void* mmap_img = mmap(NULL, (size_t)st2.st_size, PROT_READ,
+                                              MAP_PRIVATE, mfd, 0);
+                        if (mmap_img != MAP_FAILED) {
+                            g_main_exe_hmodule.mui_image      = mmap_img;
+                            g_main_exe_hmodule.mui_image_size = (size_t)st2.st_size;
+                            LSW_LOG_INFO("[exception] MUI loaded: %s (%zu bytes)",
+                                         mui_try, (size_t)st2.st_size);
+                        }
+                    }
+                    close(mfd);
+                }
+            } else {
+                LSW_LOG_INFO("[exception] no MUI found at %s", mui_path);
+            }
+        }
+    }
+}
+
+void lsw_set_exe_path(const char* path) {
+    if (path) strncpy(g_lsw_exe_path, path, sizeof(g_lsw_exe_path) - 1);
+}
 
 /* ---- Named pipe handle ---- */
 #define LSW_PIPE_MAGIC 0x50495045U  /* "PIPE" */
@@ -2502,10 +2603,13 @@ uint32_t __attribute__((ms_abi)) lsw_GetCurrentProcessId(void) {
 }
 
 void* __attribute__((ms_abi)) lsw_GetModuleHandleA(const char* module_name) {
-    // For kernel32.dll, return a fake handle
-    // For NULL, return the base address (we'll use a fake value)
     if (!module_name) {
-        LSW_LOG_INFO("GetModuleHandleA: NULL -> 0x140000000 (base)");
+        /* Return the typed module handle so FormatMessageW(FROM_HMODULE) works */
+        if (g_main_exe_hmodule_ready) {
+            LSW_LOG_INFO("GetModuleHandleA: NULL -> main exe typed handle (%p)", &g_main_exe_hmodule);
+            return (void*)&g_main_exe_hmodule;
+        }
+        LSW_LOG_INFO("GetModuleHandleA: NULL -> 0x140000000 (base, not yet typed)");
         return (void*)0x140000000;
     }
     LSW_LOG_INFO("GetModuleHandleA: %s -> system hmodule", module_name);
@@ -4271,6 +4375,16 @@ static const uint8_t* pe_raw_rva_to_ptr(const uint8_t* image, size_t image_size,
 }
 
 /*
+ * Same but for a VA-mapped in-memory PE (like the main executable) where
+ * sections are already at VirtualAddress offsets from image base.
+ */
+static const uint8_t* pe_va_rva_to_ptr(const uint8_t* image, size_t image_size, uint32_t rva)
+{
+    if (!image || rva == 0 || rva >= (uint32_t)image_size) return NULL;
+    return image + rva;
+}
+
+/*
  * Check whether a PE image has an RT_MESSAGETABLE (type id=11) resource entry.
  */
 static int pe_has_message_table(const uint8_t* image, size_t image_size)
@@ -4299,11 +4413,15 @@ static int pe_has_message_table(const uint8_t* image, size_t image_size)
  * Returns 1 (Unicode) or 2 (ANSI) on success; sets *out_str and *out_len.
  * For Unicode: *out_str points to UTF-16LE chars (not null included in len).
  * For ANSI:    *out_str points to char bytes  (cast caller side).
+ * mapped_va: 0 = flat file (raw offsets), 1 = in-memory PE (VAs are live).
  */
-static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg_id,
-                            const uint16_t** out_str, uint32_t* out_len)
+static int pe_find_message_ex(const uint8_t* image, size_t image_size, uint32_t msg_id,
+                               const uint16_t** out_str, uint32_t* out_len, int mapped_va)
 {
     if (!image || !out_str || !out_len) return 0;
+
+#define RVAPTR(rva) (mapped_va ? pe_va_rva_to_ptr(image, image_size, (rva)) \
+                               : pe_raw_rva_to_ptr(image, image_size, (rva)))
 
     uint32_t pe_off = *(const uint32_t*)(image + 0x3C);
     if (pe_off + 24 + 4 > (uint32_t)image_size) return 0;
@@ -4314,7 +4432,7 @@ static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg
     uint32_t rsrc_rva = *(const uint32_t*)(image + dd2_off);
     if (!rsrc_rva) return 0;
 
-    const uint8_t* rsrc = pe_raw_rva_to_ptr(image, image_size, rsrc_rva);
+    const uint8_t* rsrc = RVAPTR(rsrc_rva);
     if (!rsrc) return 0;
 
     /* Level 1: find RT_MESSAGETABLE (id = 11) */
@@ -4345,8 +4463,10 @@ static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg
     const uint8_t* de  = rsrc + data_off; /* IMAGE_RESOURCE_DATA_ENTRY */
     uint32_t data_rva  = *(const uint32_t*)(de);
 
-    const uint8_t* msg_data = pe_raw_rva_to_ptr(image, image_size, data_rva);
+    const uint8_t* msg_data = RVAPTR(data_rva);
     if (!msg_data) return 0;
+
+#undef RVAPTR
 
     /* Walk MESSAGE_RESOURCE_DATA */
     uint32_t num_blocks = *(const uint32_t*)(msg_data);
@@ -4370,15 +4490,15 @@ static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg
         if (entry_flags & 1) { /* Unicode */
             const uint16_t* wstr = (const uint16_t*)text;
             uint32_t wlen = text_bytes / 2;
-            /* trim trailing null/newline characters */
-            while (wlen > 0 && (wstr[wlen-1] == 0 || wstr[wlen-1] == '\r' || wstr[wlen-1] == '\n'))
+            /* trim only trailing null characters — preserve \r\n which is part of the message */
+            while (wlen > 0 && wstr[wlen-1] == 0)
                 wlen--;
             *out_str = wstr;
             *out_len = wlen;
             return 1;
         } else { /* ANSI */
             uint32_t alen = text_bytes;
-            while (alen > 0 && (text[alen-1] == 0 || text[alen-1] == '\r' || text[alen-1] == '\n'))
+            while (alen > 0 && text[alen-1] == 0)
                 alen--;
             *out_str = (const uint16_t*)text;
             *out_len = alen;
@@ -4386,6 +4506,13 @@ static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg
         }
     }
     return 0;
+}
+
+/* Compatibility wrapper: flat-file (raw offsets) version */
+static int pe_find_message(const uint8_t* image, size_t image_size, uint32_t msg_id,
+                            const uint16_t** out_str, uint32_t* out_len)
+{
+    return pe_find_message_ex(image, image_size, msg_id, out_str, out_len, 0);
 }
 
 static lsw_pe_hmodule_t  g_pe_modules[64];
@@ -5775,8 +5902,15 @@ static uint32_t fm_substitute(const uint16_t* tmpl, uint32_t tlen,
                     (void)has_fmt;
                     /* Get arg value (treat as pointer) */
                     uint64_t argval = 0;
-                    if (args && (flags & 0x2000)) { /* ARGUMENT_ARRAY */
-                        argval = ((uint64_t*)args)[argidx - 1];
+                    if (args) {
+                        if (flags & 0x2000) { /* FORMAT_MESSAGE_ARGUMENT_ARRAY */
+                            argval = ((uint64_t*)args)[argidx - 1];
+                        } else {
+                            /* va_list*: on MSVC x64, va_list is char* pointing to first arg.
+                             * args = va_list* = char** -> dereference to get the actual arg array */
+                            uint64_t* va_arr = *(uint64_t**)args;
+                            if (va_arr) argval = va_arr[argidx - 1];
+                        }
                     }
                     /* Parse format string: flags, width, precision, length modifier, type */
                     int left = 0, width = 0, prec = -1;
@@ -5838,6 +5972,10 @@ uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
     (void)language_id;
 
     /* FORMAT_MESSAGE_FROM_HMODULE (0x800): look up message in PE resource table */
+    /* On Windows, NULL source with FROM_HMODULE means "use the calling module's message table" */
+    if ((flags & 0x800) && !source && g_main_exe_hmodule_ready) {
+        source = &g_main_exe_hmodule;
+    }
     if ((flags & 0x800) && source && source != (void*)0xDEADBEEFu) {
         lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)source;
         if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
@@ -5846,12 +5984,12 @@ uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
             /* Try MUI satellite first (Vista+ message-only DLLs) */
             int r = 0;
             if (pem->mui_image) {
-                r = pe_find_message((const uint8_t*)pem->mui_image, pem->mui_image_size,
-                                    message_id, &wstr, &wlen);
+                r = pe_find_message_ex((const uint8_t*)pem->mui_image, pem->mui_image_size,
+                                       message_id, &wstr, &wlen, 0 /* MUI is flat file */);
             }
             if (!r) {
-                r = pe_find_message((const uint8_t*)pem->image_base, pem->image_size,
-                                    message_id, &wstr, &wlen);
+                r = pe_find_message_ex((const uint8_t*)pem->image_base, pem->image_size,
+                                       message_id, &wstr, &wlen, pem->mapped_va);
             }
             if (r > 0) {
                 /* Build a null-terminated UTF-16 template */
