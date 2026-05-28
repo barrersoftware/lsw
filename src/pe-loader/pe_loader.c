@@ -290,6 +290,16 @@ void lsw_add_veh_handler(lsw_veh_handler_t h) {
 // Returns 1 if handled (execution continues), 0 if unhandled (terminate).
 static int lsw_dispatch_exception(uint32_t code, siginfo_t* si, ucontext_t* uc) {
     LSW_LOG_ERROR("Win32 Exception: code=0x%08x addr=%p", code, si->si_addr);
+#ifdef __x86_64__
+    if (uc) {
+        LSW_LOG_ERROR("  RIP=0x%llx R14=0x%llx RAX=0x%llx RBX=0x%llx RCX=0x%llx",
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RIP],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_R14],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RBX],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RCX]);
+    }
+#endif
 
     // Walk VEH handlers first
     for (int i = 0; i < g_veh_count; i++) {

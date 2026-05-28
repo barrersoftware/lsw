@@ -3479,11 +3479,62 @@ int __attribute__((ms_abi)) lsw_GetDiskFreeSpaceA(const char* lpRootPathName,
 }
 
 // KERNEL32.dll!GetEnvironmentVariableA - Get environment variable
+/* Forward declarations for path-translation helpers defined later in the file */
+static size_t lsw_linux_to_windows_path(const char* lpath, char* wpath, size_t wsize);
+static size_t lsw_windows_to_linux_path(const char* wpath, char* lpath, size_t lsize);
+
 DWORD __attribute__((ms_abi)) lsw_GetEnvironmentVariableA(const char* name, char* buffer, DWORD size) {
     LSW_LOG_INFO("GetEnvironmentVariableA called: name='%s', size=%u", name ? name : "(null)", size);
     
     if (!name) {
         return 0;
+    }
+    
+    /* Provide default PATHEXT if not set */
+    if (strcmp(name, "PATHEXT") == 0) {
+        const char* pathext = getenv("PATHEXT");
+        const char* value = pathext ? pathext : ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+        size_t len = strlen(value);
+        if (!buffer || size == 0) return (DWORD)(len + 1);
+        if (size <= len) return (DWORD)(len + 1);
+        strcpy(buffer, value);
+        return (DWORD)len;
+    }
+    
+    /* Translate PATH from Linux to Windows format */
+    if (strcmp(name, "PATH") == 0) {
+        const char* linux_path = getenv("PATH");
+        if (!linux_path) return 0;
+        /* Translate: split by ':', convert each component, rejoin with ';' */
+        static char win_path[65536];
+        size_t wpos = 0;
+        const char* p = linux_path;
+        int first = 1;
+        while (*p) {
+            const char* colon = strchr(p, ':');
+            size_t seg_len = colon ? (size_t)(colon - p) : strlen(p);
+            char seg[LSW_MAX_PATH];
+            if (seg_len >= sizeof(seg)) seg_len = sizeof(seg) - 1;
+            memcpy(seg, p, seg_len); seg[seg_len] = '\0';
+            char wseg[LSW_MAX_PATH];
+            lsw_linux_to_windows_path(seg, wseg, sizeof(wseg));
+            size_t wlen = strlen(wseg);
+            if (!first && wpos + 1 < sizeof(win_path) - 1) win_path[wpos++] = ';';
+            if (wpos + wlen < sizeof(win_path) - 1) {
+                memcpy(win_path + wpos, wseg, wlen);
+                wpos += wlen;
+            }
+            first = 0;
+            if (!colon) break;
+            p = colon + 1;
+        }
+        win_path[wpos] = '\0';
+        size_t len = wpos;
+        if (!buffer || size == 0) return (DWORD)(len + 1);
+        if (size <= len) return (DWORD)(len + 1);
+        strcpy(buffer, win_path);
+        LSW_LOG_INFO("GetEnvironmentVariableA: PATH (windows) = '%s'", win_path);
+        return (DWORD)len;
     }
     
     const char* value = getenv(name);
@@ -7153,6 +7204,72 @@ size_t __attribute__((ms_abi)) lsw_strftime(char* s, size_t max, const char* fmt
 char* __attribute__((ms_abi)) lsw_getenv(const char* n) { return getenv(n); }
 int   __attribute__((ms_abi)) lsw__putenv(const char* s) { return putenv((char*)s); }
 
+/* msvcrt/ucrtbase _wgetenv — return wide env var (UTF-16 in static buffer) */
+static uint16_t lsw_wgetenv_buf[LSW_MAX_PATH];
+uint16_t* __attribute__((ms_abi)) lsw__wgetenv(const uint16_t* name) {
+    if (!name) return NULL;
+    char name_mb[256] = {0};
+    for (int i = 0; i < 255 && name[i]; i++) name_mb[i] = (char)name[i];
+    const char* val = getenv(name_mb);
+    if (!val) return NULL;
+    size_t i = 0;
+    for (; val[i] && i < LSW_MAX_PATH - 1; i++) lsw_wgetenv_buf[i] = (uint16_t)(unsigned char)val[i];
+    lsw_wgetenv_buf[i] = 0;
+    return lsw_wgetenv_buf;
+}
+
+/* Windows _stat64 struct layout (x64) */
+typedef struct {
+    uint32_t  st_dev;    /* 0 */
+    uint16_t  st_ino;    /* 4 */
+    uint16_t  st_mode;   /* 6 */
+    int16_t   st_nlink;  /* 8 */
+    int16_t   st_uid;    /* 10 */
+    int16_t   st_gid;    /* 12 */
+    uint16_t  _pad;      /* 14 */
+    uint32_t  st_rdev;   /* 16 */
+    uint32_t  _pad2;     /* 20 */
+    int64_t   st_size;   /* 24 */
+    int64_t   w_atime;   /* 32 — avoid Linux st_atime macro */
+    int64_t   w_mtime;   /* 40 */
+    int64_t   w_ctime;   /* 48 */
+} lsw_stat64_t;
+
+static int lsw_stat_wide_impl(const uint16_t* wpath, lsw_stat64_t* st) {
+    if (!wpath || !st) return -1;
+    char path_mb[LSW_MAX_PATH];
+    lsw_WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)wpath, -1, path_mb, sizeof(path_mb), NULL, NULL);
+    char linux_path[LSW_MAX_PATH];
+    if (lsw_fs_win_to_linux(path_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) return -1;
+    struct stat s;
+    if (stat(linux_path, &s) != 0) return -1;
+    memset(st, 0, sizeof(*st));
+    st->st_size  = (int64_t)s.st_size;
+    st->w_atime  = (int64_t)s.st_atim.tv_sec;
+    st->w_mtime  = (int64_t)s.st_mtim.tv_sec;
+    st->w_ctime  = (int64_t)s.st_ctim.tv_sec;
+    st->st_nlink = (int16_t)s.st_nlink;
+    /* Translate mode */
+    uint16_t mode = 0;
+    if (S_ISDIR(s.st_mode)) mode |= 0x4000; /* _S_IFDIR */
+    else mode |= 0x8000;                    /* _S_IFREG */
+    if (s.st_mode & S_IRUSR) mode |= 0x0100; /* _S_IREAD */
+    if (s.st_mode & S_IWUSR) mode |= 0x0080; /* _S_IWRITE */
+    if (s.st_mode & S_IXUSR) mode |= 0x0040; /* _S_IEXEC */
+    st->st_mode = mode;
+    return 0;
+}
+
+int __attribute__((ms_abi)) lsw__wstat64(const uint16_t* wpath, lsw_stat64_t* st) {
+    return lsw_stat_wide_impl(wpath, st);
+}
+int __attribute__((ms_abi)) lsw__wstat(const uint16_t* wpath, lsw_stat64_t* st) {
+    return lsw_stat_wide_impl(wpath, st);
+}
+int __attribute__((ms_abi)) lsw__wstat32(const uint16_t* wpath, lsw_stat64_t* st) {
+    return lsw_stat_wide_impl(wpath, st);
+}
+
 // Security/safe string variants (CRT secure versions)
 int __attribute__((ms_abi)) lsw_strcpy_s(char* dst, size_t sz, const char* src) {
     if (!dst || !sz) return 22; /* EINVAL */
@@ -7720,31 +7837,152 @@ int __attribute__((ms_abi)) lsw_GetFileAttributesA(const char* path) {
     if (S_ISDIR(st.st_mode)) attr = 0x10; // FILE_ATTRIBUTE_DIRECTORY
     return attr;
 }
+/* Convert a Linux path to Windows format using the configured drive roots.
+ * Wraps lsw_fs_linux_to_win from the shared filesystem layer.
+ * Returns number of characters written (excluding NUL). */
+static size_t lsw_linux_to_windows_path(const char* lpath, char* wpath, size_t wsize) {
+    if (!lpath || !wpath || wsize == 0) return 0;
+    if (lsw_fs_linux_to_win(lpath, wpath, wsize) == LSW_SUCCESS)
+        return strlen(wpath);
+    /* Fallback: just copy with backslash conversion */
+    size_t n = 0;
+    for (; lpath[n] && n < wsize - 1; n++)
+        wpath[n] = (lpath[n] == '/') ? '\\' : lpath[n];
+    wpath[n] = '\0';
+    return n;
+}
+
+/* Convert a Windows path to a Linux path using the configured drive roots.
+ * Wraps lsw_fs_win_to_linux from the shared filesystem layer.
+ * Returns number of characters written (excluding NUL). */
+static size_t lsw_windows_to_linux_path(const char* wpath, char* lpath, size_t lsize) {
+    if (!wpath || !lpath || lsize == 0) return 0;
+    if (lsw_fs_win_to_linux(wpath, lpath, lsize) == LSW_SUCCESS)
+        return strlen(lpath);
+    /* Fallback: just copy with forward-slash conversion */
+    size_t n = 0;
+    for (; wpath[n] && n < lsize - 1; n++)
+        lpath[n] = (wpath[n] == '\\') ? '/' : wpath[n];
+    lpath[n] = '\0';
+    return n;
+}
+
 uint32_t __attribute__((ms_abi)) lsw_GetFullPathNameA(const char* path, uint32_t buf_len, char* buf, char** fname) {
-    if (!path || !buf || buf_len == 0) return 0;
-    char* r = realpath(path, buf);
-    if (!r) { snprintf(buf, buf_len, "%s", path); }
+    if (!path) return 0;
+    char full[LSW_MAX_PATH];
+    /* Build absolute path */
+    if (path[0] == '/' || ((path[0] >= 'A' && path[0] <= 'Z' || path[0] >= 'a' && path[0] <= 'z') && path[1] == ':')) {
+        /* Already absolute — convert to Windows */
+        lsw_linux_to_windows_path(path, full, sizeof(full));
+    } else {
+        /* Relative — prepend CWD */
+        char cwd[LSW_MAX_PATH];
+        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+        char wcwd[LSW_MAX_PATH];
+        lsw_linux_to_windows_path(cwd, wcwd, sizeof(wcwd));
+        /* Append separator + path */
+        size_t clen = strlen(wcwd);
+        if (clen > 0 && wcwd[clen-1] != '\\' && wcwd[clen-1] != '/') {
+            wcwd[clen++] = '\\'; wcwd[clen] = '\0';
+        }
+        snprintf(full, sizeof(full), "%s%s", wcwd, path);
+        /* Normalise */
+        for (char* p = full; *p; p++) if (*p == '/') *p = '\\';
+    }
+    uint32_t len = (uint32_t)strlen(full);
+    if (!buf || buf_len == 0) return len + 1;
+    if (buf_len <= len) return len + 1;
+    strcpy(buf, full);
     if (fname) {
-        char* slash = strrchr(buf, '/');
+        char* slash = strrchr(buf, '\\');
         *fname = slash ? slash + 1 : buf;
     }
-    return (uint32_t)strlen(buf);
+    return len;
 }
+
 uint32_t __attribute__((ms_abi)) lsw_GetFullPathNameW(const uint16_t* path, uint32_t buf_len, uint16_t* buf, uint16_t** fname) {
-    (void)path; (void)buf_len; (void)buf; (void)fname; return 0;
+    if (!path) return 0;
+    /* Convert path to UTF-8 */
+    char path_mb[LSW_MAX_PATH];
+    int i = 0;
+    for (; path[i] && i < (int)sizeof(path_mb) - 1; i++) path_mb[i] = (path[i] < 128) ? (char)path[i] : '?';
+    path_mb[i] = '\0';
+    /* Get full path as ANSI */
+    char full[LSW_MAX_PATH];
+    char* filePart = NULL;
+    uint32_t len = lsw_GetFullPathNameA(path_mb, sizeof(full), full, &filePart);
+    if (len == 0) return 0;
+    /* If buf too small (or NULL), return required length */
+    if (!buf || buf_len == 0) return len + 1;
+    /* Convert to wide and store */
+    uint32_t actual_len = (uint32_t)strlen(full);
+    if (buf_len <= actual_len) return actual_len + 1;
+    for (uint32_t j = 0; j <= actual_len; j++) buf[j] = (uint16_t)(unsigned char)full[j];
+    if (fname) {
+        if (filePart) {
+            size_t offset = (size_t)(filePart - full);
+            *fname = buf + offset;
+        } else {
+            *fname = NULL;
+        }
+    }
+    return actual_len;
+}
+/* GetLongPathNameW — just copy input (no short-name expansion needed) */
+uint32_t __attribute__((ms_abi)) lsw_GetLongPathNameW(const uint16_t* short_path, uint16_t* long_path, uint32_t buf_len) {
+    if (!short_path) return 0;
+    uint32_t len = 0;
+    while (short_path[len]) len++;
+    if (!long_path || buf_len == 0) return len + 1;
+    uint32_t copy = (len < buf_len - 1) ? len : buf_len - 1;
+    for (uint32_t i = 0; i < copy; i++) long_path[i] = short_path[i];
+    long_path[copy] = 0;
+    return copy;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetLongPathNameA(const char* short_path, char* long_path, uint32_t buf_len) {
+    if (!short_path) return 0;
+    if (long_path && buf_len > 0) { strncpy(long_path, short_path, buf_len - 1); long_path[buf_len - 1] = 0; }
+    return (uint32_t)strlen(short_path);
 }
 int __attribute__((ms_abi)) lsw_SetCurrentDirectoryA(const char* path) {
     if (!path) return 0;
+    /* If it looks like a Windows path, convert to Linux first */
+    char lpath[LSW_MAX_PATH];
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':') {
+        lsw_windows_to_linux_path(path, lpath, sizeof(lpath));
+        return (chdir(lpath) == 0) ? 1 : 0;
+    }
     return (chdir(path) == 0) ? 1 : 0;
 }
-int __attribute__((ms_abi)) lsw_SetCurrentDirectoryW(const uint16_t* path) { (void)path; return 1; }
+int __attribute__((ms_abi)) lsw_SetCurrentDirectoryW(const uint16_t* path) {
+    if (!path) return 1;
+    char path_mb[LSW_MAX_PATH];
+    int i = 0;
+    for (; path[i] && i < (int)sizeof(path_mb)-1; i++) path_mb[i] = (path[i] < 128) ? (char)path[i] : '?';
+    path_mb[i] = '\0';
+    return lsw_SetCurrentDirectoryA(path_mb);
+}
 uint32_t __attribute__((ms_abi)) lsw_GetCurrentDirectoryA(uint32_t n, char* buf) {
-    if (!buf || n == 0) return 0;
-    if (!getcwd(buf, n)) return 0;
-    return (uint32_t)strlen(buf);
+    char cwd[LSW_MAX_PATH];
+    if (!getcwd(cwd, sizeof(cwd))) return 0;
+    char wcwd[LSW_MAX_PATH];
+    lsw_linux_to_windows_path(cwd, wcwd, sizeof(wcwd));
+    uint32_t len = (uint32_t)strlen(wcwd);
+    if (!buf || n == 0) return len + 1;
+    if (n <= len) return len + 1;
+    strcpy(buf, wcwd);
+    return len;
 }
 uint32_t __attribute__((ms_abi)) lsw_GetCurrentDirectoryW(uint32_t n, uint16_t* buf) {
-    (void)n; (void)buf; return 0;
+    char cwd[LSW_MAX_PATH];
+    if (!getcwd(cwd, sizeof(cwd))) return 0;
+    char wcwd[LSW_MAX_PATH];
+    lsw_linux_to_windows_path(cwd, wcwd, sizeof(wcwd));
+    uint32_t len = (uint32_t)strlen(wcwd);
+    if (!buf || n == 0) return len + 1;
+    if (n <= len) return len + 1;
+    for (uint32_t i = 0; i <= len; i++) buf[i] = (uint16_t)(unsigned char)wcwd[i];
+    return len;
 }
 int __attribute__((ms_abi)) lsw_MoveFileA(const char* src, const char* dst) {
     if (!src || !dst) return 0;
@@ -10600,6 +10838,12 @@ int64_t __attribute__((ms_abi)) lsw__wtoi64(const uint16_t* str) {
 int __attribute__((ms_abi)) lsw_iswctype(wint_t c, unsigned long desc) {
     return iswctype(c, desc);
 }
+wint_t __attribute__((ms_abi)) lsw_towupper(wint_t c) {
+    return towupper(c);
+}
+wint_t __attribute__((ms_abi)) lsw_towlower(wint_t c) {
+    return towlower(c);
+}
 int __attribute__((ms_abi)) lsw_wcsncat_s(u16* dst, size_t dstSz, const u16* src, size_t count) {
     if (!dst || !src || dstSz == 0) return 22; /* EINVAL */
     size_t len = u16_len(dst);
@@ -11986,6 +12230,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "strftime",     (void*)lsw_strftime},
     {"ucrtbase.dll", "getenv",       (void*)lsw_getenv},
     {"ucrtbase.dll", "_putenv",      (void*)lsw__putenv},
+    {"ucrtbase.dll", "_wgetenv",     (void*)lsw__wgetenv},
+    {"ucrtbase.dll", "_wstat64",     (void*)lsw__wstat64},
+    {"ucrtbase.dll", "_wstat",       (void*)lsw__wstat},
+    {"ucrtbase.dll", "_wstat32",     (void*)lsw__wstat32},
     {"ucrtbase.dll", "exit",         (void*)lsw_exit},
     {"ucrtbase.dll", "_exit",        (void*)lsw_exit},
     {"ucrtbase.dll", "abort",        (void*)lsw_abort},
@@ -12113,6 +12361,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetFileAttributesA",       (void*)lsw_GetFileAttributesA},
     {"KERNEL32.dll", "GetFullPathNameA",         (void*)lsw_GetFullPathNameA},
     {"KERNEL32.dll", "GetFullPathNameW",         (void*)lsw_GetFullPathNameW},
+    {"KERNEL32.dll", "GetLongPathNameW",         (void*)lsw_GetLongPathNameW},
+    {"KERNEL32.dll", "GetLongPathNameA",         (void*)lsw_GetLongPathNameA},
     {"KERNEL32.dll", "SetCurrentDirectoryA",     (void*)lsw_SetCurrentDirectoryA},
     {"KERNEL32.dll", "SetCurrentDirectoryW",     (void*)lsw_SetCurrentDirectoryW},
     {"KERNEL32.dll", "GetCurrentDirectoryA",     (void*)lsw_GetCurrentDirectoryA},
@@ -12402,9 +12652,16 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll",   "_wtoi",       (void*)lsw__wtoi},
     {"msvcrt.dll",   "_wtoi64",     (void*)lsw__wtoi64},
     {"msvcrt.dll",   "iswctype",    (void*)lsw_iswctype},
+    {"msvcrt.dll",   "towupper",    (void*)lsw_towupper},
+    {"msvcrt.dll",   "towlower",    (void*)lsw_towlower},
+    {"msvcrt.dll",   "localtime",   (void*)lsw_localtime},
     {"msvcrt.dll",   "_snwprintf_s",(void*)lsw__snwprintf_s},
     {"msvcrt.dll",   "_vsnwprintf_s",(void*)lsw__vsnwprintf_s},
     {"msvcrt.dll",   "_local_unwind",(void*)lsw__local_unwind},
+    {"msvcrt.dll",   "_wgetenv",    (void*)lsw__wgetenv},
+    {"msvcrt.dll",   "_wstat64",    (void*)lsw__wstat64},
+    {"msvcrt.dll",   "_wstat",      (void*)lsw__wstat},
+    {"msvcrt.dll",   "_wstat32",    (void*)lsw__wstat32},
     {"ucrtbase.dll", "_wcsicmp",    (void*)lsw__wcsicmp},
     {"ucrtbase.dll", "_wcsnicmp",   (void*)lsw__wcsnicmp},
     {"ucrtbase.dll", "_write",      (void*)lsw__write},

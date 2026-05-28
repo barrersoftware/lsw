@@ -50,6 +50,18 @@ void lsw_config_defaults(lsw_config_t* config) {
                sizeof(config->c_drive_root));
     }
     
+    /* Auto-detect WSL/real Windows mount point.
+     * If /mnt/c exists (standard WSL), prefer it so real Windows binaries
+     * can resolve C: paths without a separate virtual drive layout. */
+    {
+        struct stat _st;
+        if (stat("/mnt/c", &_st) == 0 && S_ISDIR(_st.st_mode)) {
+            strncpy(config->c_drive_root, "/mnt/c",
+                    sizeof(config->c_drive_root) - 1);
+            config->c_drive_root[sizeof(config->c_drive_root) - 1] = '\0';
+        }
+    }
+    
     // D: drive optional (user can configure)
     config->d_drive_root[0] = '\0';
     
