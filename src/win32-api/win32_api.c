@@ -119,6 +119,9 @@ struct lsw_pe_hmodule_s {
     /* 1 if sections are already mapped at VAs (in-memory PE, e.g. main exe);
      * 0 if flat file layout where RVA must be translated via section raw offsets. */
     int      mapped_va;
+    /* Section table for RVA→raw-offset translation when mapped_va=0 */
+    uint8_t* sec_hdrs;      /* pointer into image_base at section header array */
+    uint16_t num_sections;
 };
 
 /* ---- Typed handle for the main executable (returned by GetModuleHandle(NULL)) ---- */
@@ -1991,6 +1994,13 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
                  obj, throwInfo);
     LSW_LOG_INFO("[exception] caller ret_addr=0x%lx body_rsp=0x%lx",
                  (unsigned long)ret_to_b, (unsigned long)body_rsp);
+    /* Log first 8 bytes of exception object to help identify HRESULT */
+    if (obj) {
+        uint32_t w0 = ((uint32_t*)obj)[0];
+        uint32_t w1 = ((uint32_t*)obj)[1];
+        LSW_LOG_INFO("[exception] obj bytes [0x%08x, 0x%08x] (HR=0x%08x?)",
+                     w0, w1, w0);
+    }
 
     /* Verify we have PE image info before trying to dispatch */
     if (!g_lsw_pdata_va || !g_lsw_image_base) {
@@ -2422,8 +2432,11 @@ int __attribute__((ms_abi)) lsw_VirtualFree(void* addr, size_t size, uint32_t fr
 // File I/O functions
 #define GENERIC_READ    0x80000000
 #define GENERIC_WRITE   0x40000000
-#define CREATE_ALWAYS   2
-#define OPEN_EXISTING   3
+#define CREATE_NEW        1
+#define CREATE_ALWAYS     2
+#define OPEN_EXISTING     3
+#define OPEN_ALWAYS       4
+#define TRUNCATE_EXISTING 5
 #define INVALID_HANDLE_VALUE ((void*)(intptr_t)-1)
 
 void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t access, uint32_t share_mode, 
@@ -2434,10 +2447,11 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
     char linux_path[LSW_MAX_PATH];
     if (lsw_fs_win_to_linux(filename, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
         LSW_LOG_WARN("CreateFileA path translation failed: %s", filename);
+        lsw_SetLastError(3); /* ERROR_PATH_NOT_FOUND */
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA: %s -> %s", filename, linux_path);
+    LSW_LOG_INFO("CreateFileA: %s -> %s (access=0x%x creation=%u flags=0x%x)", filename, linux_path, access, creation, flags);
     
     // Route through kernel module if available
     if (g_kernel_fd >= 0) {
@@ -2470,32 +2484,37 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
     }
     
     // Fallback to userspace implementation
-    LSW_LOG_WARN("Using userspace fallback for CreateFileA");
-    
-    int flags_unix = 0;
-    if ((access & GENERIC_READ) && (access & GENERIC_WRITE)) {
-        if (creation == CREATE_ALWAYS) {
-            flags_unix = O_RDWR | O_CREAT | O_TRUNC;
-        } else {
-            flags_unix = O_RDWR;
-        }
-    } else if (access & GENERIC_WRITE) {
-        if (creation == CREATE_ALWAYS) {
-            flags_unix = O_WRONLY | O_CREAT | O_TRUNC;
-        } else {
-            flags_unix = O_WRONLY;
-        }
-    } else if (access & GENERIC_READ) {
-        flags_unix = O_RDONLY;
+    // Determine base open flags from access rights
+    int oflags = 0;
+    if ((access & GENERIC_READ) && (access & GENERIC_WRITE)) oflags = O_RDWR;
+    else if (access & GENERIC_WRITE) oflags = O_WRONLY;
+    else oflags = O_RDONLY;
+
+    // Apply creation disposition
+    switch (creation) {
+        case CREATE_NEW:        oflags |= O_CREAT | O_EXCL; break;   /* fail if exists */
+        case CREATE_ALWAYS:     oflags |= O_CREAT | O_TRUNC; break;  /* create or overwrite */
+        case OPEN_EXISTING:     break;                                 /* fail if not exists */
+        case OPEN_ALWAYS:       oflags |= O_CREAT; break;            /* create if not exists */
+        case TRUNCATE_EXISTING: oflags |= O_TRUNC; break;            /* truncate existing */
+        default: break;
     }
     
-    int fd = open(linux_path, flags_unix, 0644);
+    int fd = open(linux_path, oflags, 0644);
     if (fd < 0) {
-        LSW_LOG_WARN("CreateFileA userspace fallback failed: %s (errno=%d)", linux_path, errno);
+        LSW_LOG_WARN("CreateFileA failed: %s (errno=%d, creation=%u, oflags=0x%x)", linux_path, errno, creation, oflags);
+        /* Map errno to Win32 last error */
+        uint32_t win_err = (errno == ENOENT) ? 2  /* ERROR_FILE_NOT_FOUND */
+                         : (errno == EACCES) ? 5  /* ERROR_ACCESS_DENIED */
+                         : (errno == EEXIST) ? 80 /* ERROR_FILE_EXISTS */
+                         : (errno == ENOTDIR) ? 3 /* ERROR_PATH_NOT_FOUND */
+                         : 1; /* ERROR_INVALID_FUNCTION */
+        lsw_SetLastError(win_err);
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA userspace fallback: fd=%d", fd);
+    LSW_LOG_INFO("CreateFileA: opened fd=%d", fd);
+    lsw_SetLastError(0); /* ERROR_SUCCESS */
     return (void*)(intptr_t)fd;
 }
 
@@ -4591,24 +4610,45 @@ static lsw_pe_hmodule_t  g_pe_modules[64];
 static int               g_pe_module_count = 0;
 static pthread_mutex_t   g_pe_module_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Convert an RVA to a host pointer, handling both flat-file and VA-mapped layouts */
+static uint8_t* pe_rva_to_ptr(lsw_pe_hmodule_t* mod, uint32_t rva) {
+    if (!rva) return NULL;
+    uint8_t* base = (uint8_t*)mod->image_base;
+    if (mod->mapped_va || !mod->sec_hdrs || !mod->num_sections) {
+        /* Sections are at their VAs — direct access */
+        return base + rva;
+    }
+    /* Flat file: translate RVA → file offset using section headers */
+    for (uint16_t i = 0; i < mod->num_sections; i++) {
+        uint8_t* sh = mod->sec_hdrs + (uint32_t)i * 40;
+        uint32_t vaddr   = *(uint32_t*)(sh + 12);
+        uint32_t vsize   = *(uint32_t*)(sh + 16);
+        uint32_t raw_off = *(uint32_t*)(sh + 20);
+        if (vaddr <= rva && rva < vaddr + vsize)
+            return base + raw_off + (rva - vaddr);
+    }
+    /* Fallback: RVA falls in the PE header area (before first section) */
+    return base + rva;
+}
+
 /* Return symbol address from a PE export directory */
 static void* pe_hmodule_get_proc(lsw_pe_hmodule_t* mod, const char* name) {
     if (!mod->export_dir || !name) return NULL;
-    uint8_t* base = (uint8_t*)mod->image_base;
     /* IMAGE_EXPORT_DIRECTORY offsets */
     uint32_t* expdir = (uint32_t*)mod->export_dir;
     uint32_t num_names = expdir[6];     /* NumberOfNames */
     uint32_t names_rva = expdir[8];     /* AddressOfNames */
     uint32_t ords_rva  = expdir[9];     /* AddressOfNameOrdinals */
     uint32_t funcs_rva = expdir[7];     /* AddressOfFunctions */
-    uint32_t* names = (uint32_t*)(base + names_rva);
-    uint16_t* ords  = (uint16_t*)(base + ords_rva);
-    uint32_t* funcs = (uint32_t*)(base + funcs_rva);
+    uint32_t* names = (uint32_t*)pe_rva_to_ptr(mod, names_rva);
+    uint16_t* ords  = (uint16_t*)pe_rva_to_ptr(mod, ords_rva);
+    uint32_t* funcs = (uint32_t*)pe_rva_to_ptr(mod, funcs_rva);
+    if (!names || !ords || !funcs) return NULL;
     for (uint32_t i = 0; i < num_names; i++) {
-        const char* ename = (const char*)(base + names[i]);
-        if (strcmp(ename, name) == 0) {
+        const char* ename = (const char*)pe_rva_to_ptr(mod, names[i]);
+        if (ename && strcmp(ename, name) == 0) {
             uint32_t fn_rva = funcs[ords[i]];
-            return (void*)(base + fn_rva);
+            return (void*)pe_rva_to_ptr(mod, fn_rva);
         }
     }
     return NULL;
@@ -4634,6 +4674,9 @@ static int is_system_dll(const char* name) {
 }
 
 #define LSW_SYSTEM_HMODULE ((void*)0xDEADBEEF)
+
+static int __attribute__((ms_abi)) generic_stub(void); /* forward declaration — defined later in this file */
+void* win32_api_resolve_ordinal(const char* dll_name, uint16_t ordinal); /* forward decl */
 
 void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
 {
@@ -4713,97 +4756,218 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryA(const char* filename)
 
         if (found[0]) {
             LSW_LOG_INFO("LoadLibraryA: loading PE DLL %s from %s", base, found);
-            /* mmap + parse PE export directory */
             int fd = open(found, O_RDONLY);
             if (fd >= 0) {
                 struct stat st; fstat(fd, &st);
                 void* file_data = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
                 close(fd);
                 if (file_data != MAP_FAILED) {
-                    /* Quick PE validity check */
                     uint8_t* fd8 = (uint8_t*)file_data;
                     if (fd8[0] == 'M' && fd8[1] == 'Z') {
                         uint32_t pe_off = *(uint32_t*)(fd8 + 0x3C);
                         if (pe_off + 4 < (uint32_t)st.st_size &&
                             fd8[pe_off]=='P' && fd8[pe_off+1]=='E') {
-                            /* Allocate executable copy */
-                            void* image = mmap(NULL, (size_t)st.st_size,
-                                PROT_READ|PROT_WRITE|PROT_EXEC,
-                                MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-                            if (image != MAP_FAILED) {
-                                memcpy(image, file_data, (size_t)st.st_size);
-                                munmap(file_data, (size_t)st.st_size);
-                                /* Locate export directory */
-                                uint8_t* b = (uint8_t*)image;
-                                uint32_t pe_off2 = *(uint32_t*)(b + 0x3C);
-                                uint32_t export_rva = *(uint32_t*)(b + pe_off2 + 24 + 112); /* OptHdr+DataDir[0].VirtualAddress */
-                                uint32_t export_sz  = *(uint32_t*)(b + pe_off2 + 24 + 116);
-                                pthread_mutex_lock(&g_pe_module_lock);
-                                int slot = g_pe_module_count < 64 ? g_pe_module_count++ : -1;
-                                pthread_mutex_unlock(&g_pe_module_lock);
-                                if (slot >= 0) {
-                                    lsw_pe_hmodule_t* mod = &g_pe_modules[slot];
-                                    mod->magic = LSW_PE_HMODULE_MAGIC;
-                                    strncpy(mod->dll_name, base, sizeof(mod->dll_name)-1);
-                                    mod->image_base = image;
-                                    mod->image_size = (size_t)st.st_size;
-                                    mod->export_dir = export_rva ? (b + export_rva) : NULL;
-                                    mod->export_dir_size = export_sz;
-                                   /* Locate .rsrc section for FormatMessageW FROM_HMODULE */
-                                   mod->rsrc_raw = NULL; mod->rsrc_rva = 0;
-                                   uint16_t opt_size2  = *(uint16_t*)(b + pe_off2 + 4 + 16);
-                                   uint16_t num_sec2   = *(uint16_t*)(b + pe_off2 + 4 + 2);
-                                   uint32_t sec_off2   = pe_off2 + 4 + 20 + opt_size2;
-                                   for (uint16_t si = 0; si < num_sec2; si++) {
-                                       uint8_t* sh = b + sec_off2 + (uint32_t)si * 40;
-                                       if (memcmp(sh, ".rsrc\0\0\0", 8) == 0) {
-                                           mod->rsrc_rva = *(uint32_t*)(sh + 12);
-                                           mod->rsrc_raw = b + *(uint32_t*)(sh + 20);
-                                           break;
-                                       }
-                                   }
-                                   LSW_LOG_INFO("LoadLibraryA: PE DLL loaded -> slot %d, base %p, rsrc=%p",
-                                                slot, image, mod->rsrc_raw);
-                                   /* MUI satellite: if no RT_MESSAGETABLE in main DLL,
-                                    * look for en-US/<name>.dll.mui in the same directory */
-                                   mod->mui_image = NULL;
-                                   mod->mui_image_size = 0;
-                                   if (!pe_has_message_table((const uint8_t*)image, (size_t)st.st_size)) {
-                                        char dir_part[512]; strncpy(dir_part, found, sizeof(dir_part)-1);
-                                        char* sl = strrchr(dir_part, '/');
-                                        if (sl) *sl = '\0'; else dir_part[0] = '\0';
-                                        char lower_base2[128]; strncpy(lower_base2, base, sizeof(lower_base2)-1);
-                                        lower_base2[sizeof(lower_base2)-1] = '\0';
-                                        for (char* p = lower_base2; *p; p++) *p = (char)tolower((unsigned char)*p);
-                                        char mui_path[600];
-                                        snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, lower_base2);
-                                        if (access(mui_path, R_OK) != 0)
-                                            snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, base);
-                                        if (access(mui_path, R_OK) == 0) {
-                                           int mfd = open(mui_path, O_RDONLY);
-                                           if (mfd >= 0) {
-                                               struct stat mst; fstat(mfd, &mst);
-                                               void* mdata = mmap(NULL, (size_t)mst.st_size, PROT_READ, MAP_PRIVATE, mfd, 0);
-                                               close(mfd);
-                                               if (mdata != MAP_FAILED) {
-                                                   uint8_t* m8 = (uint8_t*)mdata;
-                                                   if (m8[0] == 'M' && m8[1] == 'Z') {
-                                                       mod->mui_image = mdata;
-                                                       mod->mui_image_size = (size_t)mst.st_size;
-                                                       LSW_LOG_INFO("LoadLibraryA: MUI satellite loaded from %s (%zu bytes)",
-                                                                    mui_path, mod->mui_image_size);
-                                                   } else {
-                                                       munmap(mdata, (size_t)mst.st_size);
-                                                   }
-                                               }
-                                           }
-                                       }
-                                   }
-                                   return (void*)mod;
+                            /* Parse PE headers */
+                            uint32_t opt_off2   = pe_off + 24;
+                            uint16_t num_sec2   = *(uint16_t*)(fd8 + pe_off + 6);
+                            uint16_t opt_size2  = *(uint16_t*)(fd8 + pe_off + 20);
+                            uint32_t sec_off2   = pe_off + 24 + opt_size2;
+                            uint32_t image_size2 = *(uint32_t*)(fd8 + opt_off2 + 56); /* SizeOfImage */
+                            uint32_t hdr_size2  = *(uint32_t*)(fd8 + opt_off2 + 60); /* SizeOfHeaders */
+                            uint32_t export_rva = *(uint32_t*)(fd8 + opt_off2 + 112);
+                            uint32_t export_sz  = *(uint32_t*)(fd8 + opt_off2 + 116);
+                            uint32_t import_rva = *(uint32_t*)(fd8 + opt_off2 + 120);
+                            uint32_t reloc_rva  = *(uint32_t*)(fd8 + opt_off2 + 160);
+                            uint32_t reloc_sz   = *(uint32_t*)(fd8 + opt_off2 + 164);
+                            uint32_t ep_rva     = *(uint32_t*)(fd8 + opt_off2 + 16);  /* AddressOfEntryPoint */
+                            if (!image_size2) image_size2 = (uint32_t)st.st_size;
+
+                            /* Preferred base from the optional header */
+                            uint64_t pref_base_req = *(uint64_t*)(fd8 + opt_off2 + 24);
+
+                            /* Try to allocate at preferred base first (no relocation needed
+                             * if we succeed — critical for DLLs without a reloc table) */
+                            void* image = NULL;
+                            if (pref_base_req) {
+                                image = mmap((void*)(uintptr_t)pref_base_req, (size_t)image_size2,
+                                    PROT_READ|PROT_WRITE|PROT_EXEC,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                                /* If we didn't get the preferred base, discard and try anywhere */
+                                if (image != MAP_FAILED && (uintptr_t)image != pref_base_req) {
+                                    munmap(image, (size_t)image_size2);
+                                    image = MAP_FAILED;
                                 }
-                            } else {
-                                munmap(file_data, (size_t)st.st_size);
                             }
+                            if (image == MAP_FAILED || !image)
+                                image = mmap(NULL, (size_t)image_size2,
+                                    PROT_READ|PROT_WRITE|PROT_EXEC,
+                                    MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+                            if (image == MAP_FAILED) {
+                                munmap(file_data, (size_t)st.st_size);
+                                /* fall through to system-handle fallback */
+                            } else {
+                            uint8_t* b = (uint8_t*)image;
+
+                            /* Copy PE headers */
+                            uint32_t copy_hdrs = hdr_size2 < (uint32_t)st.st_size ? hdr_size2 : (uint32_t)st.st_size;
+                            memcpy(b, fd8, copy_hdrs);
+
+                            /* Map sections at their virtual addresses */
+                            for (uint16_t si = 0; si < num_sec2; si++) {
+                                uint8_t* sh  = fd8 + sec_off2 + (uint32_t)si * 40;
+                                uint32_t vaddr    = *(uint32_t*)(sh + 12);
+                                uint32_t vsize    = *(uint32_t*)(sh + 8);
+                                uint32_t raw_sz   = *(uint32_t*)(sh + 16);
+                                uint32_t raw_off  = *(uint32_t*)(sh + 20);
+                                if (raw_off == 0 || raw_sz == 0) continue;
+                                if (vaddr + vsize > image_size2) continue;
+                                uint32_t copy_sz = raw_sz < vsize ? raw_sz : vsize;
+                                if (raw_off + copy_sz > (uint32_t)st.st_size)
+                                    copy_sz = (uint32_t)st.st_size - raw_off;
+                                if (copy_sz > 0)
+                                    memcpy(b + vaddr, fd8 + raw_off, copy_sz);
+                            }
+
+                            /* Apply base relocations if the DLL has them */
+                            if (reloc_rva && reloc_sz) {
+                                uint64_t pref_base = *(uint64_t*)(fd8 + opt_off2 + 24);
+                                int64_t  delta = (int64_t)((uintptr_t)b - pref_base);
+                                if (delta != 0) {
+                                    uint8_t* reloc = b + reloc_rva;
+                                    uint8_t* reloc_end = reloc + reloc_sz;
+                                    while (reloc < reloc_end) {
+                                        uint32_t page_rva = *(uint32_t*)(reloc);
+                                        uint32_t block_sz = *(uint32_t*)(reloc + 4);
+                                        if (block_sz < 8) break;
+                                        uint16_t* entries = (uint16_t*)(reloc + 8);
+                                        uint32_t  n_ent   = (block_sz - 8) / 2;
+                                        for (uint32_t ei = 0; ei < n_ent; ei++) {
+                                            uint16_t e = entries[ei];
+                                            int type = e >> 12;
+                                            uint32_t off = e & 0xFFF;
+                                            if (type == 10 /* IMAGE_REL_BASED_DIR64 */) {
+                                                uint64_t* p = (uint64_t*)(b + page_rva + off);
+                                                *p += delta;
+                                            }
+                                        }
+                                        reloc += block_sz;
+                                    }
+                                }
+                            }
+
+                            /* Patch IAT with our Win32 stubs */
+                            if (import_rva) {
+                                uint8_t* idesc = b + import_rva;
+                                while (*(uint32_t*)(idesc + 12) != 0) {
+                                    uint32_t dll_name_rva  = *(uint32_t*)(idesc + 12);
+                                    uint32_t iat_rva2      = *(uint32_t*)(idesc + 16);
+                                    uint32_t oft_rva2      = *(uint32_t*)(idesc + 0);
+                                    const char* imp_dll    = (const char*)(b + dll_name_rva);
+                                    uint64_t* iat_ptr      = (uint64_t*)(b + iat_rva2);
+                                    uint64_t* thunks       = (uint64_t*)(b + (oft_rva2 ? oft_rva2 : iat_rva2));
+                                    LSW_LOG_DEBUG("IAT patch: %s  oft_rva=0x%x iat_rva=0x%x", imp_dll, oft_rva2, iat_rva2);
+                                    for (int j = 0; ; j++) {
+                                       uint64_t th = thunks[j];
+                                       if (th == 0) break;
+                                       void* stub = NULL;
+                                       if (th >> 63) {
+                                           /* Ordinal import — try to resolve via ordinal table */
+                                           uint16_t ordinal = (uint16_t)(th & 0xffff);
+                                           stub = win32_api_resolve_ordinal(imp_dll, ordinal);
+                                           if (!stub) {
+                                               LSW_LOG_DEBUG("IAT patch: %s ordinal %u -> UNRESOLVED (generic_stub)", imp_dll, ordinal);
+                                               stub = (void*)(uintptr_t)generic_stub;
+                                           } else {
+                                               LSW_LOG_DEBUG("IAT patch: %s ordinal %u -> %p (iat_ptr[%d]=%p)", imp_dll, ordinal, stub, j, &iat_ptr[j]);
+                                           }
+                                       } else {
+                                           const char* fname = (const char*)(b + (uint32_t)th + 2);
+                                           stub = win32_api_resolve(imp_dll, fname);
+                                           LSW_LOG_DEBUG("IAT patch: %s!%s -> %p", imp_dll, fname, stub);
+                                       }
+                                       iat_ptr[j] = (uint64_t)(uintptr_t)stub;
+                                    }
+                                    idesc += 20;
+                                }
+                            }
+
+                            munmap(file_data, (size_t)st.st_size);
+
+                            pthread_mutex_lock(&g_pe_module_lock);
+                            int slot = g_pe_module_count < 64 ? g_pe_module_count++ : -1;
+                            pthread_mutex_unlock(&g_pe_module_lock);
+                            if (slot >= 0) {
+                                lsw_pe_hmodule_t* mod = &g_pe_modules[slot];
+                                mod->magic = LSW_PE_HMODULE_MAGIC;
+                                strncpy(mod->dll_name, base, sizeof(mod->dll_name)-1);
+                                mod->image_base = image;
+                                mod->image_size = (size_t)image_size2;
+                                mod->mapped_va  = 1; /* sections mapped at VAs */
+                                mod->sec_hdrs     = b + sec_off2;
+                                mod->num_sections = num_sec2;
+                                mod->export_dir      = export_rva ? (b + export_rva) : NULL;
+                                mod->export_dir_size = export_sz;
+                                /* .rsrc section */
+                                mod->rsrc_raw = NULL; mod->rsrc_rva = 0;
+                                for (uint16_t si = 0; si < num_sec2; si++) {
+                                    uint8_t* sh = (uint8_t*)image + sec_off2 + (uint32_t)si * 40;
+                                    if (memcmp(sh, ".rsrc\0\0\0", 8) == 0) {
+                                        uint32_t rsrc_va  = *(uint32_t*)(sh + 12);
+                                        mod->rsrc_rva = rsrc_va;
+                                        mod->rsrc_raw = b + rsrc_va;
+                                        break;
+                                    }
+                                }
+                                LSW_LOG_INFO("LoadLibraryA: PE DLL mapped -> slot %d, base %p (image_size=0x%x)",
+                                             slot, image, image_size2);
+                                /* MUI satellite: if no RT_MESSAGETABLE in main DLL,
+                                 * look for en-US/<name>.dll.mui in the same directory */
+                                mod->mui_image = NULL;
+                                mod->mui_image_size = 0;
+                                if (!pe_has_message_table((const uint8_t*)image, (size_t)image_size2)) {
+                                     char dir_part[512]; strncpy(dir_part, found, sizeof(dir_part)-1);
+                                     char* sl = strrchr(dir_part, '/');
+                                     if (sl) *sl = '\0'; else dir_part[0] = '\0';
+                                     char lower_base2[128]; strncpy(lower_base2, base, sizeof(lower_base2)-1);
+                                     lower_base2[sizeof(lower_base2)-1] = '\0';
+                                     for (char* p = lower_base2; *p; p++) *p = (char)tolower((unsigned char)*p);
+                                     char mui_path[600];
+                                     snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, lower_base2);
+                                     if (access(mui_path, R_OK) != 0)
+                                         snprintf(mui_path, sizeof(mui_path), "%s/en-US/%s.mui", dir_part, base);
+                                     if (access(mui_path, R_OK) == 0) {
+                                        int mfd = open(mui_path, O_RDONLY);
+                                        if (mfd >= 0) {
+                                            struct stat mst; fstat(mfd, &mst);
+                                            void* mdata = mmap(NULL, (size_t)mst.st_size, PROT_READ, MAP_PRIVATE, mfd, 0);
+                                            close(mfd);
+                                            if (mdata != MAP_FAILED) {
+                                                uint8_t* m8 = (uint8_t*)mdata;
+                                                if (m8[0] == 'M' && m8[1] == 'Z') {
+                                                    mod->mui_image = mdata;
+                                                    mod->mui_image_size = (size_t)mst.st_size;
+                                                    LSW_LOG_INFO("LoadLibraryA: MUI satellite loaded from %s (%zu bytes)",
+                                                                 mui_path, mod->mui_image_size);
+                                                } else {
+                                                    munmap(mdata, (size_t)mst.st_size);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                /* Call DllMain(hModule, DLL_PROCESS_ATTACH, NULL) */
+                                if (ep_rva) {
+                                    typedef int (__attribute__((ms_abi)) *dll_entry_fn)(void* hinstDLL, uint32_t fdwReason, void* lpvReserved);
+                                    dll_entry_fn dll_entry = (dll_entry_fn)(b + ep_rva);
+                                    LSW_LOG_INFO("LoadLibraryA: calling DllMain %s at %p (rva 0x%x) DLL_PROCESS_ATTACH",
+                                                 base, (void*)dll_entry, ep_rva);
+                                    int r = dll_entry((void*)mod, 1 /* DLL_PROCESS_ATTACH */, NULL);
+                                    LSW_LOG_INFO("LoadLibraryA: DllMain %s returned %d", base, r);
+                                }
+                                return (void*)mod;
+                            }
+                            munmap(image, (size_t)image_size2);
+                            } /* end else (image != MAP_FAILED) */
                         }
                     }
                     munmap(file_data, (size_t)st.st_size);
@@ -4858,9 +5022,10 @@ void* __attribute__((ms_abi)) lsw_GetProcAddress(void* module, const char* proc_
     /* PE module handle? */
     lsw_pe_hmodule_t* pem = (lsw_pe_hmodule_t*)module;
     if (IS_TYPED_HANDLE(pem) && pem->magic == LSW_PE_HMODULE_MAGIC) {
-        /* First check our Win32 stub tables (highest priority) */
-        void* addr = win32_api_resolve(pem->dll_name, proc_name);
-        if (!addr) addr = pe_hmodule_get_proc(pem, proc_name);
+        /* Check real PE exports first (highest priority for the DLL's own functions) */
+        void* addr = pe_hmodule_get_proc(pem, proc_name);
+        /* Fallback: our Win32 stub tables (for re-exported system functions) */
+        if (!addr) addr = win32_api_resolve_any(proc_name);
         if (addr) { LSW_LOG_INFO("GetProcAddress: PE %s!%s -> %p", pem->dll_name, proc_name, addr); }
         else { LSW_LOG_WARN("GetProcAddress: PE %s!%s not found", pem->dll_name, proc_name); }
         return addr;
@@ -7717,6 +7882,32 @@ int __attribute__((ms_abi)) lsw_FileTimeToSystemTime(const uint64_t* ft, void* s
 int __attribute__((ms_abi)) lsw_SystemTimeToFileTime(const void* st, uint64_t* ft) {
     (void)st; if (ft) *ft = 0; return 1; // stub
 }
+/* LocalFileTimeToFileTime — convert local FILETIME to UTC FILETIME */
+int __attribute__((ms_abi)) lsw_LocalFileTimeToFileTime(const uint64_t* lpLocalFileTime, uint64_t* lpFileTime) {
+    /* Simple stub: assume no timezone offset (UTC = local) */
+    if (lpFileTime && lpLocalFileTime) *lpFileTime = *lpLocalFileTime;
+    return 1;
+}
+/* DosDateTimeToFileTime — convert FAT date/time to FILETIME */
+int __attribute__((ms_abi)) lsw_DosDateTimeToFileTime(uint16_t wFatDate, uint16_t wFatTime, uint64_t* lpFileTime) {
+    if (!lpFileTime) return 0;
+    /* Unpack FAT date/time:
+     *   date: bits 15-9=year-1980, 8-5=month, 4-0=day
+     *   time: bits 15-11=hour, 10-5=min, 4-0=sec/2 */
+    int year  = 1980 + ((wFatDate >> 9) & 0x7f);
+    int month = (wFatDate >> 5) & 0x0f;
+    int day   = wFatDate & 0x1f;
+    int hour  = (wFatTime >> 11) & 0x1f;
+    int min   = (wFatTime >> 5)  & 0x3f;
+    int sec   = (wFatTime & 0x1f) * 2;
+    struct tm t = {0};
+    t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day;
+    t.tm_hour = hour; t.tm_min = min; t.tm_sec = sec;
+    time_t ut = mktime(&t);
+    if (ut == (time_t)-1) { *lpFileTime = 0; return 0; }
+    *lpFileTime = (uint64_t)ut * 10000000ULL + 116444736000000000ULL;
+    return 1;
+}
 
 // QueryPerformanceCounter/Frequency
 int __attribute__((ms_abi)) lsw_QueryPerformanceCounter(uint64_t* out) {
@@ -8420,6 +8611,15 @@ int __attribute__((ms_abi)) lsw_CharToOemA(const char* src, char* dst) {
 int __attribute__((ms_abi)) lsw_OemToCharA(const char* src, char* dst) {
     if (src && dst) strcpy(dst, src);
     return 1;
+}
+/* GetACP / GetOEMCP — return Windows-1252 / OEM 437 as defaults */
+uint32_t __attribute__((ms_abi)) lsw_GetACP(void)    { return 1252; }
+uint32_t __attribute__((ms_abi)) lsw_GetOEMCP(void)  { return 437; }
+/* CharPrevExA — returns pointer to previous char in string */
+const char* __attribute__((ms_abi)) lsw_CharPrevExA(uint16_t CodePage, const char* lpStart, const char* lpCurrentChar, int bDBCS) {
+    (void)CodePage; (void)bDBCS;
+    if (!lpStart || !lpCurrentChar || lpCurrentChar <= lpStart) return (const char*)lpStart;
+    return lpCurrentChar - 1;
 }
 
 // ============================================================================
@@ -9747,7 +9947,14 @@ size_t __attribute__((ms_abi)) lsw_GetLargePageMinimum(void) {
 /* FindFirstStreamW / FindNextStreamW — NTFS streams enumeration (not supported) */
 void* __attribute__((ms_abi)) lsw_FindFirstStreamW(const uint16_t* lpFileName, int InfoLevel,
                                                      void* lpFindStreamData, uint32_t dwFlags) {
-    (void)lpFileName; (void)InfoLevel; (void)lpFindStreamData; (void)dwFlags;
+    (void)InfoLevel; (void)lpFindStreamData; (void)dwFlags;
+    LSW_LOG_DEBUG("[FindFirstStreamW] called (no NTFS streams → INVALID_HANDLE_VALUE)");
+    if (lpFileName) {
+        char buf[256] = {0};
+        int i = 0;
+        while (lpFileName[i] && i < 127) { buf[i] = (char)lpFileName[i]; i++; }
+        LSW_LOG_DEBUG("[FindFirstStreamW] file=%s", buf);
+    }
     /* SetLastError(ERROR_HANDLE_EOF) — no streams */
     extern void __attribute__((ms_abi)) lsw_SetLastError(uint32_t);
     lsw_SetLastError(38); /* ERROR_HANDLE_EOF */
@@ -11756,6 +11963,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"USER32.dll", "LoadStringA",          (void*)lsw_LoadStringA},
     {"USER32.dll", "CharLowerW",           (void*)lsw_CharLowerW},
     {"USER32.dll", "CharUpperW",           (void*)lsw_CharUpperW},
+    {"USER32.dll", "CharPrevExA",          (void*)lsw_CharPrevExA},
 
     // SspiCli.dll stubs (Kerberos/NTLM auth — whoami needs these)
     {"SspiCli.dll", "GetUserNameExW",                  (void*)lsw_GetUserNameExW},
@@ -12344,6 +12552,10 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "GetLocalTime",             (void*)lsw_GetLocalTime},
     {"KERNEL32.dll", "FileTimeToSystemTime",     (void*)lsw_FileTimeToSystemTime},
     {"KERNEL32.dll", "SystemTimeToFileTime",     (void*)lsw_SystemTimeToFileTime},
+    {"KERNEL32.dll", "LocalFileTimeToFileTime",  (void*)lsw_LocalFileTimeToFileTime},
+    {"KERNEL32.dll", "DosDateTimeToFileTime",    (void*)lsw_DosDateTimeToFileTime},
+    {"KERNEL32.dll", "GetACP",                   (void*)lsw_GetACP},
+    {"KERNEL32.dll", "GetOEMCP",                 (void*)lsw_GetOEMCP},
     {"KERNEL32.dll", "QueryPerformanceCounter",  (void*)lsw_QueryPerformanceCounter},
     {"KERNEL32.dll", "QueryPerformanceFrequency",(void*)lsw_QueryPerformanceFrequency},
     {"KERNEL32.dll", "AllocConsole",             (void*)lsw_AllocConsole},
@@ -12917,7 +13129,7 @@ static const win32_api_mapping_t api_mappings[] = {
 static const size_t api_mappings_count = sizeof(api_mappings) / sizeof(api_mappings[0]);
 
 // Generic stub for unresolved functions
-static int generic_stub(void) {
+static int __attribute__((ms_abi)) generic_stub(void) {
     void* caller = __builtin_return_address(0);
     LSW_LOG_WARN("Called unresolved Win32 API function (called from %p) - returning 0", caller);
     return 0;
@@ -12988,21 +13200,50 @@ static const lsw_ordinal_entry_t ordinal_table[] = {
     /* ntdll.dll — ordinals used by some apps */
     {"ntdll.dll",   0, "RtlAllocateHeap"},
     {"ntdll.dll",   2, "RtlFreeHeap"},
-    /* OLEAUT32.dll BSTR functions — exported by ordinal */
-    {"OLEAUT32.dll",  2, "SysAllocString"},
-    {"OLEAUT32.dll",  3, "SysReAllocString"},
-    {"OLEAUT32.dll",  4, "SysAllocStringLen"},
-    {"OLEAUT32.dll",  5, "SysReAllocStringLen"},
-    {"OLEAUT32.dll",  6, "SysFreeString"},
-    {"OLEAUT32.dll",  7, "SysStringLen"},
-    {"OLEAUT32.dll",  8, "SysStringByteLen"},
-    {"OLEAUT32.dll",  9, "SysAllocStringByteLen"},
-    {"OLEAUT32.dll", 10, "SysAllocStringByteLen"},  /* alias ordinal 10 */
-    {"OLEAUT32.dll", 12, "VariantInit"},             /* Variant init — VT_EMPTY */
-    {"OLEAUT32.dll", 13, "VariantClear"},
-    {"OLEAUT32.dll", 14, "VariantCopy"},
-    {"OLEAUT32.dll", 16, "VariantChangeType"},
-    {"OLEAUT32.dll", 150, "VariantTimeToSystemTime"},/* Var time conversions */
+    /* OLEAUT32.dll — ordinal table based on Windows 10 x64 OLEAUT32.dll exports */
+    {"OLEAUT32.dll",   2, "SysAllocString"},
+    {"OLEAUT32.dll",   3, "SysReAllocString"},
+    {"OLEAUT32.dll",   4, "SysAllocStringLen"},
+    {"OLEAUT32.dll",   5, "SysReAllocStringLen"},
+    {"OLEAUT32.dll",   6, "SysFreeString"},
+    {"OLEAUT32.dll",   7, "SysStringLen"},
+    {"OLEAUT32.dll",   8, "VariantInit"},
+    {"OLEAUT32.dll",   9, "VariantClear"},
+    {"OLEAUT32.dll",  10, "VariantCopy"},
+    {"OLEAUT32.dll",  11, "VariantCopyInd"},
+    {"OLEAUT32.dll",  12, "VariantChangeType"},
+    {"OLEAUT32.dll",  15, "SafeArrayCreate"},
+    {"OLEAUT32.dll",  16, "SafeArrayDestroy"},
+    {"OLEAUT32.dll",  17, "SafeArrayGetDim"},
+    {"OLEAUT32.dll",  18, "SafeArrayGetElemsize"},
+    {"OLEAUT32.dll",  19, "SafeArrayGetUBound"},
+    {"OLEAUT32.dll",  20, "SafeArrayGetLBound"},
+    {"OLEAUT32.dll",  21, "SafeArrayLock"},
+    {"OLEAUT32.dll",  22, "SafeArrayUnlock"},
+    {"OLEAUT32.dll",  23, "SafeArrayAccessData"},
+    {"OLEAUT32.dll",  24, "SafeArrayUnaccessData"},
+    {"OLEAUT32.dll",  25, "SafeArrayGetElement"},
+    {"OLEAUT32.dll",  26, "SafeArrayPutElement"},
+    {"OLEAUT32.dll",  27, "SafeArrayCopy"},
+    {"OLEAUT32.dll",  36, "SafeArrayAllocDescriptor"},
+    {"OLEAUT32.dll",  37, "SafeArrayAllocData"},
+    {"OLEAUT32.dll",  38, "SafeArrayDestroyDescriptor"},
+    {"OLEAUT32.dll",  39, "SafeArrayDestroyData"},
+    {"OLEAUT32.dll",  40, "SafeArrayRedim"},
+    {"OLEAUT32.dll",  42, "SafeArrayCreateEx"},
+    {"OLEAUT32.dll",  43, "SafeArrayCreateVectorEx"},
+    {"OLEAUT32.dll",  44, "SafeArraySetRecordInfo"},
+    {"OLEAUT32.dll",  45, "SafeArrayGetRecordInfo"},
+    {"OLEAUT32.dll",  57, "SafeArraySetIID"},
+    {"OLEAUT32.dll",  67, "SafeArrayGetIID"},
+    {"OLEAUT32.dll",  77, "SafeArrayGetVartype"},
+    {"OLEAUT32.dll", 147, "VariantChangeTypeEx"},
+    {"OLEAUT32.dll", 148, "SafeArrayPtrOfIndex"},
+    {"OLEAUT32.dll", 149, "SysStringByteLen"},
+    {"OLEAUT32.dll", 150, "SysAllocStringByteLen"},
+    {"OLEAUT32.dll", 184, "SystemTimeToVariantTime"},
+    {"OLEAUT32.dll", 185, "VariantTimeToSystemTime"},
+    {"OLEAUT32.dll", 411, "SafeArrayCreateVector"},
     /* {sentinel} */
     {NULL, 0, NULL}
 };

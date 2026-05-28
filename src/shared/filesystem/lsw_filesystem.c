@@ -49,6 +49,17 @@ lsw_status_t lsw_fs_win_to_linux(
     // Load config if needed
     ensure_config();
 
+    /* Strip extended-length path prefix (\\?\\  or  //?/).
+     * \\\\?\\\\C:\\\\foo  -> C:\\\\foo
+     * \\\\?\\\\UNC\\\\server -> \\\\\\\\server */
+    if (strncmp(windows_path, "\\\\?\\UNC\\", 7) == 0 ||
+        strncmp(windows_path, "//?/UNC/", 8) == 0) {
+        windows_path += 7;
+    } else if (strncmp(windows_path, "\\\\?\\", 4) == 0 ||
+               strncmp(windows_path, "//?/", 4) == 0) {
+        windows_path += 4;
+    }
+
     // Check for drive letter (C:, D:, etc.)
     if (strlen(windows_path) >= 2 && windows_path[1] == ':') {
         char drive = toupper(windows_path[0]);
