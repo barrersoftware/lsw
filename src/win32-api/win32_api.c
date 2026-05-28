@@ -48,6 +48,7 @@
 #include <semaphore.h>   /* sem_t — for CreateSemaphore */
 #include <sys/timerfd.h> /* timerfd_create — for waitable timers */
 #include <poll.h>        /* poll — for IOCP wait */
+#include <execinfo.h>   /* backtrace, backtrace_symbols_fd */
 #include <setjmp.h>      /* longjmp — for C++ exception delivery */
 #include <pwd.h>         /* getpwuid — for username lookup */
 
@@ -2345,9 +2346,29 @@ void __attribute__((ms_abi)) lsw_SetUnhandledExceptionFilter(void* handler) {
 
 /* UnhandledExceptionFilter — called when no handler catches an exception; return EXCEPTION_EXECUTE_HANDLER (1) */
 int __attribute__((ms_abi)) lsw_UnhandledExceptionFilter(void* pExceptionInfo) {
-    (void)pExceptionInfo;
-    LSW_LOG_ERROR("UnhandledExceptionFilter called — terminating");
-    return 1; /* EXCEPTION_EXECUTE_HANDLER */
+    uint32_t code = 0;
+    if (pExceptionInfo) {
+        /* EXCEPTION_POINTERS: first field is EXCEPTION_RECORD* */
+        uint32_t* rec = *(uint32_t**)pExceptionInfo;
+        if (rec) code = rec[0];
+    }
+
+    /* Debug print exception (0x40010006 / 0x4001000A): ignore, continue execution */
+    if (code == 0x40010006 || code == 0x4001000A)
+        return -1; /* EXCEPTION_CONTINUE_EXECUTION */
+
+    /* Breakpoint (0x80000003) or single-step (0x80000004): continue if possible */
+    if (code == 0x80000003 || code == 0x80000004)
+        return -1; /* EXCEPTION_CONTINUE_EXECUTION */
+
+    LSW_LOG_ERROR("UnhandledExceptionFilter: code=0x%08x — exiting", code);
+    /* Print Linux backtrace for diagnosis */
+    void *bt[32];
+    int n = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+
+    /* For fatal exceptions, exit cleanly rather than let PE execute DebugBreak */
+    _exit(1);
 }
 
 void __attribute__((ms_abi)) lsw_InitializeCriticalSection(void* cs) {
@@ -7282,8 +7303,22 @@ void* __attribute__((ms_abi)) lsw__aligned_realloc(void* p, size_t sz, size_t al
 size_t __attribute__((ms_abi)) lsw__msize(void* p) { return p ? malloc_usable_size(p) : 0; }
 
 // CRT init helpers
-int __attribute__((ms_abi)) lsw__initterm_e(int (**start)(void), int (**end)(void)) {
-    for (int (**fn)(void) = start; fn < end; fn++) if (*fn) { int r = (*fn)(); if (r) return r; }
+typedef int __attribute__((ms_abi)) (*initterm_e_fn_t)(void);
+int __attribute__((ms_abi)) lsw__initterm_e(initterm_e_fn_t *start, initterm_e_fn_t *end) {
+    LSW_LOG_DEBUG("_initterm_e: start=%p end=%p count=%zu", (void*)start, (void*)end,
+                 (start && end && end > start) ? (size_t)(end - start) : 0);
+    if (!start || !end || start >= end) return 0;
+    for (initterm_e_fn_t *fn = start; fn < end; fn++) {
+        if (*fn) {
+            LSW_LOG_DEBUG("_initterm_e: calling fn[%zu]=%p", (size_t)(fn - start), (void*)(uintptr_t)*fn);
+            int r = (*fn)();
+            LSW_LOG_DEBUG("_initterm_e: fn[%zu]=%p returned %d", (size_t)(fn - start), (void*)(uintptr_t)*fn, r);
+            if (r) {
+                LSW_LOG_ERROR("_initterm_e: fn[%zu]=%p FAILED with %d — aborting init", (size_t)(fn - start), (void*)(uintptr_t)*fn, r);
+                return r;
+            }
+        }
+    }
     return 0;
 }
 void __attribute__((ms_abi)) lsw___security_init_cookie(void) {}
@@ -7357,19 +7392,143 @@ int __attribute__((ms_abi)) lsw___stdio_common_vfwprintf(
     return vfwprintf((FILE*)f, fmt, ap);
 }
 
-// _configure_narrow_argv / _configure_wide_argv — CRT startup config, no-op
-void __attribute__((ms_abi)) lsw__configure_narrow_argv(int mode) { (void)mode; }
-void __attribute__((ms_abi)) lsw__configure_wide_argv(int mode)   { (void)mode; }
+// _configure_narrow_argv / _configure_wide_argv — CRT startup config, return 0 = success
+int __attribute__((ms_abi)) lsw__configure_narrow_argv(int mode) { (void)mode; return 0; }
+int __attribute__((ms_abi)) lsw__configure_wide_argv(int mode) {
+    (void)mode;
+    // Build lsw_crt_wargv from lsw_crt_argv using uint16_t (Windows UTF-16, 2 bytes/char)
+    // NOTE: Linux wchar_t is 4 bytes; Windows wchar_t is 2 bytes. We must use uint16_t.
+    int argc = lsw_crt_argc;
+    char** argv = lsw_crt_argv;
+    if (!argv || argc <= 0) return 0;
 
-// _initialize_narrow_environment / _initialize_wide_environment — no-op
-void __attribute__((ms_abi)) lsw__initialize_narrow_environment(void) {}
-void __attribute__((ms_abi)) lsw__initialize_wide_environment(void)   {}
-void __attribute__((ms_abi)) lsw__initialize_onexit_table(void* t) { (void)t; }
-void __attribute__((ms_abi)) lsw__register_onexit_function(void* t, void* fn) { (void)t; (void)fn; }
-void __attribute__((ms_abi)) lsw__execute_onexit_table(void* t) { (void)t; }
-void __attribute__((ms_abi)) lsw___p___argc(void)   {}   // Returns pointer to __argc — stubbed
-void __attribute__((ms_abi)) lsw___p___argv(void)   {}
+    uint16_t** wargv = malloc((size_t)(argc + 1) * sizeof(uint16_t*));
+    if (!wargv) return -1;
+
+    for (int i = 0; i < argc; i++) {
+        const char* s = argv[i] ? argv[i] : "";
+        size_t len = strlen(s) + 1;
+        uint16_t* ws = malloc(len * sizeof(uint16_t));
+        if (!ws) return -1;
+        for (size_t j = 0; j < len; j++) ws[j] = (uint16_t)(unsigned char)s[j];
+        wargv[i] = ws;
+    }
+    wargv[argc] = NULL;
+
+    /* Build wide command line string for GetCommandLineW (also uint16_t) */
+    if (!lsw_crt_wcmdln && lsw_crt_acmdln) {
+        size_t cmdlen = strlen(lsw_crt_acmdln) + 1;
+        uint16_t* wcmd = malloc(cmdlen * sizeof(uint16_t));
+        if (wcmd) {
+            for (size_t j = 0; j < cmdlen; j++) wcmd[j] = (uint16_t)(unsigned char)lsw_crt_acmdln[j];
+            lsw_crt_wcmdln = (wchar_t*)wcmd;
+        }
+    }
+
+    lsw_crt_wargv = (wchar_t**)wargv;
+    LSW_LOG_INFO("_configure_wide_argv: built wargv with %d args, wargv[0]='%s'",
+                 argc, argv[0] ? argv[0] : "(null)");
+    return 0;
+}
+
+// _initialize_narrow_environment / _initialize_wide_environment — return 0 = success
+int __attribute__((ms_abi)) lsw__initialize_narrow_environment(void) { return 0; }
+int __attribute__((ms_abi)) lsw__initialize_wide_environment(void) {
+    if (lsw_crt_wenvp) return 0;  // Already initialized
+    // Count environ entries
+    char** env = lsw_crt_environ ? lsw_crt_environ : environ;
+    if (!env) return 0;
+    int count = 0;
+    while (env[count]) count++;
+    // Build wide env using uint16_t (Windows UTF-16, 2 bytes/char)
+    uint16_t** wenv = malloc((size_t)(count + 1) * sizeof(uint16_t*));
+    if (!wenv) return 0;
+    for (int i = 0; i < count; i++) {
+        size_t len = strlen(env[i]) + 1;
+        uint16_t* ws = malloc(len * sizeof(uint16_t));
+        if (!ws) { wenv[i] = NULL; continue; }
+        for (size_t j = 0; j < len; j++) ws[j] = (uint16_t)(unsigned char)env[i][j];
+        wenv[i] = ws;
+    }
+    wenv[count] = NULL;
+    lsw_crt_wenvp = (wchar_t**)wenv;
+    return 0;
+}
+
+/* _onexit_table_t layout: { void** _first; void** _last; void** _end; } */
+typedef struct { void** _first; void** _last; void** _end; } lsw_onexit_table_t;
+
+int __attribute__((ms_abi)) lsw__initialize_onexit_table(void* t) {
+    if (t) {
+        lsw_onexit_table_t* tbl = (lsw_onexit_table_t*)t;
+        tbl->_first = tbl->_last = tbl->_end = NULL;
+    }
+    return 0;
+}
+int __attribute__((ms_abi)) lsw__register_onexit_function(void* t, void* fn) {
+    if (!t || !fn) return 0;
+    lsw_onexit_table_t* tbl = (lsw_onexit_table_t*)t;
+    /* grow table by 4 slots if needed */
+    if (!tbl->_first || tbl->_last >= tbl->_end) {
+        size_t old = (size_t)(tbl->_last - tbl->_first);
+        size_t cap = old + 4;
+        void** p = realloc(tbl->_first, cap * sizeof(void*));
+        if (!p) return -1;
+        tbl->_first = p;
+        tbl->_last  = p + old;
+        tbl->_end   = p + cap;
+    }
+    *tbl->_last++ = fn;
+    return 0;
+}
+void __attribute__((ms_abi)) lsw__execute_onexit_table(void* t) {
+    if (!t) return;
+    lsw_onexit_table_t* tbl = (lsw_onexit_table_t*)t;
+    if (!tbl->_first) return;
+    /* call in reverse order */
+    void** p = tbl->_last;
+    while (p > tbl->_first) {
+        --p;
+        if (*p) ((void(*)(void))(*p))();
+    }
+    free(tbl->_first);
+    tbl->_first = tbl->_last = tbl->_end = NULL;
+}
+int* __attribute__((ms_abi)) lsw___p___argc(void)     { return &lsw_crt_argc; }
+char*** __attribute__((ms_abi)) lsw___p___argv(void)  { return &lsw_crt_argv; }
+wchar_t*** __attribute__((ms_abi)) lsw___p___wargv(void) { return &lsw_crt_wargv; }
 /* lsw___p__commode defined earlier with correct int* return type */
+
+/* __current_exception / __current_exception_context — used by ucrtbase SEH */
+static void* lsw_current_exception_ptr = NULL;
+static void* lsw_current_exception_context_ptr = NULL;
+void** __attribute__((ms_abi)) lsw___current_exception(void) { return &lsw_current_exception_ptr; }
+void** __attribute__((ms_abi)) lsw___current_exception_context(void) { return &lsw_current_exception_context_ptr; }
+
+/* _register_thread_local_exe_atexit_callback — no-op for single-threaded stubs */
+void __attribute__((ms_abi)) lsw__register_thread_local_exe_atexit_callback(void* cb) { (void)cb; }
+
+/* _set_fmode / _set_new_mode / _seh_filter_exe / _resetstkoflw */
+void __attribute__((ms_abi)) lsw__set_fmode(int mode) { lsw_crt_fmode = mode; }
+void __attribute__((ms_abi)) lsw__set_new_mode(int mode) { (void)mode; }
+int __attribute__((ms_abi)) lsw__seh_filter_exe(uint32_t code, void* ep) { (void)code; (void)ep; return 0; }
+int __attribute__((ms_abi)) lsw__resetstkoflw(void) { return 1; }
+
+/* _get_initial_wide_environment — return pointer to wenvp */
+wchar_t** __attribute__((ms_abi)) lsw__get_initial_wide_environment(void) { return lsw_crt_wenvp; }
+
+/* _configthreadlocale — no-op */
+int __attribute__((ms_abi)) lsw__configthreadlocale(int per_thread) { (void)per_thread; return 0; }
+
+/* _wcstoui64 — wide string to uint64 */
+uint64_t __attribute__((ms_abi)) lsw__wcstoui64(const wchar_t* s, wchar_t** end, int base) {
+    return (uint64_t)wcstoull(s, end, base);
+}
+
+/* getwchar / getwc */
+int __attribute__((ms_abi)) lsw_getwchar(void) { return (int)getwchar(); }
+
+/* _fileno is already defined earlier; only add the missing new stubs below */
 
 // terminate / unexpected
 void __attribute__((ms_abi)) lsw__crt_atexit(void* fn) { (void)fn; }
@@ -11702,7 +11861,46 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "__security_check_cookie",     (void*)lsw___security_check_cookie},
     {"ucrtbase.dll", "__p___argc",                  (void*)lsw___p___argc},
     {"ucrtbase.dll", "__p___argv",                  (void*)lsw___p___argv},
+    {"ucrtbase.dll", "__p___wargv",                 (void*)lsw___p___wargv},
     {"ucrtbase.dll", "__p__commode",                (void*)lsw___p__commode},
+    {"ucrtbase.dll", "__current_exception",         (void*)lsw___current_exception},
+    {"ucrtbase.dll", "__current_exception_context", (void*)lsw___current_exception_context},
+    {"ucrtbase.dll", "_register_thread_local_exe_atexit_callback", (void*)lsw__register_thread_local_exe_atexit_callback},
+    /* ucrtbase.dll _o_* onecore aliases — same implementations, _o_ prefix */
+    {"ucrtbase.dll", "_o__errno",                   (void*)lsw__errno},
+    {"ucrtbase.dll", "_o__exit",                    (void*)lsw_exit},
+    {"ucrtbase.dll", "_o__cexit",                   (void*)lsw__cexit},
+    {"ucrtbase.dll", "_o__c_exit",                  (void*)lsw__c_exit},
+    {"ucrtbase.dll", "_o_exit",                     (void*)lsw_exit},
+    {"ucrtbase.dll", "_o_terminate",                (void*)lsw_abort},
+    {"ucrtbase.dll", "_o_fflush",                   (void*)lsw_fflush},
+    {"ucrtbase.dll", "_o_getwchar",                 (void*)lsw_getwchar},
+    {"ucrtbase.dll", "_o__fileno",                  (void*)lsw__fileno},
+    {"ucrtbase.dll", "_o__get_osfhandle",            (void*)lsw__get_osfhandle},
+    {"ucrtbase.dll", "_o__memicmp",                 (void*)lsw__memicmp},
+    {"ucrtbase.dll", "_o__wcstoui64",               (void*)lsw__wcstoui64},
+    {"ucrtbase.dll", "_o_wcstol",                   (void*)lsw_wcstol},
+    {"ucrtbase.dll", "_o_wcstoul",                  (void*)lsw_wcstoul},
+    {"ucrtbase.dll", "_o__set_app_type",             (void*)lsw__set_app_type},
+    {"ucrtbase.dll", "_o__set_fmode",               (void*)lsw__set_fmode},
+    {"ucrtbase.dll", "_o__set_new_mode",             (void*)lsw__set_new_mode},
+    {"ucrtbase.dll", "_o__seh_filter_exe",           (void*)lsw__seh_filter_exe},
+    {"ucrtbase.dll", "_o__resetstkoflw",             (void*)lsw__resetstkoflw},
+    {"ucrtbase.dll", "_o__get_initial_wide_environment", (void*)lsw__get_initial_wide_environment},
+    {"ucrtbase.dll", "_o__initialize_wide_environment",  (void*)lsw__initialize_wide_environment},
+    {"ucrtbase.dll", "_o__configure_wide_argv",     (void*)lsw__configure_wide_argv},
+    {"ucrtbase.dll", "_o__configthreadlocale",      (void*)lsw__configthreadlocale},
+    {"ucrtbase.dll", "_o__initialize_onexit_table", (void*)lsw__initialize_onexit_table},
+    {"ucrtbase.dll", "_o__register_onexit_function",(void*)lsw__register_onexit_function},
+    {"ucrtbase.dll", "_o__crt_atexit",              (void*)lsw__crt_atexit},
+    {"ucrtbase.dll", "_o___acrt_iob_func",          (void*)lsw___acrt_iob_func},
+    {"ucrtbase.dll", "_o___stdio_common_vfprintf",  (void*)lsw___stdio_common_vfprintf},
+    {"ucrtbase.dll", "_o___stdio_common_vswprintf", (void*)lsw___stdio_common_vswprintf},
+    {"ucrtbase.dll", "_o___p___argc",               (void*)lsw___p___argc},
+    {"ucrtbase.dll", "_o___p___wargv",              (void*)lsw___p___wargv},
+    {"ucrtbase.dll", "_o___p__commode",             (void*)lsw___p__commode},
+    {"ucrtbase.dll", "__C_specific_handler",        (void*)lsw___C_specific_handler},
+    {"ucrtbase.dll", "_c_exit",                     (void*)lsw__c_exit},
     /* ucrtbase.dll — memory/string/time/IO */
     {"ucrtbase.dll", "malloc",       (void*)lsw_malloc},
     {"ucrtbase.dll", "free",         (void*)lsw_free},

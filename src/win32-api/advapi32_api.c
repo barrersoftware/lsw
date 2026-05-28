@@ -31,12 +31,12 @@ extern int __attribute__((ms_abi)) lsw_EnumDependentServicesW(void* hService,
  * Registry helper layer — bridge Win32 HKEY world to lsw_registry.c
  * =========================================================================*/
 
-/* Win32 predefined HKEY pseudo-handle values */
-#define W32_HKCR  ((HKEY)(uintptr_t)0x80000000UL)
-#define W32_HKCU  ((HKEY)(uintptr_t)0x80000001UL)
-#define W32_HKLM  ((HKEY)(uintptr_t)0x80000002UL)
-#define W32_HKU   ((HKEY)(uintptr_t)0x80000003UL)
-#define W32_HKCC  ((HKEY)(uintptr_t)0x80000005UL)
+/* Win32 predefined HKEY pseudo-handle values — use sign-extended 64-bit form */
+#define W32_HKCR  ((HKEY)(intptr_t)(int32_t)0x80000000)
+#define W32_HKCU  ((HKEY)(intptr_t)(int32_t)0x80000001)
+#define W32_HKLM  ((HKEY)(intptr_t)(int32_t)0x80000002)
+#define W32_HKU   ((HKEY)(intptr_t)(int32_t)0x80000003)
+#define W32_HKCC  ((HKEY)(intptr_t)(int32_t)0x80000005)
 
 /* Win32 REG value type constants */
 #define REG_NONE                0
@@ -184,9 +184,11 @@ LSTATUS __attribute__((ms_abi)) lsw_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, D
     char subkey[512] = {0};
     LSW_UNUSED(ulOptions); LSW_UNUSED(samDesired);
     if (lpSubKey) wstr_to_utf8(lpSubKey, subkey, sizeof(subkey));
+    LSW_LOG_DEBUG("RegOpenKeyExW: hKey=%p subKey='%s'", hKey, subkey);
     HANDLE h = reg_open_or_create(hKey, subkey[0] ? subkey : NULL, 0);
-    if (!h) return 2L; /* ERROR_FILE_NOT_FOUND */
+    if (!h) { LSW_LOG_DEBUG("RegOpenKeyExW: NOT FOUND -> 2"); return 2L; }
     if (phkResult) *phkResult = (HKEY)h;
+    LSW_LOG_DEBUG("RegOpenKeyExW: SUCCESS -> handle=%p", h);
     return 0L;
 }
 
@@ -199,6 +201,7 @@ LSTATUS __attribute__((ms_abi)) lsw_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DW
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegCloseKey(HKEY hKey) {
+    LSW_LOG_INFO("RegCloseKey: hKey=%p", hKey);
     lsw_hkey_t dummy;
     if (w32_hkey_to_lsw(hKey, &dummy)) return 0L; /* predefined handle — no-op */
     return lsw_status_to_w32(lsw_reg_close_key((HANDLE)hKey));
@@ -208,6 +211,7 @@ LSTATUS __attribute__((ms_abi)) lsw_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueN
     char name[256] = {0};
     LSW_UNUSED(lpReserved);
     if (lpValueName) wstr_to_utf8(lpValueName, name, sizeof(name));
+    LSW_LOG_INFO("RegQueryValueExW: hKey=%p value='%s'", hKey, name);
     lsw_hkey_t lhk;
     HANDLE h;
     /* If predefined handle, open root key first */
@@ -339,6 +343,7 @@ LSTATUS __attribute__((ms_abi)) lsw_RegDeleteValueA(HKEY hKey, LPCSTR lpValueNam
 
 LSTATUS __attribute__((ms_abi)) lsw_RegEnumKeyExW(HKEY hKey, DWORD dwIndex, LPWSTR lpName, DWORD* lpcchName, DWORD* lpReserved, LPWSTR lpClass, DWORD* lpcchClass, void* lpftLastWriteTime) {
     LSW_UNUSED(lpReserved); LSW_UNUSED(lpClass); LSW_UNUSED(lpcchClass); LSW_UNUSED(lpftLastWriteTime);
+    LSW_LOG_INFO("RegEnumKeyExW: hKey=%p index=%u", hKey, (unsigned)dwIndex);
     if (!lpName || !lpcchName || *lpcchName == 0) return 234L; /* ERROR_MORE_DATA */
     lsw_hkey_t lhk;
     HANDLE h;
@@ -421,16 +426,57 @@ LSTATUS __attribute__((ms_abi)) lsw_RegEnumValueA(HKEY hKey, DWORD dwIndex, LPST
 }
 
 LSTATUS __attribute__((ms_abi)) lsw_RegQueryInfoKeyW(HKEY hKey, LPWSTR lpClass, DWORD* lpcchClass, DWORD* lpReserved, DWORD* lpcSubKeys, DWORD* lpcbMaxSubKeyLen, DWORD* lpcbMaxClassLen, DWORD* lpcValues, DWORD* lpcbMaxValueNameLen, DWORD* lpcbMaxValueLen, DWORD* lpcbSecurityDescriptor, void* lpftLastWriteTime) {
-    LSW_UNUSED(hKey); LSW_UNUSED(lpReserved); LSW_UNUSED(lpftLastWriteTime);
+    LSW_UNUSED(lpReserved); LSW_UNUSED(lpftLastWriteTime);
+    LSW_LOG_DEBUG("RegQueryInfoKeyW: hKey=%p", hKey);
+
+    /* Get/open the handle — predefined keys must be opened first */
+    HANDLE h = NULL;
+    lsw_hkey_t lhk;
+    if (w32_hkey_to_lsw(hKey, &lhk)) {
+        lsw_reg_open_key(lhk, NULL, &h);
+    } else {
+        h = (HANDLE)hKey;
+    }
+
     if (lpClass && lpcchClass && *lpcchClass > 0) lpClass[0] = 0;
     if (lpcchClass) *lpcchClass = 0;
-    if (lpcSubKeys) *lpcSubKeys = 0;
-    if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = 0;
     if (lpcbMaxClassLen) *lpcbMaxClassLen = 0;
-    if (lpcValues) *lpcValues = 0;
-    if (lpcbMaxValueNameLen) *lpcbMaxValueNameLen = 0;
-    if (lpcbMaxValueLen) *lpcbMaxValueLen = 0;
     if (lpcbSecurityDescriptor) *lpcbSecurityDescriptor = 0;
+
+    /* Count subkeys */
+    uint32_t num_subkeys = 0, max_subkey_len = 0;
+    if (h) {
+        char namebuf[512];
+        for (uint32_t idx = 0; ; idx++) {
+            if (lsw_reg_enum_keys(h, idx, namebuf, sizeof(namebuf)) != LSW_SUCCESS) break;
+            num_subkeys++;
+            size_t nl = strlen(namebuf);
+            if (nl > max_subkey_len) max_subkey_len = (uint32_t)nl;
+        }
+    }
+    if (lpcSubKeys) *lpcSubKeys = num_subkeys;
+    if (lpcbMaxSubKeyLen) *lpcbMaxSubKeyLen = max_subkey_len;
+
+    /* Count values */
+    uint32_t num_values = 0, max_val_name_len = 0, max_val_data_len = 0;
+    if (h) {
+        char namebuf[512];
+        lsw_reg_type_t type;
+        for (uint32_t idx = 0; ; idx++) {
+            if (lsw_reg_enum_values(h, idx, namebuf, sizeof(namebuf), &type) != LSW_SUCCESS) break;
+            num_values++;
+            size_t nl = strlen(namebuf);
+            if (nl > max_val_name_len) max_val_name_len = (uint32_t)nl;
+        }
+    }
+    if (lpcValues) *lpcValues = num_values;
+    if (lpcbMaxValueNameLen) *lpcbMaxValueNameLen = max_val_name_len;
+    if (lpcbMaxValueLen) *lpcbMaxValueLen = max_val_data_len;
+
+    /* Close temporary handle if we opened it for predefined key */
+    if (h && w32_hkey_to_lsw(hKey, &lhk)) lsw_reg_close_key(h);
+
+    LSW_LOG_DEBUG("RegQueryInfoKeyW: subkeys=%u values=%u", num_subkeys, num_values);
     return 0L;
 }
 

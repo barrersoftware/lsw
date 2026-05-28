@@ -351,6 +351,7 @@ static void lsw_signal_handler(int sig, siginfo_t* si, void* ctx) {
         case SIGILL:  code = WIN_EXCEPTION_ILLEGAL_INSTRUCTION; break;
         case SIGFPE:  code = WIN_EXCEPTION_INT_DIVIDE_BY_ZERO;  break;
         case SIGBUS:  code = WIN_EXCEPTION_ACCESS_VIOLATION;    break;
+        case SIGTRAP: code = 0x80000003; /* EXCEPTION_BREAKPOINT */ break;
         default:      code = 0xC0000000 | (uint32_t)sig;       break;
     }
 
@@ -371,7 +372,8 @@ static void lsw_install_signal_handlers(void) {
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
-    LSW_LOG_INFO("SEH signal handlers installed (SIGSEGV/SIGILL/SIGFPE/SIGBUS)");
+    sigaction(SIGTRAP, &sa, NULL);
+    LSW_LOG_INFO("SEH signal handlers installed (SIGSEGV/SIGILL/SIGFPE/SIGBUS/SIGTRAP)");
 }
 
 bool pe_load_image(pe_image_t* image, const char* filepath) {
