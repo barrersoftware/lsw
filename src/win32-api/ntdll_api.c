@@ -474,6 +474,42 @@ NTSTATUS __attribute__((ms_abi)) lsw_NtTerminateProcess(void* handle, NTSTATUS e
 }
 
 /* ------------------------------------------------------------------
+ * NtQueryInformationProcess — returns basic process info
+ * class 0 = ProcessBasicInformation (PBI): ExitStatus, PEB, Affinity,
+ *           Priority, UniqueProcessId, InheritedFromUniqueProcessId
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int32_t   ExitStatus;
+    void*     PebBaseAddress;
+    uintptr_t AffinityMask;
+    int32_t   BasePriority;
+    uintptr_t UniqueProcessId;
+    uintptr_t InheritedFromUniqueProcessId;
+} LSW_PROCESS_BASIC_INFORMATION;
+
+NTSTATUS __attribute__((ms_abi)) lsw_NtQueryInformationProcess(
+    void* handle, uint32_t info_class,
+    void* buf, uint32_t len, uint32_t* ret_len)
+{
+    if (ret_len) *ret_len = 0;
+    if (!buf || len == 0) return STATUS_SUCCESS;
+    memset(buf, 0, len);
+    if (info_class == 0) { /* ProcessBasicInformation */
+        if (len >= sizeof(LSW_PROCESS_BASIC_INFORMATION)) {
+            LSW_PROCESS_BASIC_INFORMATION* pbi = (LSW_PROCESS_BASIC_INFORMATION*)buf;
+            pbi->ExitStatus                   = 259; /* STILL_ACTIVE */
+            pbi->UniqueProcessId              = (uintptr_t)getpid();
+            pbi->InheritedFromUniqueProcessId = (uintptr_t)getppid();
+            pbi->BasePriority                 = 8; /* NORMAL_PRIORITY_CLASS */
+            pbi->AffinityMask                 = 0x3F; /* 6 cores */
+            if (ret_len) *ret_len = sizeof(LSW_PROCESS_BASIC_INFORMATION);
+        }
+    }
+    LSW_LOG_DEBUG("NtQueryInformationProcess(handle=%p, class=%u)", handle, info_class);
+    return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------
  * NtQuerySystemInformation — minimal stub
  * Needed by the CRT and various profiling tools.
  * ------------------------------------------------------------------ */
@@ -639,6 +675,70 @@ int __attribute__((ms_abi)) lsw_RtlTimeFieldsToTime(LSW_TIME_FIELDS* tf, uint64_
 }
 
 /* ------------------------------------------------------------------
+ * RtlTimeToElapsedTimeFields — convert 100-ns ticks to TIME_FIELDS
+ * Used by tasklist.exe to format elapsed CPU time.
+ * ------------------------------------------------------------------ */
+void __attribute__((ms_abi)) lsw_RtlTimeToElapsedTimeFields(
+    uint64_t* Time, LSW_TIME_FIELDS* Fields)
+{
+    if (!Time || !Fields) return;
+    uint64_t ticks   = *Time;
+    uint64_t ms      = ticks / 10000ULL;
+    uint64_t secs    = ms / 1000; ms %= 1000;
+    uint64_t mins    = secs / 60; secs %= 60;
+    uint64_t hours   = mins / 60; mins %= 60;
+    uint64_t days    = hours / 24; hours %= 24;
+    Fields->Milliseconds = (uint16_t)ms;
+    Fields->Second       = (uint16_t)secs;
+    Fields->Minute       = (uint16_t)mins;
+    Fields->Hour         = (uint16_t)hours;
+    Fields->Day          = (uint16_t)days;
+    Fields->Month        = 0;
+    Fields->Year         = 0;
+    Fields->Weekday      = 0;
+}
+
+/* ------------------------------------------------------------------
+ * RtlLargeIntegerToChar — convert LARGE_INTEGER to string
+ * Signature: NTSTATUS RtlLargeIntegerToChar(PLARGE_INTEGER Value, ULONG Base,
+ *            LONG Length, PCHAR String);
+ * ------------------------------------------------------------------ */
+int32_t __attribute__((ms_abi)) lsw_RtlLargeIntegerToChar(
+    int64_t* Value, uint32_t Base, int32_t Length, char* String)
+{
+    if (!Value || !String || Length <= 0) return 0xC000000D; /* STATUS_INVALID_PARAMETER */
+    if (Base == 0) Base = 10;
+    int64_t v = *Value;
+    char buf[66]; int pos = 0;
+    int neg = (v < 0 && Base == 10);
+    uint64_t uv = neg ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+    if (uv == 0) { buf[pos++] = '0'; }
+    else while (uv > 0) {
+        int d = (int)(uv % Base);
+        buf[pos++] = (d < 10) ? ('0' + d) : ('a' + d - 10);
+        uv /= Base;
+    }
+    if (neg) buf[pos++] = '-';
+    /* reverse */
+    for (int i = 0, j = pos-1; i < j; i++, j--) { char t = buf[i]; buf[i] = buf[j]; buf[j] = t; }
+    buf[pos] = '\0';
+    if (pos + 1 > Length) return 0xC0000023; /* STATUS_BUFFER_TOO_SMALL */
+    for (int i = 0; i <= pos; i++) String[i] = buf[i];
+    return 0; /* STATUS_SUCCESS */
+}
+
+/* ------------------------------------------------------------------
+ * RtlQueryPackageIdentity — we are not a packaged app
+ * ------------------------------------------------------------------ */
+int32_t __attribute__((ms_abi)) lsw_RtlQueryPackageIdentity(void* TokenObject,
+    uint16_t* PackageFullName, uint64_t* PackageSize,
+    uint16_t* AppId, uint64_t* AppIdSize, uint8_t* DynamicId) {
+    (void)TokenObject; (void)PackageFullName; (void)PackageSize;
+    (void)AppId; (void)AppIdSize; (void)DynamicId;
+    return 0xC0000225; /* STATUS_NOT_FOUND */
+}
+
+/* ------------------------------------------------------------------
  * Thread / token stubs (privilege management — no-ops on Linux)
  * ------------------------------------------------------------------ */
 int __attribute__((ms_abi)) lsw_NtSetInformationThread(void* hThread, int cls, void* info, uint32_t len) {
@@ -790,6 +890,7 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     /* Process / thread */
     {"ntdll.dll", "NtTerminateProcess",            (void*)lsw_NtTerminateProcess},
     {"ntdll.dll", "NtQuerySystemInformation",      (void*)lsw_NtQuerySystemInformation},
+    {"ntdll.dll", "NtQueryInformationProcess",     (void*)lsw_NtQueryInformationProcess},
     {"ntdll.dll", "NtQueryVirtualMemory",          (void*)lsw_NtQueryVirtualMemory},
     {"ntdll.dll", "NtClose",                       (void*)lsw_NtClose},
     {"ntdll.dll", "RtlExitUserProcess",            (void*)lsw_RtlExitUserProcess},
@@ -804,6 +905,7 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     {"ntdll.dll", "NtQuerySystemTime",             (void*)lsw_NtQuerySystemTime},
     {"ntdll.dll", "RtlTimeToSecondsSince1970",     (void*)lsw_RtlTimeToSecondsSince1970},
     {"ntdll.dll", "RtlTimeFieldsToTime",           (void*)lsw_RtlTimeFieldsToTime},
+    {"ntdll.dll", "RtlTimeToElapsedTimeFields",    (void*)lsw_RtlTimeToElapsedTimeFields},
     /* Thread / token (no-ops) */
     {"ntdll.dll", "NtSetInformationThread",        (void*)lsw_NtSetInformationThread},
     {"ntdll.dll", "NtAdjustPrivilegesToken",       (void*)lsw_NtAdjustPrivilegesToken},
@@ -818,6 +920,10 @@ const win32_api_mapping_t win32_api_ntdll_mappings[] = {
     {"ntdll.dll", "RtlCopySid",                    (void*)lsw_RtlCopySid},
     /* Product type */
     {"ntdll.dll", "RtlGetNtProductType",           (void*)lsw_RtlGetNtProductType},
+    /* Integer conversion */
+    {"ntdll.dll", "RtlLargeIntegerToChar",         (void*)lsw_RtlLargeIntegerToChar},
+    /* Package identity — always fails, not a packaged app */
+    {"ntdll.dll", "RtlQueryPackageIdentity",       (void*)lsw_RtlQueryPackageIdentity},
     /* Sentinel */
     {NULL, NULL, NULL}
 };

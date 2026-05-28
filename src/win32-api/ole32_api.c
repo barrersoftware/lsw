@@ -582,6 +582,19 @@ int32_t __attribute__((ms_abi)) lsw_CoTreatAsClass(const GUID* clsidOld, const G
     return S_OK;
 }
 
+/* CoInitializeSecurity — called by COM apps (e.g. tasklist) to set security;
+ * we have no real COM server so always succeed. */
+int32_t __attribute__((ms_abi)) lsw_CoInitializeSecurity(
+    void* pSecDesc, int32_t cAuthSvc, void* asAuthSvc,
+    void* pReserved1, uint32_t dwAuthnLevel, uint32_t dwImpLevel,
+    void* pAuthList, uint32_t dwCapabilities, void* pReserved3)
+{
+    (void)pSecDesc; (void)cAuthSvc; (void)asAuthSvc; (void)pReserved1;
+    (void)dwAuthnLevel; (void)dwImpLevel; (void)pAuthList;
+    (void)dwCapabilities; (void)pReserved3;
+    return S_OK; /* 0 */
+}
+
 const win32_api_mapping_t win32_api_ole32_mappings[] = {
     {"ole32.dll", "CoInitialize", (void*)lsw_CoInitialize},
     {"ole32.dll", "CoInitializeEx", (void*)lsw_CoInitializeEx},
@@ -640,6 +653,8 @@ const win32_api_mapping_t win32_api_ole32_mappings[] = {
     {"ole32.dll", "CoFreeAllLibraries", (void*)lsw_CoFreeAllLibraries},
     {"ole32.dll", "CoGetTreatAsClass", (void*)lsw_CoGetTreatAsClass},
     {"ole32.dll", "CoTreatAsClass", (void*)lsw_CoTreatAsClass},
+    /* CoInitializeSecurity — tasklist/COM apps call this; return S_OK */
+    {"ole32.dll", "CoInitializeSecurity", (void*)lsw_CoInitializeSecurity},
     {NULL, NULL, NULL}
 };
 

@@ -44,6 +44,12 @@ typedef int      BOOL;
  * BCrypt (bcrypt.dll)
  * ========================================================================= */
 
+/* Forward declarations for functions defined in win32_api.c */
+extern int __attribute__((ms_abi)) lsw_LoadStringW(void* hInstance, uint32_t uID, uint16_t* lpBuffer, int cchBuffer);
+extern int __attribute__((ms_abi)) lsw_LoadStringA(void* hInstance, uint32_t uID, char* lpBuffer, int cchBuffer);
+extern uint64_t __attribute__((ms_abi)) lsw_VerSetConditionMask(uint64_t ConditionMask, uint32_t TypeMask, uint8_t Condition);
+extern void __attribute__((ms_abi)) lsw_SetLastError(uint32_t code);
+
 typedef struct {
     uint32_t magic;   /* 0xBC007400 */
     char     alg[64]; /* algorithm name */
@@ -1022,7 +1028,159 @@ DWORD MSABI lsw_GetSystemDefaultLCID(void) { return 0x0409; }
 DWORD MSABI lsw_GetUserDefaultUILanguage(void) { return 0x0409; }
 DWORD MSABI lsw_GetSystemDefaultUILanguage(void) { return 0x0409; }
 
-/* GetDateFormatEx / GetTimeFormatEx — games show clocks/dates */
+/* GetLocaleInfoW/A — return en-US locale data (LCID 0x0409) */
+int MSABI lsw_GetLocaleInfoW(uint32_t Locale, uint32_t LCType, uint16_t* lpLCData, int cchData) {
+    (void)Locale;
+    /* Strip override/flag bits */
+    uint32_t type = LCType & 0x000FFFFF;
+    const char* s = NULL;
+    uint32_t num  = 0;
+    int return_num = (LCType & 0x20000000) != 0;
+
+    switch (type) {
+        case 0x0001: s = "0409"; break;          /* LOCALE_ILANGUAGE */
+        case 0x0002: s = "English (United States)"; break; /* LOCALE_SLANGUAGE */
+        case 0x0003: s = "ENU"; break;           /* LOCALE_SABBREVLANGNAME */
+        case 0x0004: s = "English"; break;        /* LOCALE_SNATIVELANGNAME */
+        case 0x0005: s = "1"; break;             /* LOCALE_ICOUNTRY */
+        case 0x0006: s = "United States"; break; /* LOCALE_SCOUNTRY */
+        case 0x0007: s = "USA"; break;           /* LOCALE_SABBREVCTRYNAME */
+        case 0x0008: s = "United States"; break; /* LOCALE_SNATIVECTRYNAME */
+        case 0x000B: s = "437"; break;           /* LOCALE_IDEFAULTCODEPAGE */
+        case 0x000E: s = "."; break;             /* LOCALE_SDECIMAL */
+        case 0x000F: s = ","; break;             /* LOCALE_STHOUSAND */
+        case 0x0010: s = "3;0"; break;           /* LOCALE_SGROUPING */
+        case 0x0011: s = "2"; break;             /* LOCALE_IDIGITS */
+        case 0x0012: s = "1"; break;             /* LOCALE_ILZERO */
+        case 0x0013: s = "0123456789"; break;    /* LOCALE_SNATIVEDIGITS */
+        case 0x0014: s = "$"; break;             /* LOCALE_SCURRENCY */
+        case 0x0015: s = "USD"; break;           /* LOCALE_SINTLSYMBOL */
+        case 0x0016: s = "."; break;             /* LOCALE_SMONDECIMALSEP */
+        case 0x0017: s = ","; break;             /* LOCALE_SMONTHOUSANDSEP */
+        case 0x0018: s = "3;0"; break;           /* LOCALE_SMONGROUPING */
+        case 0x0019: s = "2"; break;             /* LOCALE_ICURRDIGITS */
+        case 0x001A: s = "2"; break;             /* LOCALE_IINTLCURRDIGITS */
+        case 0x001B: s = "0"; break;             /* LOCALE_ICURRENCY */
+        case 0x001C: s = "0"; break;             /* LOCALE_INEGCURR */
+        case 0x001D: s = "/"; break;             /* LOCALE_SDATE (deprecated) */
+        case 0x001E: s = ":"; break;             /* LOCALE_STIME (deprecated) */
+        case 0x001F: s = "M/d/yyyy"; break;      /* LOCALE_SSHORTDATE */
+        case 0x0020: s = "dddd, MMMM d, yyyy"; break; /* LOCALE_SLONGDATE */
+        case 0x0021: s = "0"; break;             /* LOCALE_IDATE */
+        case 0x0022: s = "0"; break;             /* LOCALE_ILDATE */
+        case 0x0023: s = "0"; break;             /* LOCALE_ITIME (12-hour) */
+        case 0x0024: s = "1"; break;             /* LOCALE_ICENTURY */
+        case 0x0025: s = "0"; break;             /* LOCALE_ITLZERO */
+        case 0x0026: s = "0"; break;             /* LOCALE_IDAYLZERO */
+        case 0x0027: s = "0"; break;             /* LOCALE_IMONLZERO */
+        case 0x0028: s = "AM"; break;            /* LOCALE_S1159 */
+        case 0x0029: s = "PM"; break;            /* LOCALE_S2359 */
+        case 0x002A: s = "Monday"; break;        /* LOCALE_SDAYNAME1 */
+        case 0x002B: s = "Tuesday"; break;
+        case 0x002C: s = "Wednesday"; break;
+        case 0x002D: s = "Thursday"; break;
+        case 0x002E: s = "Friday"; break;
+        case 0x002F: s = "Saturday"; break;
+        case 0x0030: s = "Sunday"; break;        /* LOCALE_SDAYNAME7 */
+        case 0x0031: s = "Mon"; break;           /* LOCALE_SABBREVDAYNAME1 */
+        case 0x0032: s = "Tue"; break;
+        case 0x0033: s = "Wed"; break;
+        case 0x0034: s = "Thu"; break;
+        case 0x0035: s = "Fri"; break;
+        case 0x0036: s = "Sat"; break;
+        case 0x0037: s = "Sun"; break;
+        case 0x0038: s = "January"; break;       /* LOCALE_SMONTHNAME1 */
+        case 0x0039: s = "February"; break;
+        case 0x003A: s = "March"; break;
+        case 0x003B: s = "April"; break;
+        case 0x003C: s = "May"; break;
+        case 0x003D: s = "June"; break;
+        case 0x003E: s = "July"; break;
+        case 0x003F: s = "August"; break;
+        case 0x0040: s = "September"; break;
+        case 0x0041: s = "October"; break;
+        case 0x0042: s = "November"; break;
+        case 0x0043: s = "December"; break;
+        case 0x0044: s = "Jan"; break;           /* LOCALE_SABBREVMONTHNAME1 */
+        case 0x0045: s = "Feb"; break;
+        case 0x0046: s = "Mar"; break;
+        case 0x0047: s = "Apr"; break;
+        case 0x0048: s = "May"; break;
+        case 0x0049: s = "Jun"; break;
+        case 0x004A: s = "Jul"; break;
+        case 0x004B: s = "Aug"; break;
+        case 0x004C: s = "Sep"; break;
+        case 0x004D: s = "Oct"; break;
+        case 0x004E: s = "Nov"; break;
+        case 0x004F: s = "Dec"; break;
+        case 0x0050: s = "+"; break;             /* LOCALE_SPOSITIVESIGN */
+        case 0x0051: s = "-"; break;             /* LOCALE_SNEGATIVESIGN */
+        case 0x0059: s = "en"; break;            /* LOCALE_SISO639LANGNAME */
+        case 0x005A: s = "US"; break;            /* LOCALE_SISO3166CTRYNAME */
+        case 0x005C: s = "en-US"; break;         /* LOCALE_SNAME */
+        case 0x100A: s = "1"; break;             /* LOCALE_IPAPERSIZE (letter=1) */
+        case 0x1001: s = "English (United States)"; break; /* LOCALE_SENGLANGUAGE */
+        case 0x1002: s = "United States"; break; /* LOCALE_SENGCOUNTRY */
+        case 0x1003: s = "h:mm:ss tt"; break;    /* LOCALE_STIMEFORMAT */
+        case 0x1004: s = "1252"; break;          /* LOCALE_IDEFAULTANSICODEPAGE */
+        case 0x1009: s = "1"; break;             /* LOCALE_ICALENDARTYPE (Gregorian) */
+        case 0x100C: s = "6"; break;             /* LOCALE_IFIRSTDAYOFWEEK (Sunday=6) */
+        case 0x100D: s = "0"; break;             /* LOCALE_IFIRSTWEEKOFYEAR */
+        case 0x1010: s = "1"; break;             /* LOCALE_INEGNUMBER */
+        default:     s = ""; break;
+    }
+
+    if (return_num) {
+        /* LOCALE_RETURN_NUMBER: write a DWORD to buffer */
+        num = (uint32_t)strtoul(s ? s : "0", NULL, 10);
+        if (cchData == 0) return sizeof(uint32_t) / sizeof(uint16_t);
+        if (!lpLCData || cchData < (int)(sizeof(uint32_t) / sizeof(uint16_t))) return 0;
+        *(uint32_t*)lpLCData = num;
+        return sizeof(uint32_t) / sizeof(uint16_t);
+    }
+
+    if (!s) s = "";
+    int slen = 0;
+    while (s[slen]) slen++;
+    int need = slen + 1; /* including null */
+    if (cchData == 0) return need;
+    if (!lpLCData || cchData < need) { return 0; }
+    for (int i = 0; i < need; i++) lpLCData[i] = (uint16_t)(unsigned char)s[i];
+    return need;
+}
+
+int MSABI lsw_GetLocaleInfoA(uint32_t Locale, uint32_t LCType, char* lpLCData, int cchData) {
+    (void)Locale;
+    uint32_t type = LCType & 0x000FFFFF;
+    const char* s = NULL;
+    switch (type) {
+        case 0x0001: s = "0409"; break;
+        case 0x000E: s = "."; break;
+        case 0x000F: s = ","; break;
+        case 0x0011: s = "2"; break;
+        case 0x0012: s = "1"; break;
+        case 0x001F: s = "M/d/yyyy"; break;
+        case 0x0028: s = "AM"; break;
+        case 0x0029: s = "PM"; break;
+        case 0x0059: s = "en"; break;
+        case 0x005A: s = "US"; break;
+        case 0x005C: s = "en-US"; break;
+        case 0x1003: s = "h:mm:ss tt"; break;
+        case 0x1004: s = "1252"; break;
+        case 0x1010: s = "1"; break;
+        default:     s = ""; break;
+    }
+    if (!s) s = "";
+    int slen = 0;
+    while (s[slen]) slen++;
+    int need = slen + 1;
+    if (cchData == 0) return need;
+    if (!lpLCData || cchData < need) return 0;
+    for (int i = 0; i < need; i++) lpLCData[i] = s[i];
+    return need;
+}
+
+/* GetDateFormatW/A — format a date using locale-specific format */
 int MSABI lsw_GetDateFormatEx(const uint16_t* locale, DWORD flags, const void* date,
                                const uint16_t* fmt, uint16_t* buf, int cbuf, const uint16_t* cal) {
     (void)locale; (void)flags; (void)date; (void)fmt; (void)cal;
@@ -1111,6 +1269,37 @@ DWORD MSABI lsw_EnumSystemFirmwareTables(DWORD FirmwareTableProviderSignature,
 
 /* GetUserNameW / GetComputerNameW / GetComputerNameExW — already in advapi32_api.c */
 
+/* GetNumberFormatW — format a number string using locale conventions.
+ * For a minimal stub, we just copy the number string as-is to the output buffer. */
+int MSABI lsw_GetNumberFormatW(uint32_t Locale, DWORD dwFlags, const uint16_t* lpValue,
+                                const void* lpFormat, uint16_t* lpNumberStr, int cchNumber) {
+    (void)Locale; (void)dwFlags; (void)lpFormat;
+    if (!lpValue) { lsw_SetLastError(87); return 0; }
+    int len = 0;
+    while (lpValue[len]) len++;
+    int need = len + 1;
+    if (cchNumber == 0) return need;
+    if (!lpNumberStr || cchNumber < need) { lsw_SetLastError(122); return 0; }
+    for (int i = 0; i < need; i++) lpNumberStr[i] = lpValue[i];
+    return need;
+}
+int MSABI lsw_GetNumberFormatA(uint32_t Locale, DWORD dwFlags, const char* lpValue,
+                                const void* lpFormat, char* lpNumberStr, int cchNumber) {
+    (void)Locale; (void)dwFlags; (void)lpFormat;
+    if (!lpValue) { lsw_SetLastError(87); return 0; }
+    int len = 0;
+    while (lpValue[len]) len++;
+    int need = len + 1;
+    if (cchNumber == 0) return need;
+    if (!lpNumberStr || cchNumber < need) { lsw_SetLastError(122); return 0; }
+    for (int i = 0; i < need; i++) lpNumberStr[i] = lpValue[i];
+    return need;
+}
+int MSABI lsw_GetNumberFormatEx(const uint16_t* lpLocaleName, DWORD dwFlags, const uint16_t* lpValue,
+                                 const void* lpFormat, uint16_t* lpNumberStr, int cchNumber) {
+    return lsw_GetNumberFormatW(0, dwFlags, lpValue, lpFormat, lpNumberStr, cchNumber);
+}
+
 /* =========================================================================
  * Mapping table
  * ========================================================================= */
@@ -1197,8 +1386,17 @@ const win32_api_mapping_t win32_api_game_mappings[] = {
     MAP("KERNEL32.dll", "GetSystemDefaultLCID",       lsw_GetSystemDefaultLCID),
     MAP("KERNEL32.dll", "GetUserDefaultUILanguage",   lsw_GetUserDefaultUILanguage),
     MAP("KERNEL32.dll", "GetSystemDefaultUILanguage", lsw_GetSystemDefaultUILanguage),
+    MAP("KERNEL32.dll", "GetLocaleInfoW",             lsw_GetLocaleInfoW),
+    MAP("KERNEL32.dll", "GetLocaleInfoA",             lsw_GetLocaleInfoA),
+    MAP("KERNEL32.dll", "GetLocaleInfoEx",            lsw_GetLocaleInfoW),
     MAP("KERNEL32.dll", "GetDateFormatEx",            lsw_GetDateFormatEx),
     MAP("KERNEL32.dll", "GetTimeFormatEx",            lsw_GetTimeFormatEx),
+    MAP("KERNEL32.dll", "GetNumberFormatW",           lsw_GetNumberFormatW),
+    MAP("KERNEL32.dll", "GetNumberFormatA",           lsw_GetNumberFormatA),
+    MAP("KERNEL32.dll", "GetNumberFormatEx",          lsw_GetNumberFormatEx),
+    MAP("KERNEL32.dll", "LoadStringW",                lsw_LoadStringW),
+    MAP("KERNEL32.dll", "LoadStringA",                lsw_LoadStringA),
+    MAP("KERNEL32.dll", "VerSetConditionMask",        lsw_VerSetConditionMask),
     MAP("KERNEL32.dll", "EnumWindows",                lsw_EnumWindows),
     MAP("KERNEL32.dll", "EnumChildWindows",           lsw_EnumChildWindows),
     /* XAudio2 */

@@ -18,6 +18,15 @@ typedef uint32_t DWORD;
 typedef void* HANDLE;
 typedef void* HKEY;
 
+/* Forward declarations for functions defined in win32_api.c */
+extern int __attribute__((ms_abi)) lsw_EnumServicesStatusExW(void* hSCManager,
+    uint32_t InfoLevel, uint32_t dwServiceType, uint32_t dwServiceState, uint8_t* lpServices,
+    uint32_t cbBufSize, uint32_t* pcbBytesNeeded, uint32_t* lpServicesReturned,
+    uint32_t* lpResumeHandle, uint16_t* pszGroupName);
+extern int __attribute__((ms_abi)) lsw_EnumDependentServicesW(void* hService,
+    uint32_t dwServiceState, uint8_t* lpServices, uint32_t cbBufSize,
+    uint32_t* pcbBytesNeeded, uint32_t* lpServicesReturned);
+
 /* =========================================================================
  * Registry helper layer — bridge Win32 HKEY world to lsw_registry.c
  * =========================================================================*/
@@ -1680,6 +1689,9 @@ win32_api_mapping_t win32_api_advapi32_mappings[] = {
     {"advapi32.dll", "ControlService", (void*)lsw_ControlService},
     {"advapi32.dll", "DeleteService", (void*)lsw_DeleteService},
     {"advapi32.dll", "EnumServicesStatusW", (void*)lsw_EnumServicesStatusW},
+    {"ADVAPI32.dll", "EnumServicesStatusExW", (void*)lsw_EnumServicesStatusExW},
+    {"advapi32.dll", "EnumServicesStatusExW", (void*)lsw_EnumServicesStatusExW},
+    {"advapi32.dll", "EnumDependentServicesW", (void*)lsw_EnumDependentServicesW},
     {"advapi32.dll", "RegisterServiceCtrlHandlerW", (void*)lsw_RegisterServiceCtrlHandlerW},
     {"advapi32.dll", "SetServiceStatus", (void*)lsw_SetServiceStatus},
     {"advapi32.dll", "OpenEventLogW", (void*)lsw_OpenEventLogW},

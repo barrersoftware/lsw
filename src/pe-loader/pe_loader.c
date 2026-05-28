@@ -1103,7 +1103,8 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
             void* pdata_va = (uint8_t*)image->image_base + pdata_sec->VirtualAddress;
             win32_api_set_pe_image_info((uint64_t)image->image_base,
                                         pdata_va,
-                                        pdata_sec->VirtualSize);
+                                        pdata_sec->VirtualSize,
+                                        (uint32_t)image->image_size);
         } else {
             LSW_LOG_WARN("[pe_loader] .pdata section not found; C++ exceptions disabled");
         }

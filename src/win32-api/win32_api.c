@@ -79,14 +79,17 @@ static char g_lsw_exe_path[4096] = {0};
 
 /* ---- PE image info for x64 C++ exception dispatch ---- */
 static uint64_t g_lsw_image_base  = 0;
+static uint32_t g_lsw_image_size  = 0;   /* SizeOfImage from PE header */
 static void*    g_lsw_pdata_va    = NULL;
 static uint32_t g_lsw_pdata_size  = 0;
 
 void win32_api_set_pe_image_info(uint64_t image_base,
                                   void*    pdata_va,
-                                  uint32_t pdata_size)
+                                  uint32_t pdata_size,
+                                  uint32_t image_size)
 {
     g_lsw_image_base = image_base;
+    g_lsw_image_size = image_size;
     g_lsw_pdata_va   = pdata_va;
     g_lsw_pdata_size = pdata_size;
     LSW_LOG_INFO("[exception] PE image info: base=0x%lx pdata=%p size=%u",
@@ -1279,7 +1282,11 @@ typedef struct {
 
 /* Resolve a PE RVA to a mapped virtual address */
 static inline void* lsw_rva2va(uint32_t rva) {
-    return rva ? (void*)(g_lsw_image_base + rva) : NULL;
+    if (!rva) return NULL;
+    /* Bounds-check: reject RVAs outside the mapped image to prevent SIGSEGV
+     * when garbage values (e.g. GS cookie data) are misread as FuncInfo RVAs. */
+    if (g_lsw_image_size && rva >= g_lsw_image_size) return NULL;
+    return (void*)(g_lsw_image_base + rva);
 }
 
 /* Binary-search .pdata for the RUNTIME_FUNCTION covering 'rip'. */
@@ -1368,6 +1375,254 @@ static uint64_t lsw_unwind_frame(lsw_RUNTIME_FUNCTION* rf,
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * EH4 (__CxxFrameHandler4, VS2019+) compressed-integer helpers.
+ *
+ * EH4 uses the .NET uint32 compressed integer encoding:
+ *   low nibble 0bXXX0 → 1 byte,  value = b0 >> 1          (7-bit max)
+ *   low nibble 0bXX01 → 2 bytes, value = (b0>>2)|(b1<<6)  (14-bit)
+ *   low nibble 0bX011 → 3 bytes, value = (b0>>3)|(b1<<5)|(b2<<13) (21-bit)
+ *   low nibble 0b0111 → 4 bytes, value = (b0>>4)|(b1<<4)|(b2<<12)|(b3<<20) (28-bit)
+ *   low nibble 0b1111 → 5 bytes, value = b1|(b2<<8)|(b3<<16)|(b4<<24) (32-bit)
+ * ----------------------------------------------------------------------- */
+static uint32_t lsw_eh4_read_uint(const uint8_t** pp)
+{
+    const uint8_t *p = *pp;
+    uint8_t b0 = p[0];
+    uint8_t ln = b0 & 0x0Fu;
+    if ((ln & 0x01u) == 0u) {
+        *pp += 1;
+        return (uint32_t)(b0 >> 1);
+    } else if ((ln & 0x03u) == 1u) {
+        *pp += 2;
+        return ((uint32_t)(b0 >> 2)) | ((uint32_t)p[1] << 6);
+    } else if ((ln & 0x07u) == 3u) {
+        *pp += 3;
+        return ((uint32_t)(b0 >> 3)) | ((uint32_t)p[1] << 5) | ((uint32_t)p[2] << 13);
+    } else if ((ln & 0x0Fu) == 7u) {
+        *pp += 4;
+        return ((uint32_t)(b0 >> 4)) | ((uint32_t)p[1] << 4) |
+               ((uint32_t)p[2] << 12) | ((uint32_t)p[3] << 20);
+    } else { /* ln == 0x0F → 5-byte form */
+        *pp += 5;
+        return (uint32_t)p[1] | ((uint32_t)p[2] << 8) |
+               ((uint32_t)p[3] << 16) | ((uint32_t)p[4] << 24);
+    }
+}
+
+static int32_t lsw_eh4_read_int(const uint8_t** pp)
+{
+    int32_t v;
+    memcpy(&v, *pp, 4);
+    *pp += 4;
+    return v;
+}
+
+/*
+ * EH4 IPtoStateMap lookup.  Map entries are delta-encoded:
+ *   each entry = (ip_delta: compressed uint, state_enc: compressed uint)
+ * where state_enc = actual_state + 1  (so -1 encodes as 0).
+ * ip values are function-relative (RVA - func_begin_rva).
+ */
+static int32_t lsw_eh4_ip_to_state(uint32_t ipts_rva, uint32_t ip_offset)
+{
+    const uint8_t *p = (const uint8_t *)lsw_rva2va(ipts_rva);
+    if (!p) return -1;
+    const uint8_t *img_end = (const uint8_t *)(g_lsw_image_base + g_lsw_image_size);
+
+    uint32_t num = lsw_eh4_read_uint(&p);
+    if (num == 0 || num > 65536u) return -1;
+
+    int32_t  state  = -1;
+    uint32_t abs_ip = 0;
+    for (uint32_t i = 0; i < num && p < img_end - 2; i++) {
+        uint32_t delta     = lsw_eh4_read_uint(&p);
+        abs_ip            += delta;
+        uint32_t state_enc = lsw_eh4_read_uint(&p);
+        int32_t  s         = (int32_t)state_enc - 1;
+        if (abs_ip <= ip_offset)
+            state = s;
+    }
+    return state;
+}
+
+/*
+ * EH4 catch-handler search.
+ *
+ * FuncInfo4 layout (variable-length, all ints are compressed unless noted):
+ *   [0]    header byte  (FuncInfoHeader bitfield)
+ *   [1..4] dispUnwindMap RVA (4 bytes plain, if header bit3)
+ *   [5..8] dispTryBlockMap RVA (4 bytes plain, if header bit4)
+ *   [9..12] dispIPtoStateMap RVA (4 bytes plain, always)
+ *   [13..] dispFrame (compressed uint, if header bit0 isCatch)
+ *
+ * TryBlockMap4: numEntries(compressed) + [tryLow tryHigh catchHigh(compressed) + dispHandlerArray(4B)]
+ * HandlerMap4:  numEntries(compressed) + [hdr(1B) + optional adjectives + optional dispType(4B)
+ *               + optional dispCatchObj(compressed) + dispOfHandler(4B) + cont addrs]
+ *
+ * State storage: TryBlockMap states are DIRECT values.
+ *                IPtoStateMap states are encoded as state+1.
+ */
+static bool lsw_eh4_find_catch(uint32_t funcinfo_rva,
+                                uint32_t func_begin_rva,
+                                uint64_t rip,
+                                lsw_ThrowInfo *throw_info,
+                                uint64_t *handler_va,
+                                int32_t  *disp_catch_obj,
+                                uint32_t *out_adjectives,
+                                uint64_t *out_cont_vas,   /* [2]: continuation VAs */
+                                uint32_t *out_cont_cnt)   /* number of cont VAs (0-2) */
+{
+    const uint8_t *fi = (const uint8_t *)lsw_rva2va(funcinfo_rva);
+    if (!fi) return false;
+    const uint8_t *img_end = (const uint8_t *)(g_lsw_image_base + g_lsw_image_size);
+    if (fi >= img_end) return false;
+
+    const uint8_t *p = fi;
+    uint8_t hdr = *p++;
+
+    uint32_t disp_uw_map = 0, disp_tb_map = 0, disp_ip_map = 0;
+    if (p >= img_end) return false;
+
+    if ((hdr >> 2) & 1u)  lsw_eh4_read_uint(&p);            /* BBT: skip bbtFlags */
+    if ((hdr >> 3) & 1u)  disp_uw_map = (uint32_t)lsw_eh4_read_int(&p); /* UnwindMap */
+    if ((hdr >> 4) & 1u)  disp_tb_map = (uint32_t)lsw_eh4_read_int(&p); /* TryBlockMap */
+    if (p >= img_end - 4) return false;
+    disp_ip_map = (uint32_t)lsw_eh4_read_int(&p);           /* IPtoStateMap (always) */
+    (void)disp_uw_map;  /* not needed for catch dispatch */
+
+    if (!disp_tb_map) {
+        LSW_LOG_INFO("[exception] EH4 func=0x%x: no TryBlockMap", func_begin_rva);
+        return false;
+    }
+
+    /* Validate that both RVAs look sane before dereferencing */
+    if (!lsw_rva2va(disp_tb_map) || !lsw_rva2va(disp_ip_map))
+        return false;
+
+    /* Determine current EH state via IPtoStateMap */
+    uint32_t ip_offset = (uint32_t)(rip - g_lsw_image_base) - func_begin_rva;
+    int32_t  cur_state = lsw_eh4_ip_to_state(disp_ip_map, ip_offset);
+    LSW_LOG_INFO("[exception] EH4 func=0x%x ip_offset=0x%x cur_state=%d tbm=0x%x",
+                 func_begin_rva, ip_offset, cur_state, disp_tb_map);
+
+    /* Build catchable pType list from ThrowInfo */
+    uint32_t catchable_ptype[16];
+    int      n_catchable = 0;
+    if (throw_info && throw_info->pCatchableTypeArray) {
+        lsw_CatchableTypeArray *cta =
+            (lsw_CatchableTypeArray *)lsw_rva2va(throw_info->pCatchableTypeArray);
+        if (cta && cta->nCatchableTypes > 0 && cta->nCatchableTypes <= 64) {
+            for (int ci = 0; ci < cta->nCatchableTypes && n_catchable < 16; ci++) {
+                lsw_CatchableType *ct =
+                    (lsw_CatchableType *)lsw_rva2va(cta->arrayOfCatchableTypes[ci]);
+                if (ct) catchable_ptype[n_catchable++] = ct->pType;
+            }
+        }
+    }
+
+    /* Walk TryBlockMap */
+    const uint8_t *tbp = (const uint8_t *)lsw_rva2va(disp_tb_map);
+    if (!tbp || tbp >= img_end) return false;
+
+    uint32_t num_tries = lsw_eh4_read_uint(&tbp);
+    if (num_tries == 0 || num_tries > 1024u) return false;
+
+    for (uint32_t t = 0; t < num_tries && tbp < img_end - 8; t++) {
+        uint32_t try_low  = lsw_eh4_read_uint(&tbp);
+        uint32_t try_high = lsw_eh4_read_uint(&tbp);
+        /* catchHigh exists in the format but is not needed for dispatch */
+        lsw_eh4_read_uint(&tbp);
+        int32_t disp_handler_arr = lsw_eh4_read_int(&tbp);
+
+        /* State range check: TryBlockMap states are direct (not state+1) */
+        if (cur_state >= 0) {
+            int32_t s_low  = (int32_t)try_low;
+            int32_t s_high = (int32_t)try_high;
+            if (cur_state < s_low || cur_state > s_high) {
+                LSW_LOG_INFO("[exception] EH4 func=0x%x try[%u] state %d not in [%d,%d]",
+                             func_begin_rva, t, cur_state, s_low, s_high);
+                continue;
+            }
+        }
+
+        if (!disp_handler_arr) continue;
+
+        const uint8_t *hmp = (const uint8_t *)lsw_rva2va((uint32_t)disp_handler_arr);
+        if (!hmp || hmp >= img_end) continue;
+
+        uint32_t num_handlers = lsw_eh4_read_uint(&hmp);
+        if (num_handlers == 0 || num_handlers > 1024u) continue;
+
+        LSW_LOG_INFO("[exception] EH4 func=0x%x try[%u] [%u,%u] numHandlers=%u",
+                     func_begin_rva, t, try_low, try_high, num_handlers);
+
+        for (uint32_t h = 0; h < num_handlers && hmp < img_end - 4; h++) {
+            uint8_t  h_hdr    = *hmp++;
+            uint32_t adj      = 0;
+            int32_t  d_type   = 0;
+            uint32_t d_catch  = 0;
+            int32_t  d_handler;
+
+            if (h_hdr & 0x01u) adj     = lsw_eh4_read_uint(&hmp); /* adjectives */
+            if (h_hdr & 0x02u) d_type  = lsw_eh4_read_int(&hmp);  /* dispType   */
+            if (h_hdr & 0x04u) d_catch = lsw_eh4_read_uint(&hmp); /* dispCatchObj */
+            d_handler = lsw_eh4_read_int(&hmp);                    /* dispOfHandler (always) */
+
+            /* Read continuation addresses */
+            uint8_t  cont_cnt    = (h_hdr >> 4) & 0x03u;
+            uint8_t  cont_is_rva = (h_hdr >> 3) & 0x01u;
+            uint64_t my_cont_vas[2] = {0, 0};
+            uint8_t  my_cont_cnt = (cont_cnt < 2) ? cont_cnt : 2;
+            for (uint8_t ca = 0; ca < cont_cnt && hmp < img_end - 4; ca++) {
+                if (cont_is_rva) {
+                    int32_t rva = lsw_eh4_read_int(&hmp);
+                    if (ca < 2) my_cont_vas[ca] = g_lsw_image_base + (uint32_t)rva;
+                } else {
+                    uint32_t off = lsw_eh4_read_uint(&hmp);
+                    if (ca < 2) my_cont_vas[ca] = g_lsw_image_base + func_begin_rva + off;
+                }
+            }
+
+            if (!d_handler) continue;
+
+            /* Type matching */
+            bool matches = false;
+            if (d_type == 0) {
+                matches = true; /* catch(...) */
+            } else {
+                for (int ci = 0; ci < n_catchable; ci++) {
+                    if ((uint32_t)d_type == catchable_ptype[ci]) {
+                        matches = true;
+                        break;
+                    }
+                }
+            }
+
+            if (matches) {
+                *handler_va     = g_lsw_image_base + (uint32_t)d_handler;
+                *disp_catch_obj = (int32_t)d_catch;
+                *out_adjectives = adj;
+                if (out_cont_cnt) *out_cont_cnt = my_cont_cnt;
+                if (out_cont_vas) {
+                    out_cont_vas[0] = my_cont_vas[0];
+                    out_cont_vas[1] = my_cont_vas[1];
+                }
+                LSW_LOG_INFO("[exception] EH4 catch %s in func 0x%x handler=0x%lx disp=%d cont_cnt=%u",
+                             d_type ? "typed" : "(...)",
+                             func_begin_rva,
+                             (unsigned long)*handler_va,
+                             *disp_catch_obj, my_cont_cnt);
+                if (my_cont_cnt > 0)
+                    LSW_LOG_INFO("[exception] EH4 cont_vas[0]=0x%lx cont_vas[1]=0x%lx",
+                                 (unsigned long)my_cont_vas[0], (unsigned long)my_cont_vas[1]);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /*
  * Look up the "state" for a given RIP in a function's IPToStateMap.
  * Returns -1 if not found or no map.
@@ -1406,7 +1661,10 @@ static bool lsw_find_catch_in_frame(lsw_RUNTIME_FUNCTION* rf,
                                      lsw_ThrowInfo* throw_info,
                                      uint64_t* handler_va,
                                      int32_t*  disp_catch_obj,
-                                     uint32_t* out_adjectives)
+                                     uint32_t* out_adjectives,
+                                     bool*     out_is_eh4,
+                                     uint64_t* out_eh4_cont_vas,
+                                     uint32_t* out_eh4_cont_cnt)
 {
     /* Load UNWIND_INFO to find the handler function and FuncInfo RVA */
     uint8_t* ui = (uint8_t*)lsw_rva2va(rf->UnwindData);
@@ -1428,25 +1686,80 @@ static bool lsw_find_catch_in_frame(lsw_RUNTIME_FUNCTION* rf,
         if (!(flags & UNW_FLAG_EHANDLER))
             return false;
 
-        /* handler RVA and FuncInfo RVA follow the unwind codes */
+        /* handler RVA and FuncInfo RVA follow the unwind codes.
+         *
+         * For __CxxFrameHandler3:
+         *   after[0] = handlerRVA, after[1] = FuncInfo3 RVA
+         * For __GSHandlerCheck_EH3 (stack-cookie protected functions):
+         *   after[0] = handlerRVA
+         *   after[1..4] = GS_HANDLERDATA (GSCookieOffset, GSCookieXorOffset,
+         *                                  EHCookieOffset, EHCookieXorOffset)
+         *   after[5] = FuncInfo3 RVA
+         * We try after[1] first; if magic doesn't match, try after[5].
+         */
         uint32_t* after = (uint32_t*)(ui + 4 + codes_sz);
 
         if ((uint32_t*)after + 2 > (uint32_t*)((uint8_t*)g_lsw_pdata_va + g_lsw_pdata_size + 0x10000))
             return false;  /* rough bounds check */
 
-        uint32_t funcinfo_rva = after[1];
-        lsw_FuncInfo3* fi = (lsw_FuncInfo3*)lsw_rva2va(funcinfo_rva);
-        if (!fi) return false;
-
-        if (fi->magic < 0x19930520u || fi->magic > 0x19930524u)
+        /* Try to locate FuncInfo3: check after[1] first (plain EH3),
+         * then after[5] (GSHandlerCheck_EH3 with 4-DWORD cookie data). */
+        lsw_FuncInfo3* fi = NULL;
+        LSW_LOG_INFO("[exception] find_catch func=0x%x after[0]=0x%x after[1]=0x%x after[5]=0x%x",
+                     rf->BeginAddress, after[0], after[1], after[5]);
+        for (int fi_offset = 1; fi_offset <= 5; fi_offset += 4) {
+            uint32_t funcinfo_rva = after[fi_offset];
+            lsw_FuncInfo3* candidate = (lsw_FuncInfo3*)lsw_rva2va(funcinfo_rva);
+            LSW_LOG_INFO("[exception]   fi_offset=%d rva=0x%x candidate=%p magic=0x%x",
+                         fi_offset, funcinfo_rva, (void*)candidate,
+                         candidate ? candidate->magic : 0);
+            if (candidate &&
+                candidate->magic >= 0x19930520u && candidate->magic <= 0x19930524u) {
+                fi = candidate;
+                break;
+            }
+        }
+        if (!fi) {
+            /* EH3 not found — try EH4 (__CxxFrameHandler4, VS2019+).
+             * FuncInfo4 starts with a 1-byte header (value 0x00-0x7F) rather
+             * than the EH3 magic DWORD.  Try the same after[1] / after[5]
+             * offsets used for EH3. */
+            LSW_LOG_INFO("[exception]   no FuncInfo3; trying EH4 for func=0x%x",
+                         rf->BeginAddress);
+            for (int fi4_off = 1; fi4_off <= 5; fi4_off += 4) {
+                uint32_t fi4_rva = after[fi4_off];
+                uint8_t *fi4_ptr = (uint8_t *)lsw_rva2va(fi4_rva);
+                if (!fi4_ptr) continue;
+                /* Quick sanity: EH4 header byte must be in 0x00-0x7F range and
+                 * must NOT be the lead byte of an EH3 magic (0x20 from 0x19930520
+                 * can appear here; we still let the parser try and it will bail if
+                 * the derived RVAs are invalid). */
+                uint8_t hdr4 = fi4_ptr[0];
+                if (hdr4 > 0x1Fu) continue; /* reserved bits set → garbage */
+                if (lsw_eh4_find_catch(fi4_rva, rf->BeginAddress, rip,
+                                       throw_info, handler_va,
+                                       disp_catch_obj, out_adjectives,
+                                       out_eh4_cont_vas, out_eh4_cont_cnt)) {
+                    if (out_is_eh4) *out_is_eh4 = true;
+                    return true;
+                }
+            }
             return false;
+        }
+
+        LSW_LOG_INFO("[exception] fi=%p magic=0x%x nTryBlocks=%u pTryBlockMap=0x%x",
+                     (void*)fi, fi->magic, fi->nTryBlocks, fi->pTryBlockMap);
+
         if (!fi->nTryBlocks || !fi->pTryBlockMap)
             return false;
 
         int32_t cur_state = lsw_ip_to_state(fi, rip);
+        LSW_LOG_INFO("[exception] cur_state=%d for rip=0x%lx func=0x%x",
+                     cur_state, (unsigned long)rip, rf->BeginAddress);
 
         lsw_TryBlockMapEntry* tbm =
             (lsw_TryBlockMapEntry*)lsw_rva2va(fi->pTryBlockMap);
+        LSW_LOG_INFO("[exception] tbm=%p", (void*)tbm);
         if (!tbm) return false;
 
         for (uint32_t t = 0; t < fi->nTryBlocks; t++) {
@@ -1504,7 +1817,7 @@ static bool lsw_find_catch_in_frame(lsw_RUNTIME_FUNCTION* rf,
                         *handler_va     = g_lsw_image_base + h->addressOfHandler;
                         *disp_catch_obj = h->dispCatchObj;
                         *out_adjectives = h->adjectives;
-                        LSW_LOG_DEBUG("[exception] catch %s in func 0x%x "
+                        LSW_LOG_INFO("[exception] catch %s in func 0x%x "
                                      "handler=0x%lx disp=%d state=%d [%d,%d]",
                                      h->pType ? "typed" : "(...)",
                                      rf->BeginAddress,
@@ -1591,8 +1904,12 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
 
         /* Unwind this frame to get entry RSP */
         uint64_t caller_rip, caller_rsp;
+        LSW_LOG_INFO("[exception] calling unwind_frame depth=%d body_rsp=0x%lx",
+                     depth, (unsigned long)body_rsp);
         uint64_t entry_rsp = lsw_unwind_frame(rf, body_rsp,
                                                &caller_rip, &caller_rsp);
+        LSW_LOG_INFO("[exception] unwind_frame returned entry_rsp=0x%lx caller_rip=0x%lx",
+                     (unsigned long)entry_rsp, (unsigned long)caller_rip);
         if (!entry_rsp) {
             LSW_LOG_WARN("[exception] unwind_frame failed at depth=%d", depth);
             break;
@@ -1602,29 +1919,36 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
         uint64_t catch_handler_va = 0;
         int32_t  disp_catch_obj   = 0;
         uint32_t catch_adjectives = 0;
+        bool     is_eh4           = false;
+        uint64_t eh4_cont_vas[2]  = {0, 0};
+        uint32_t eh4_cont_cnt     = 0;
+        LSW_LOG_INFO("[exception] calling find_catch depth=%d body_rsp=0x%lx",
+                     depth, (unsigned long)body_rsp);
         if (lsw_find_catch_in_frame(rf, rip, entry_rsp,
                                     (lsw_ThrowInfo*)throwInfo,
                                     &catch_handler_va, &disp_catch_obj,
-                                    &catch_adjectives)) {
+                                    &catch_adjectives,
+                                    &is_eh4, eh4_cont_vas, &eh4_cont_cnt)) {
             /* ----------------------------------------------------------
              * Found a matching catch handler.  Execute its funclet.
              *
-             * The catch funclet is called with RCX = the try function's
-             * "frame base" (entry_rsp).  It runs the catch body and
-             * returns the continuation virtual address in RAX.
+             * The catch funclet is called with RDX = the try function's
+             * "frame base" (body_rsp for EH4, entry_rsp for EH3).
+             * EH3 funclets return the continuation VA directly.
+             * EH4 funclets return a continuation INDEX (0 or 1).
              * ---------------------------------------------------------- */
             LSW_LOG_INFO("[exception] Dispatching to catch handler 0x%lx "
-                         "entry_rsp=0x%lx disp=%d adj=0x%x",
+                         "body_rsp=0x%lx entry_rsp=0x%lx disp=%d adj=0x%x is_eh4=%d",
                          (unsigned long)catch_handler_va,
+                         (unsigned long)body_rsp,
                          (unsigned long)entry_rsp, disp_catch_obj,
-                         catch_adjectives);
+                         catch_adjectives, (int)is_eh4);
 
             /* Place the exception object in the catch frame if disp != 0.
-             * For reference catches (adj & 0x8): slot = pointer-to-object.
-             * For value catches: slot = the object itself (copy needed,
-             *   but for now store pointer — good enough for most cases). */
+             * EH4 uses body_rsp as the frame base; EH3 uses entry_rsp. */
+            uint64_t frame_base = is_eh4 ? body_rsp : entry_rsp;
             if (disp_catch_obj != 0) {
-                void** slot = (void**)(entry_rsp + (int64_t)disp_catch_obj);
+                void** slot = (void**)(frame_base + (int64_t)disp_catch_obj);
                 if (catch_adjectives & 0x8) {
                     /* reference catch: slot holds pointer to exception object */
                     *slot = obj;
@@ -1642,16 +1966,30 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
              * a constant into RCX immediately after).
              *
              * Convention: funclet(rcx_ignored, frame_base) → continuation
+             * EH3: continuation is a direct VA
+             * EH4: continuation is an index into eh4_cont_vas[]
              */
             typedef void* (__attribute__((ms_abi)) *funclet_t)(uint64_t, uint64_t);
             funclet_t funclet = (funclet_t)catch_handler_va;
-            void* continuation = funclet(0, entry_rsp);  /* RCX=0, RDX=entry_rsp */
+            void* continuation = funclet(0, frame_base);
 
             LSW_LOG_INFO("[exception] catch funclet returned continuation=%p",
                          continuation);
 
-            if (continuation) {
-                uint64_t cont_va = (uint64_t)continuation;
+            uint64_t cont_va = 0;
+            if (is_eh4 && eh4_cont_cnt > 0) {
+                /* EH4: continuation is a 0-based index */
+                uint64_t cont_idx = (uint64_t)(uintptr_t)continuation;
+                if (cont_idx >= eh4_cont_cnt) cont_idx = 0;
+                cont_va = eh4_cont_vas[cont_idx];
+                LSW_LOG_INFO("[exception] EH4 cont_idx=%lu cont_va=0x%lx",
+                             (unsigned long)cont_idx, (unsigned long)cont_va);
+            } else if (!is_eh4 && continuation) {
+                /* EH3: continuation is a direct VA */
+                cont_va = (uint64_t)continuation;
+            }
+
+            if (cont_va) {
                 /* Jump to the continuation inside the try function with
                  * RSP restored to the body RSP of that frame.             */
                 LSW_LOG_INFO("[exception] jumping to continuation 0x%lx "
@@ -1665,8 +2003,8 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
                 __builtin_unreachable();
             }
 
-            /* Funclet returned NULL — treat as successful catch, continue
-             * execution normally (PE code will handle the rest) */
+            /* Funclet returned NULL / index 0 with no cont_vas — treat as
+             * successful catch, continue execution normally */
             LSW_LOG_INFO("[exception] catch handler completed (no continuation)");
             return;
         }
@@ -5238,13 +5576,601 @@ uint32_t __attribute__((ms_abi)) lsw_FormatMessageW(
         const char* msg = NULL;
         switch (message_id) {
             case 0:   msg = "The operation completed successfully."; break;
+            case 1:   msg = "Incorrect function."; break;
             case 2:   msg = "The system cannot find the file specified."; break;
             case 3:   msg = "The system cannot find the path specified."; break;
+            case 4:   msg = "The system cannot open the file."; break;
             case 5:   msg = "Access is denied."; break;
             case 6:   msg = "The handle is invalid."; break;
+            case 7:   msg = "The storage control blocks were destroyed."; break;
             case 8:   msg = "Not enough memory resources are available to process this command."; break;
+            case 9:   msg = "The storage control block address is invalid."; break;
+            case 10:  msg = "The environment is incorrect."; break;
+            case 11:  msg = "An attempt was made to load a program with an incorrect format."; break;
+            case 12:  msg = "The access code is invalid."; break;
+            case 13:  msg = "The data is invalid."; break;
+            case 14:  msg = "Not enough storage is available to complete this operation."; break;
+            case 15:  msg = "The system cannot find the drive specified."; break;
+            case 16:  msg = "The directory cannot be removed."; break;
+            case 17:  msg = "The system cannot move the file to a different disk drive."; break;
+            case 18:  msg = "There are no more files."; break;
+            case 19:  msg = "The media is write protected."; break;
+            case 20:  msg = "The system cannot find the device specified."; break;
+            case 21:  msg = "The device is not ready."; break;
+            case 23:  msg = "Data error (cyclic redundancy check)."; break;
+            case 24:  msg = "The program issued a command but the command length is incorrect."; break;
+            case 25:  msg = "The drive cannot locate a specific area or track on the disk."; break;
+            case 26:  msg = "The specified disk or diskette cannot be accessed."; break;
+            case 27:  msg = "The drive cannot find the sector requested."; break;
+            case 28:  msg = "The printer is out of paper."; break;
+            case 29:  msg = "The system cannot write to the specified device."; break;
+            case 30:  msg = "The system cannot read from the specified device."; break;
+            case 31:  msg = "A device attached to the system is not functioning."; break;
+            case 32:  msg = "The process cannot access the file because it is being used by another process."; break;
+            case 33:  msg = "The process cannot access the file because another process has locked a portion of the file."; break;
+            case 36:  msg = "Too many files opened for sharing."; break;
+            case 38:  msg = "Reached the end of the file."; break;
+            case 39:  msg = "The disk is full."; break;
+            case 50:  msg = "The request is not supported."; break;
+            case 51:  msg = "Windows cannot find the network path."; break;
+            case 52:  msg = "You were not connected because a duplicate name exists on the network."; break;
+            case 53:  msg = "The network path was not found."; break;
+            case 54:  msg = "The network is busy."; break;
+            case 55:  msg = "The specified network resource or device is no longer available."; break;
+            case 58:  msg = "The specified server cannot perform the requested operation."; break;
+            case 59:  msg = "An unexpected network error occurred."; break;
+            case 64:  msg = "The specified network name is no longer available."; break;
+            case 65:  msg = "Network access is denied."; break;
+            case 67:  msg = "The network name cannot be found."; break;
+            case 80:  msg = "The file exists."; break;
+            case 82:  msg = "The directory or file cannot be created."; break;
+            case 83:  msg = "Fail on INT 24."; break;
+            case 84:  msg = "Storage to process this request is not available."; break;
+            case 85:  msg = "The local device name is already in use."; break;
+            case 86:  msg = "The specified network password is not correct."; break;
             case 87:  msg = "The parameter is incorrect."; break;
+            case 88:  msg = "A write fault occurred on the network."; break;
+            case 89:  msg = "The system cannot start another process at this time."; break;
+            case 100: msg = "Cannot create another system semaphore."; break;
+            case 101: msg = "The exclusive semaphore is owned by another process."; break;
+            case 102: msg = "The semaphore is set and cannot be closed."; break;
+            case 103: msg = "The semaphore cannot be set again."; break;
+            case 104: msg = "Cannot request exclusive semaphores at interrupt time."; break;
+            case 105: msg = "The previous ownership of this semaphore has ended."; break;
+            case 106: msg = "Insert the diskette for drive %1."; break;
+            case 107: msg = "The program stopped because an alternate diskette was not inserted."; break;
+            case 108: msg = "The disk is in use or locked by another process."; break;
+            case 109: msg = "The pipe has been ended."; break;
+            case 110: msg = "The system cannot open the device or file specified."; break;
+            case 111: msg = "The file name is too long."; break;
+            case 112: msg = "There is not enough space on the disk."; break;
+            case 113: msg = "No more internal file identifiers available."; break;
+            case 114: msg = "The target internal file identifier is incorrect."; break;
+            case 117: msg = "The IOCTL call made by the application program is not correct."; break;
+            case 118: msg = "The verify-on-write switch parameter value is not correct."; break;
+            case 119: msg = "The system does not support the command requested."; break;
+            case 120: msg = "This function is not supported on this system."; break;
+            case 121: msg = "The semaphore timeout period has expired."; break;
             case 122: msg = "The data area passed to a system call is too small."; break;
+            case 123: msg = "The filename, directory name, or volume label syntax is incorrect."; break;
+            case 124: msg = "The system call level is not correct."; break;
+            case 125: msg = "The disk has no volume label."; break;
+            case 126: msg = "The specified module could not be found."; break;
+            case 127: msg = "The specified procedure could not be found."; break;
+            case 128: msg = "There are no child processes to wait for."; break;
+            case 129: msg = "The %1 application cannot be run in Win32 mode."; break;
+            case 130: msg = "Attempt to use a file handle to an open disk partition for an operation other than raw disk I/O."; break;
+            case 131: msg = "An attempt was made to move the file pointer before the beginning of the file."; break;
+            case 132: msg = "The file pointer cannot be set on the specified device or file."; break;
+            case 133: msg = "A JOIN or SUBST command cannot be used for a drive that contains previously joined drives."; break;
+            case 160: msg = "One or more arguments are not correct."; break;
+            case 161: msg = "The specified path is invalid."; break;
+            case 162: msg = "A signal is already pending."; break;
+            case 164: msg = "No more threads can be created in the system."; break;
+            case 167: msg = "Unable to lock a region of a file."; break;
+            case 170: msg = "The requested resource is in use."; break;
+            case 183: msg = "Cannot create a file when that file already exists."; break;
+            case 193: msg = "The %1 application is not a valid Win32 application."; break;
+            case 197: msg = "The operating system cannot run this application program."; break;
+            case 203: msg = "The system could not find the environment option that was entered."; break;
+            case 206: msg = "The filename or extension is too long."; break;
+            case 214: msg = "Too many dynamic-link modules are attached to this program or dynamic-link module."; break;
+            case 234: msg = "More data is available."; break;
+            case 258: msg = "The wait operation timed out."; break;
+            case 259: msg = "No more data is available."; break;
+            case 267: msg = "The directory name is invalid."; break;
+            case 298: msg = "Too many posts were made to a semaphore."; break;
+            case 299: msg = "Only part of a ReadProcessMemory or WriteProcessMemory request was completed."; break;
+            case 317: msg = "The system cannot find message text for message number 0x%1 in the message file for %2."; break;
+            case 487: msg = "Attempt to access invalid address."; break;
+            case 534: msg = "Arithmetic result exceeded 32 bits."; break;
+            case 535: msg = "There is a process on other end of the pipe."; break;
+            case 536: msg = "Waiting for a process to open the other end of the pipe."; break;
+            case 568: msg = "An attempt was made to create more links on a file than the file system supports."; break;
+            case 997: msg = "Overlapped I/O operation is in progress."; break;
+            case 998: msg = "Invalid access to memory location."; break;
+            case 999: msg = "Error performing inpage operation."; break;
+            case 1001: msg = "Recursion too deep; the stack overflowed."; break;
+            case 1002: msg = "The window cannot act on the sent message."; break;
+            case 1003: msg = "Cannot complete this function."; break;
+            case 1004: msg = "Invalid flags."; break;
+            case 1005: msg = "The volume does not contain a recognized file system."; break;
+            case 1006: msg = "The volume for a file has been externally altered so that the opened file is no longer valid."; break;
+            case 1007: msg = "The requested operation cannot be performed in full-screen mode."; break;
+            case 1008: msg = "An attempt was made to reference a token that does not exist."; break;
+            case 1009: msg = "The configuration registry database is corrupt."; break;
+            case 1010: msg = "The configuration registry key is invalid."; break;
+            case 1011: msg = "The configuration registry key could not be opened."; break;
+            case 1012: msg = "The configuration registry key could not be read."; break;
+            case 1013: msg = "The configuration registry key could not be written."; break;
+            case 1014: msg = "One of the files in the registry database had to be recovered by use of a log or alternate copy."; break;
+            case 1015: msg = "The registry is corrupted."; break;
+            case 1016: msg = "An I/O operation initiated by the registry failed unrecoverably."; break;
+            case 1017: msg = "The system has attempted to load or restore a file into the registry, but the specified file is not in a registry file format."; break;
+            case 1018: msg = "Illegal operation attempted on a registry key that has been marked for deletion."; break;
+            case 1019: msg = "System could not allocate the required space in a registry log."; break;
+            case 1020: msg = "Cannot create a symbolic link in a registry key that already has subkeys or values."; break;
+            case 1021: msg = "Cannot create a stable subkey under a volatile parent key."; break;
+            case 1022: msg = "A notify change request is being completed and the information is not being returned in the caller's buffer."; break;
+            case 1051: msg = "A stop control has been sent to a service that other running services are dependent on."; break;
+            case 1052: msg = "The requested control is not valid for this service."; break;
+            case 1053: msg = "The service did not respond to the start or control request in a timely fashion."; break;
+            case 1054: msg = "A thread could not be created for the service."; break;
+            case 1055: msg = "The service database is locked."; break;
+            case 1056: msg = "An instance of the service is already running."; break;
+            case 1057: msg = "The account name is invalid or does not exist, or the password is invalid for the account name specified."; break;
+            case 1058: msg = "The service cannot be started, either because it is disabled or because it has no enabled devices associated with it."; break;
+            case 1059: msg = "Circular service dependency was specified."; break;
+            case 1060: msg = "The specified service does not exist as an installed service."; break;
+            case 1061: msg = "The service cannot accept control messages at this time."; break;
+            case 1062: msg = "The service has not been started."; break;
+            case 1063: msg = "The service process could not connect to the service controller."; break;
+            case 1064: msg = "An exception occurred in the service when handling the control request."; break;
+            case 1065: msg = "The database specified does not exist."; break;
+            case 1066: msg = "The service has returned a service-specific error code."; break;
+            case 1067: msg = "The process terminated unexpectedly."; break;
+            case 1068: msg = "The dependency service or group failed to start."; break;
+            case 1069: msg = "The service did not start due to a logon failure."; break;
+            case 1070: msg = "After starting, the service hung in a start-pending state."; break;
+            case 1071: msg = "The specified service database lock is invalid."; break;
+            case 1072: msg = "The specified service has been marked for deletion."; break;
+            case 1073: msg = "The specified service already exists."; break;
+            case 1074: msg = "The system is currently running with the last-known-good configuration."; break;
+            case 1075: msg = "The dependency service does not exist or has been marked for deletion."; break;
+            case 1076: msg = "The current boot has already been accepted for use as the last-known-good control set."; break;
+            case 1077: msg = "No attempts to start the service have been made since the last boot."; break;
+            case 1078: msg = "The name is already in use as either a service name or a service display name."; break;
+            case 1079: msg = "The account specified for this service is different from the account specified for other services running in the same process."; break;
+            case 1080: msg = "Failure actions can only be set for Win32 services, not for drivers."; break;
+            case 1082: msg = "No recovery program has been configured for this service."; break;
+            case 1083: msg = "The executable program that this service is configured to run in does not implement the service."; break;
+            case 1084: msg = "This service cannot be started from the command prompt."; break;
+            case 1085: msg = "The service has not been set up for this computer."; break;
+            case 1100: msg = "The physical end of the tape has been reached."; break;
+            case 1101: msg = "A tape access reached a filemark."; break;
+            case 1102: msg = "The beginning of the tape or a partition was encountered."; break;
+            case 1103: msg = "A tape access reached the end of a set of files."; break;
+            case 1104: msg = "No more data is on the tape."; break;
+            case 1105: msg = "Tape could not be partitioned."; break;
+            case 1106: msg = "When accessing a new tape of a multivolume partition, the current block size is incorrect."; break;
+            case 1107: msg = "Tape partition information could not be found when loading a tape."; break;
+            case 1108: msg = "Unable to lock the media eject mechanism."; break;
+            case 1109: msg = "Unable to unload the media."; break;
+            case 1110: msg = "The media in the drive may have changed."; break;
+            case 1111: msg = "The I/O bus was reset."; break;
+            case 1112: msg = "No media in drive."; break;
+            case 1113: msg = "No mapping for the Unicode character exists in the target multi-byte code page."; break;
+            case 1114: msg = "A dynamic link library (DLL) initialization routine failed."; break;
+            case 1115: msg = "A system shutdown is in progress."; break;
+            case 1116: msg = "Unable to abort the system shutdown because no shutdown was in progress."; break;
+            case 1117: msg = "The request could not be performed because of an I/O device error."; break;
+            case 1118: msg = "No serial device was successfully initialized. The serial driver will unload."; break;
+            case 1119: msg = "Unable to open a device that was sharing an interrupt request (IRQ) with other devices."; break;
+            case 1120: msg = "A serial I/O operation was completed by another write to the serial port."; break;
+            case 1121: msg = "A serial I/O operation completed because the timeout period expired."; break;
+            case 1122: msg = "No ID address mark was found on the floppy disk."; break;
+            case 1123: msg = "Mismatch between the floppy disk sector ID field and the floppy disk controller track address."; break;
+            case 1124: msg = "The floppy disk controller reported an error that is not recognized by the floppy disk driver."; break;
+            case 1125: msg = "The floppy disk controller returned inconsistent results in its registers."; break;
+            case 1126: msg = "While accessing the hard disk, a recalibrate operation failed, even after retries."; break;
+            case 1127: msg = "While accessing the hard disk, a disk operation failed even after retries."; break;
+            case 1128: msg = "While accessing the hard disk, a disk controller reset was needed, but even that failed."; break;
+            case 1129: msg = "Physical end of tape encountered."; break;
+            case 1130: msg = "Not enough server storage is available to process this command."; break;
+            case 1131: msg = "A potential deadlock condition has been detected."; break;
+            case 1132: msg = "The base address or the file offset specified does not have the proper alignment."; break;
+            case 1140: msg = "An attempt to change the system power state was vetoed by another application or driver."; break;
+            case 1141: msg = "The system BIOS failed an attempt to change the system power state."; break;
+            case 1142: msg = "An attempt was made to create more links on a file than the file system supports."; break;
+            case 1150: msg = "The specified program requires a newer version of Windows."; break;
+            case 1151: msg = "The specified program is not a Windows or MS-DOS program."; break;
+            case 1152: msg = "Cannot start more than one instance of the specified program."; break;
+            case 1153: msg = "The specified program was written for an earlier version of Windows."; break;
+            case 1154: msg = "One of the library files needed to run this application is damaged."; break;
+            case 1155: msg = "No application is associated with the specified file for this operation."; break;
+            case 1156: msg = "An error occurred in sending the command to the application."; break;
+            case 1157: msg = "One of the library files needed to run this application cannot be found."; break;
+            case 1158: msg = "The current process has used all of its system allowance of handles for Window Manager objects."; break;
+            case 1159: msg = "The message can be used only with synchronous operations."; break;
+            case 1160: msg = "The indicated source element has no media."; break;
+            case 1161: msg = "The indicated destination element already contains media."; break;
+            case 1162: msg = "The indicated element does not exist."; break;
+            case 1163: msg = "The indicated element is part of a magazine that is not present."; break;
+            case 1164: msg = "The indicated device requires reinitialization due to hardware errors."; break;
+            case 1165: msg = "The device has indicated that cleaning is required before further operations are attempted."; break;
+            case 1166: msg = "The device has indicated that its door is open."; break;
+            case 1167: msg = "The device is not connected."; break;
+            case 1168: msg = "Element not found."; break;
+            case 1169: msg = "There was no match for the specified key in the index."; break;
+            case 1170: msg = "The property set specified does not exist on the object."; break;
+            case 1171: msg = "The point passed to GetMouseMovePoints is not in the buffer."; break;
+            case 1172: msg = "The tracking (workstation) service is not running."; break;
+            case 1173: msg = "The Volume ID could not be found."; break;
+            case 1175: msg = "Unable to remove the file to be replaced."; break;
+            case 1176: msg = "Unable to move the replacement file to the file to be replaced. The file to be replaced has retained its original name."; break;
+            case 1177: msg = "Unable to move the replacement file to the file to be replaced. The file to be replaced has been renamed using the backup name."; break;
+            case 1178: msg = "The volume change journal is being deleted."; break;
+            case 1179: msg = "The volume change journal is not active."; break;
+            case 1180: msg = "A file was found, but it may not be the correct file."; break;
+            case 1181: msg = "The journal entry has been deleted from the journal."; break;
+            case 1200: msg = "The specified device name is invalid."; break;
+            case 1201: msg = "The device is not currently connected but it is a remembered connection."; break;
+            case 1202: msg = "The local device name has a remembered connection to another network resource."; break;
+            case 1203: msg = "The network path was either typed incorrectly, does not exist, or the network provider is not currently available."; break;
+            case 1204: msg = "The specified network provider name is invalid."; break;
+            case 1205: msg = "Unable to open the network connection profile."; break;
+            case 1206: msg = "The network connection profile is corrupted."; break;
+            case 1207: msg = "Cannot enumerate a noncontainer."; break;
+            case 1208: msg = "An extended error has occurred."; break;
+            case 1209: msg = "The format of the specified group name is invalid."; break;
+            case 1210: msg = "The format of the specified computer name is invalid."; break;
+            case 1211: msg = "The format of the specified event name is invalid."; break;
+            case 1212: msg = "The format of the specified domain name is invalid."; break;
+            case 1213: msg = "The format of the specified service name is invalid."; break;
+            case 1214: msg = "The format of the specified network name is invalid."; break;
+            case 1215: msg = "The format of the specified share name is invalid."; break;
+            case 1216: msg = "The format of the specified password is invalid."; break;
+            case 1217: msg = "The format of the specified message name is invalid."; break;
+            case 1218: msg = "The format of the specified message destination is invalid."; break;
+            case 1219: msg = "Multiple connections to a server or shared resource by the same user, using more than one user name, are not allowed."; break;
+            case 1220: msg = "An attempt was made to establish a session to a network server, but there are already too many sessions established to that server."; break;
+            case 1221: msg = "The workgroup or domain name is already in use by another computer on the network."; break;
+            case 1222: msg = "The network is not present or not started."; break;
+            case 1223: msg = "The operation was canceled by the user."; break;
+            case 1224: msg = "The requested operation cannot be performed on a file with a user-mapped section open."; break;
+            case 1225: msg = "The remote computer refused the network connection."; break;
+            case 1226: msg = "The network connection was gracefully closed."; break;
+            case 1227: msg = "The network transport endpoint already has an address associated with it."; break;
+            case 1228: msg = "An address has not yet been associated with the network endpoint."; break;
+            case 1229: msg = "An operation was attempted on a nonexistent network connection."; break;
+            case 1230: msg = "An invalid operation was attempted on an active network connection."; break;
+            case 1231: msg = "The network location cannot be reached."; break;
+            case 1232: msg = "The network location cannot be reached."; break;
+            case 1233: msg = "The network location cannot be reached."; break;
+            case 1234: msg = "No service is operating at the destination network endpoint on the remote system."; break;
+            case 1235: msg = "The request was aborted."; break;
+            case 1236: msg = "The network connection was aborted by the local system."; break;
+            case 1237: msg = "The operation could not be completed. A retry should be performed."; break;
+            case 1238: msg = "A connection to the server could not be made because the limit on the number of concurrent connections for this account has been reached."; break;
+            case 1239: msg = "Attempting to log in during an unauthorized time of day for this account."; break;
+            case 1240: msg = "The account is not authorized to log in from this station."; break;
+            case 1241: msg = "The network address could not be used for the operation requested."; break;
+            case 1242: msg = "The service is already registered."; break;
+            case 1243: msg = "The specified service does not exist."; break;
+            case 1244: msg = "The operation being requested was not performed because the user has not been authenticated."; break;
+            case 1245: msg = "The operation being requested was not performed because the user has not logged on to the network."; break;
+            case 1246: msg = "Return that wants caller to continue with work in progress."; break;
+            case 1247: msg = "An attempt was made to perform an initialization operation when initialization has already been completed."; break;
+            case 1248: msg = "No more local devices."; break;
+            case 1249: msg = "The specified site does not exist."; break;
+            case 1250: msg = "A domain controller with the specified name already exists."; break;
+            case 1251: msg = "This operation is supported only when you are connected to the server."; break;
+            case 1300: msg = "Not all privileges or groups referenced are assigned to the caller."; break;
+            case 1301: msg = "Some mapping between account names and security IDs was not done."; break;
+            case 1302: msg = "No system quota limits are specifically set for this account."; break;
+            case 1303: msg = "No encryption key is available. A well-known encryption key was returned."; break;
+            case 1304: msg = "The password is too complex to be converted to a LAN Manager password."; break;
+            case 1305: msg = "The revision level is unknown."; break;
+            case 1306: msg = "Indicates two revision levels are incompatible."; break;
+            case 1307: msg = "This security ID may not be assigned as the owner of this object."; break;
+            case 1308: msg = "This security ID may not be assigned as the primary group of an object."; break;
+            case 1309: msg = "An attempt has been made to operate on an impersonation token by a thread that is not currently impersonating a client."; break;
+            case 1310: msg = "The group may not be disabled."; break;
+            case 1311: msg = "There are currently no logon servers available to service the logon request."; break;
+            case 1312: msg = "A specified logon session does not exist. It may already have been terminated."; break;
+            case 1313: msg = "A specified privilege does not exist."; break;
+            case 1314: msg = "A required privilege is not held by the client."; break;
+            case 1315: msg = "The name provided is not a properly formed account name."; break;
+            case 1316: msg = "The specified account already exists."; break;
+            case 1317: msg = "The specified account does not exist."; break;
+            case 1318: msg = "The specified group already exists."; break;
+            case 1319: msg = "The specified group does not exist."; break;
+            case 1320: msg = "Either the specified user account is already a member of the specified group, or the specified group cannot be deleted because it contains a member."; break;
+            case 1321: msg = "The specified user account is not a member of the specified group account."; break;
+            case 1322: msg = "This operation is disallowed as it could result in an administration account being disabled, deleted or unable to log on."; break;
+            case 1323: msg = "Unable to update the password. The value provided as the current password is incorrect."; break;
+            case 1324: msg = "Unable to update the password. The value provided for the new password contains values that are not allowed in passwords."; break;
+            case 1325: msg = "Unable to update the password. The value provided for the new password does not meet the length, complexity, or history requirements of the domain."; break;
+            case 1326: msg = "The user name or password is incorrect."; break;
+            case 1327: msg = "Account restrictions are preventing this user from signing in."; break;
+            case 1328: msg = "Your account has time restrictions that keep you from signing in right now."; break;
+            case 1329: msg = "This user isn't allowed to sign in to this computer."; break;
+            case 1330: msg = "The password for this account has expired."; break;
+            case 1331: msg = "This user can't sign in because this account is currently disabled."; break;
+            case 1332: msg = "No mapping between account names and security IDs was done."; break;
+            case 1333: msg = "Too many local user identifiers (LUIDs) were requested at one time."; break;
+            case 1334: msg = "No more local user identifiers (LUIDs) are available."; break;
+            case 1335: msg = "The sub-authority part of a security ID is out of range."; break;
+            case 1336: msg = "The access control list (ACL) structure is invalid."; break;
+            case 1337: msg = "The security ID structure is invalid."; break;
+            case 1338: msg = "The security descriptor structure is invalid."; break;
+            case 1339: msg = "The inherited access control list (ACL) or access control entry (ACE) could not be built."; break;
+            case 1340: msg = "The server is currently disabled."; break;
+            case 1341: msg = "The server is currently enabled."; break;
+            case 1342: msg = "The value provided was an invalid value for an identifier authority."; break;
+            case 1343: msg = "No more memory is available for security information updates."; break;
+            case 1344: msg = "The specified attributes are invalid, or incompatible with the attributes for the group as a whole."; break;
+            case 1345: msg = "Either a required impersonation level was not provided, or the provided impersonation level is invalid."; break;
+            case 1346: msg = "It is not possible to open an anonymous level token."; break;
+            case 1347: msg = "The validation information class requested was invalid."; break;
+            case 1348: msg = "The type of the token is inappropriate for its attempted use."; break;
+            case 1349: msg = "Unable to perform a security operation on an object that has no associated security."; break;
+            case 1350: msg = "Configuration information could not be read from the domain controller, either because the machine is unavailable, or access has been denied."; break;
+            case 1351: msg = "The security account manager (SAM) or local security authority (LSA) server was in the wrong state to perform the security operation."; break;
+            case 1352: msg = "The domain was in the wrong state to perform the security operation."; break;
+            case 1353: msg = "This operation is only allowed for the Primary Domain Controller of the domain."; break;
+            case 1354: msg = "Unable to complete the requested operation because of either a catastrophic media failure or a data structure corruption on the disk."; break;
+            case 1355: msg = "The specified domain either does not exist or could not be contacted."; break;
+            case 1356: msg = "The specified domain already exists."; break;
+            case 1357: msg = "An attempt was made to exceed the limit on the number of domains per server."; break;
+            case 1358: msg = "Unable to complete the requested operation because of either a catastrophic media failure or a data structure corruption on the disk."; break;
+            case 1359: msg = "An internal error occurred."; break;
+            case 1360: msg = "Generic access types were contained in an access mask which should already be mapped to nongeneric types."; break;
+            case 1361: msg = "A security descriptor is not in the right format (absolute or self-relative)."; break;
+            case 1362: msg = "The requested action is restricted for use by logon processes only."; break;
+            case 1363: msg = "Cannot start a new logon session with an ID that is already in use."; break;
+            case 1364: msg = "A specified authentication package is unknown."; break;
+            case 1365: msg = "The logon session is not in a state that is consistent with the requested operation."; break;
+            case 1366: msg = "The logon session ID is already in use."; break;
+            case 1367: msg = "A logon request contained an invalid logon type value."; break;
+            case 1368: msg = "Unable to impersonate using a named pipe until data has been read from that pipe."; break;
+            case 1369: msg = "The transaction state of a registry subtree is incompatible with the requested operation."; break;
+            case 1370: msg = "An internal security database corruption has been encountered."; break;
+            case 1371: msg = "Cannot perform this operation on built-in accounts."; break;
+            case 1372: msg = "Cannot perform this operation on this built-in special group."; break;
+            case 1373: msg = "Cannot perform this operation on this built-in special user."; break;
+            case 1374: msg = "The user cannot be removed from a group because the group is currently the user's primary group."; break;
+            case 1375: msg = "The token is already in use as a primary token."; break;
+            case 1376: msg = "The specified local group does not exist."; break;
+            case 1377: msg = "The specified account name is not a member of the group."; break;
+            case 1378: msg = "The specified account name is already a member of the group."; break;
+            case 1379: msg = "The specified local group already exists."; break;
+            case 1380: msg = "Logon failure: the user has not been granted the requested logon type at this computer."; break;
+            case 1381: msg = "The maximum number of secrets that may be stored in a single system has been exceeded."; break;
+            case 1382: msg = "The length of a secret exceeds the maximum length allowed."; break;
+            case 1383: msg = "The local security authority database contains an internal inconsistency."; break;
+            case 1384: msg = "During a logon attempt, the user's security context accumulated too many security IDs."; break;
+            case 1385: msg = "Logon failure: the user has not been granted the requested logon type at this computer."; break;
+            case 1386: msg = "A cross-encrypted password is necessary to change a user password."; break;
+            case 1387: msg = "A member could not be added to or removed from the local group because the member does not exist."; break;
+            case 1388: msg = "A new member could not be added to a local group because the member has the wrong account type."; break;
+            case 1389: msg = "Too many security IDs have been specified."; break;
+            case 1390: msg = "A cross-encrypted password is necessary to change this user password."; break;
+            case 1391: msg = "Indicates an ACL contains no inheritable components."; break;
+            case 1392: msg = "The file or directory is corrupted and unreadable."; break;
+            case 1393: msg = "The disk structure is corrupted and unreadable."; break;
+            case 1394: msg = "There is no user session key for the specified logon session."; break;
+            case 1395: msg = "The service being accessed is licensed for a particular number of connections."; break;
+            case 1396: msg = "Logon failure: the target account name is incorrect."; break;
+            case 1397: msg = "Mutual Authentication failed. The server's password is out of date at the domain controller."; break;
+            case 1398: msg = "There is a time and/or date difference between the client and server."; break;
+            case 1399: msg = "This operation cannot be performed on the current domain."; break;
+            case 1400: msg = "Invalid window handle."; break;
+            case 1401: msg = "Invalid menu handle."; break;
+            case 1402: msg = "Invalid cursor handle."; break;
+            case 1403: msg = "Invalid accelerator table handle."; break;
+            case 1404: msg = "Invalid hook handle."; break;
+            case 1405: msg = "Invalid handle to a multiple-window position structure."; break;
+            case 1406: msg = "Cannot create a top-level child window."; break;
+            case 1407: msg = "Cannot find window class."; break;
+            case 1408: msg = "Invalid window; it belongs to other thread."; break;
+            case 1409: msg = "Hot key is already registered."; break;
+            case 1410: msg = "Class already exists."; break;
+            case 1411: msg = "Class does not exist."; break;
+            case 1412: msg = "Class still has open windows."; break;
+            case 1413: msg = "Invalid index."; break;
+            case 1414: msg = "Invalid icon handle."; break;
+            case 1415: msg = "Using private DIALOG window words."; break;
+            case 1416: msg = "The list box identifier was not found."; break;
+            case 1417: msg = "No wildcards were found."; break;
+            case 1418: msg = "Thread does not have a clipboard open."; break;
+            case 1419: msg = "Hot key is not registered."; break;
+            case 1420: msg = "The window is not a valid dialog window."; break;
+            case 1421: msg = "Control ID not found."; break;
+            case 1422: msg = "Invalid message for a combo box because it does not have an edit control."; break;
+            case 1423: msg = "The window is not a combo box."; break;
+            case 1424: msg = "Height must be less than 256."; break;
+            case 1425: msg = "Invalid device context (DC) handle."; break;
+            case 1426: msg = "Invalid hook procedure type."; break;
+            case 1427: msg = "Invalid hook procedure."; break;
+            case 1428: msg = "Cannot set nonlocal hook without a module handle."; break;
+            case 1429: msg = "This hook procedure can only be set globally."; break;
+            case 1430: msg = "The journal hook procedure is already installed."; break;
+            case 1431: msg = "The hook procedure is not installed."; break;
+            case 1432: msg = "Invalid message for single-selection list box."; break;
+            case 1433: msg = "LB_SETCOUNT sent to non-lazy list box."; break;
+            case 1434: msg = "This list box does not support tab stops."; break;
+            case 1435: msg = "Cannot destroy object created by another thread."; break;
+            case 1436: msg = "Child windows cannot have menus."; break;
+            case 1437: msg = "The window does not have a system menu."; break;
+            case 1438: msg = "Invalid message box style."; break;
+            case 1439: msg = "Invalid system-wide (SPI_*) parameter."; break;
+            case 1440: msg = "Screen already locked."; break;
+            case 1441: msg = "All handles to windows in a multiple-window position structure must have the same parent."; break;
+            case 1442: msg = "The window is not a child window."; break;
+            case 1443: msg = "Invalid GW_* command."; break;
+            case 1444: msg = "Invalid thread identifier."; break;
+            case 1445: msg = "Cannot process a message from a window that is not a multiple document interface (MDI) window."; break;
+            case 1446: msg = "Popup menu already active."; break;
+            case 1447: msg = "The window does not have scroll bars."; break;
+            case 1448: msg = "Scroll bar range cannot be greater than MAXLONG."; break;
+            case 1449: msg = "Cannot show or remove the window in the way specified."; break;
+            case 1450: msg = "Insufficient system resources exist to complete the requested service."; break;
+            case 1451: msg = "Insufficient system resources exist to complete the requested service."; break;
+            case 1452: msg = "Insufficient system resources exist to complete the requested service."; break;
+            case 1453: msg = "Insufficient quota to complete the requested service."; break;
+            case 1454: msg = "Insufficient quota to complete the requested service."; break;
+            case 1455: msg = "The paging file is too small for this operation to complete."; break;
+            case 1456: msg = "A menu item was not found."; break;
+            case 1457: msg = "Invalid keyboard layout handle."; break;
+            case 1458: msg = "Hook type not allowed."; break;
+            case 1459: msg = "This operation requires an interactive window station."; break;
+            case 1460: msg = "This operation returned because the timeout period expired."; break;
+            case 1461: msg = "Invalid monitor handle."; break;
+            case 1462: msg = "Incorrect size argument."; break;
+            case 1463: msg = "The symbolic link cannot be followed because its type is disabled."; break;
+            case 1464: msg = "This application does not support the current operation on symbolic links."; break;
+            case 1465: msg = "Windows was unable to parse the requested XML data."; break;
+            case 1466: msg = "An error was encountered while processing an XML digital signature."; break;
+            case 1467: msg = "This application must be restarted."; break;
+            case 1468: msg = "The caller made the connection request in the wrong routing compartment."; break;
+            case 1469: msg = "There was an AuthIP failure when attempting to connect to the remote host."; break;
+            case 1470: msg = "Insufficient NVRAM resources exist to complete the requested service. A reboot might be required."; break;
+            case 1471: msg = "Unable to finish the requested operation because the specified process is not a GUI process."; break;
+            case 1500: msg = "The event log file is corrupted."; break;
+            case 1501: msg = "No event log file could be opened, so the event logging service did not start."; break;
+            case 1502: msg = "The event log file is full."; break;
+            case 1503: msg = "The event log file has changed between read operations."; break;
+            case 1504: msg = "The specified Job already has a container assigned to it."; break;
+            case 1700: msg = "The string binding is invalid."; break;
+            case 1701: msg = "The binding handle is not the correct type."; break;
+            case 1702: msg = "The binding handle is invalid."; break;
+            case 1703: msg = "The RPC protocol sequence is not supported."; break;
+            case 1704: msg = "The RPC protocol sequence is invalid."; break;
+            case 1705: msg = "The string universal unique identifier (UUID) is invalid."; break;
+            case 1706: msg = "The endpoint format is invalid."; break;
+            case 1707: msg = "The network address is invalid."; break;
+            case 1708: msg = "No endpoint was found."; break;
+            case 1709: msg = "The timeout value is invalid."; break;
+            case 1710: msg = "The object universal unique identifier (UUID) was not found."; break;
+            case 1711: msg = "The object universal unique identifier (UUID) has already been registered."; break;
+            case 1712: msg = "The type universal unique identifier (UUID) has already been registered."; break;
+            case 1713: msg = "The RPC server is already listening."; break;
+            case 1714: msg = "No protocol sequences have been registered."; break;
+            case 1715: msg = "The RPC server is not listening."; break;
+            case 1716: msg = "The manager type is unknown."; break;
+            case 1717: msg = "The interface is unknown."; break;
+            case 1718: msg = "There are no bindings."; break;
+            case 1719: msg = "There are no protocol sequences."; break;
+            case 1720: msg = "The endpoint cannot be created."; break;
+            case 1721: msg = "Not enough resources are available to complete this operation."; break;
+            case 1722: msg = "The RPC server is unavailable."; break;
+            case 1723: msg = "The RPC server is too busy to complete this operation."; break;
+            case 1724: msg = "The network options are invalid."; break;
+            case 1725: msg = "There are no remote procedure calls active on this thread."; break;
+            case 1726: msg = "The remote procedure call failed."; break;
+            case 1727: msg = "The remote procedure call failed and did not execute."; break;
+            case 1728: msg = "A remote procedure call (RPC) protocol error occurred."; break;
+            case 1730: msg = "The transfer syntax is not supported by the RPC server."; break;
+            case 1732: msg = "The universal unique identifier (UUID) type is not supported."; break;
+            case 1733: msg = "The tag is invalid."; break;
+            case 1734: msg = "The array bounds are invalid."; break;
+            case 1735: msg = "The binding does not contain an entry name."; break;
+            case 1736: msg = "The name syntax is invalid."; break;
+            case 1737: msg = "The name syntax is not supported."; break;
+            case 1739: msg = "No network address is available to use to construct a universal unique identifier (UUID)."; break;
+            case 1740: msg = "The endpoint is a duplicate."; break;
+            case 1741: msg = "The authentication type is unknown."; break;
+            case 1742: msg = "The maximum number of calls is too small."; break;
+            case 1743: msg = "The string is too long."; break;
+            case 1744: msg = "The RPC protocol sequence was not found."; break;
+            case 1745: msg = "The procedure number is out of range."; break;
+            case 1746: msg = "The binding does not contain any authentication information."; break;
+            case 1747: msg = "The authentication service is unknown."; break;
+            case 1748: msg = "The authentication level is unknown."; break;
+            case 1749: msg = "The security context is invalid."; break;
+            case 1750: msg = "The authorization service is unknown."; break;
+            case 1751: msg = "The entry is invalid."; break;
+            case 1752: msg = "The server endpoint cannot perform the operation."; break;
+            case 1753: msg = "There are no more endpoints available from the endpoint mapper."; break;
+            case 1754: msg = "No interfaces have been exported."; break;
+            case 1755: msg = "The entry name is incomplete."; break;
+            case 1756: msg = "The version option is invalid."; break;
+            case 1757: msg = "There are no more members."; break;
+            case 1758: msg = "There is nothing to unexport."; break;
+            case 1759: msg = "The interface was not found."; break;
+            case 1760: msg = "The entry already exists."; break;
+            case 1761: msg = "The entry is not found."; break;
+            case 1762: msg = "The name service is unavailable."; break;
+            case 1763: msg = "The network address family is invalid."; break;
+            case 1764: msg = "The requested operation is not supported."; break;
+            case 1765: msg = "No security context is available to allow impersonation."; break;
+            case 1766: msg = "An internal error occurred in a remote procedure call (RPC)."; break;
+            case 1767: msg = "The RPC server attempted an integer division by zero."; break;
+            case 1768: msg = "An addressing error occurred in the RPC server."; break;
+            case 1769: msg = "A floating-point operation at the RPC server caused a division by zero."; break;
+            case 1770: msg = "A floating-point underflow occurred at the RPC server."; break;
+            case 1771: msg = "A floating-point overflow occurred at the RPC server."; break;
+            case 1772: msg = "The list of RPC servers available for the binding of auto handles has been exhausted."; break;
+            case 1773: msg = "Unable to open the character translation table file."; break;
+            case 1774: msg = "The file containing the character translation table has fewer than 512 bytes."; break;
+            case 1775: msg = "A null context handle was passed from the client to the host during a remote procedure call."; break;
+            case 1777: msg = "The context handle changed during a remote procedure call."; break;
+            case 1778: msg = "The binding handles passed to a remote procedure call do not match."; break;
+            case 1779: msg = "The stub is unable to get the remote procedure call handle."; break;
+            case 1780: msg = "A null reference pointer was passed to the stub."; break;
+            case 1781: msg = "The enumeration value is out of range."; break;
+            case 1782: msg = "The byte count is too small."; break;
+            case 1783: msg = "The stub received bad data."; break;
+            case 1784: msg = "The supplied user buffer is not valid for the requested operation."; break;
+            case 1785: msg = "The disk media is not recognized. It may not be formatted."; break;
+            case 1786: msg = "The workstation does not have a trust secret."; break;
+            case 1787: msg = "The security database on the server does not have a computer account for this workstation trust relationship."; break;
+            case 1788: msg = "The trust relationship between the primary domain and the trusted domain failed."; break;
+            case 1789: msg = "The trust relationship between this workstation and the primary domain failed."; break;
+            case 1790: msg = "The network logon failed."; break;
+            case 1791: msg = "A remote procedure call is already in progress for this thread."; break;
+            case 1792: msg = "An attempt was made to logon, but the network logon service was not started."; break;
+            case 1793: msg = "The user's account has expired."; break;
+            case 1794: msg = "The redirector is in use and cannot be unloaded."; break;
+            case 1795: msg = "The specified printer driver is already installed."; break;
+            case 1796: msg = "The specified port is unknown."; break;
+            case 1797: msg = "The printer driver is unknown."; break;
+            case 1798: msg = "The print processor is unknown."; break;
+            case 1799: msg = "The specified separator file is invalid."; break;
+            case 1800: msg = "The specified priority is invalid."; break;
+            case 1801: msg = "The printer name is invalid."; break;
+            case 1802: msg = "The printer already exists."; break;
+            case 1803: msg = "The printer command is invalid."; break;
+            case 1804: msg = "The specified datatype is invalid."; break;
+            case 1805: msg = "The environment specified is invalid."; break;
+            case 1806: msg = "There are no more bindings."; break;
+            case 1807: msg = "The account used is an interdomain trust account. Use your global user account or local user account to access this server."; break;
+            case 1808: msg = "The account used is a computer account. Use your global user account or local user account to access this server."; break;
+            case 1809: msg = "The account used is a server trust account. Use your global user account or local user account to access this server."; break;
+            case 1810: msg = "The name or security ID (SID) of the domain specified is inconsistent with the trust information for that domain."; break;
+            case 1811: msg = "The server is in use and cannot be unloaded."; break;
+            case 1812: msg = "The specified image file did not contain a resource section."; break;
+            case 1813: msg = "The specified resource type cannot be found in the image file."; break;
+            case 1814: msg = "The specified resource name cannot be found in the image file."; break;
+            case 1815: msg = "The specified resource language ID cannot be found in the image file."; break;
+            case 1816: msg = "Not enough quota is available to process this command."; break;
+            case 1817: msg = "No interfaces have been registered."; break;
+            case 1818: msg = "The remote procedure call was cancelled."; break;
+            case 1819: msg = "The binding handle does not contain all required information."; break;
+            case 1820: msg = "A communications failure occurred during a remote procedure call."; break;
+            case 1821: msg = "The requested authentication level is not supported."; break;
+            case 1822: msg = "No principal name registered."; break;
+            case 1823: msg = "The error specified is not a valid Windows RPC error code."; break;
+            case 1824: msg = "A UUID that is valid only on this computer has been allocated."; break;
+            case 1825: msg = "A security package specific error occurred."; break;
+            case 1826: msg = "Thread is not canceled."; break;
+            case 1827: msg = "Invalid operation on the encoding/decoding handle."; break;
+            case 1828: msg = "Incompatible version of the serializing package."; break;
+            case 1829: msg = "Incompatible version of the RPC stub."; break;
+            case 1898: msg = "The list of servers available for this workgroup is not currently available."; break;
+            case 2202: msg = "The specified username is invalid."; break;
+            case 2250: msg = "The network connection does not exist."; break;
             default: {
                 /* Try strerror as a fallback */
                 const char* s = strerror((int)message_id);
@@ -8604,6 +9530,23 @@ not_found:
     LSW_LOG_DEBUG("LoadStringW: uID=%u not found", uID);
     return 0;
 }
+
+/* LoadStringA — narrow wrapper around LoadStringW */
+int __attribute__((ms_abi)) lsw_LoadStringA(void* hInstance, uint32_t uID, char* lpBuffer, int cchBuffer) {
+    if (!lpBuffer || cchBuffer <= 0) {
+        /* Probe: call W version with NULL buffer to get length */
+        uint16_t tmp[512];
+        return lsw_LoadStringW(hInstance, uID, tmp, 512);
+    }
+    uint16_t wbuf[512];
+    int r = lsw_LoadStringW(hInstance, uID, wbuf, 512);
+    if (r <= 0) return 0;
+    int out = 0;
+    for (int i = 0; i < r && out < cchBuffer - 1; i++)
+        lpBuffer[out++] = (char)(wbuf[i] < 0x80 ? wbuf[i] : '?');
+    lpBuffer[out] = '\0';
+    return out;
+}
 wchar_t* __attribute__((ms_abi)) lsw_CharLowerW(wchar_t* lpsz) {
     if (!lpsz) return NULL;
     for (u16* p = (u16*)lpsz; *p; p++) *p = (u16)towlower(*p);
@@ -8926,6 +9869,14 @@ int __attribute__((ms_abi)) lsw__wtoi(const uint16_t* str) {
     if (!str) return 0;
     while (*str == ' ' || *str == '\t') str++;
     int neg = 0; int val = 0;
+    if (*str == '-') { neg = 1; str++; } else if (*str == '+') str++;
+    while (*str >= '0' && *str <= '9') { val = val * 10 + (*str - '0'); str++; }
+    return neg ? -val : val;
+}
+int64_t __attribute__((ms_abi)) lsw__wtoi64(const uint16_t* str) {
+    if (!str) return 0;
+    while (*str == ' ' || *str == '\t') str++;
+    int neg = 0; int64_t val = 0;
     if (*str == '-') { neg = 1; str++; } else if (*str == '+') str++;
     while (*str >= '0' && *str <= '9') { val = val * 10 + (*str - '0'); str++; }
     return neg ? -val : val;
@@ -9522,6 +10473,24 @@ int __attribute__((ms_abi)) lsw_EnumDependentServicesW(void* hService,
     lsw_SetLastError(6); return 0;
 }
 
+/* imagehlp.dll / dbghelp.dll stubs */
+int __attribute__((ms_abi)) lsw_EnumerateLoadedModulesW64(void* hProcess,
+    void* EnumLoadedModulesCallbackW64, void* UserContext) {
+    (void)hProcess; (void)EnumLoadedModulesCallbackW64; (void)UserContext;
+    return 0; /* FALSE — no modules enumerated */
+}
+void* __attribute__((ms_abi)) lsw_ImagehlpApiVersion(void) {
+    /* Returns pointer to static API_VERSION struct: MajorVersion, MinorVersion, Revision, Reserved */
+    static uint16_t ver[4] = {12, 0, 0, 0}; /* version 12.0 */
+    return ver;
+}
+int __attribute__((ms_abi)) lsw_SymInitialize(void* hProcess, const char* UserSearchPath, int fInvadeProcess) {
+    (void)hProcess; (void)UserSearchPath; (void)fInvadeProcess; return 1; /* TRUE */
+}
+int __attribute__((ms_abi)) lsw_SymCleanup(void* hProcess) {
+    (void)hProcess; return 1; /* TRUE */
+}
+
 /* MPR (Multiple Provider Router) stubs */
 int __attribute__((ms_abi)) lsw_WNetGetLastErrorW(uint32_t* lpError, uint16_t* lpErrorBuf,
     uint32_t nErrorBufSize, uint16_t* lpNameBuf, uint32_t nNameBufSize) {
@@ -9820,6 +10789,7 @@ static const win32_api_mapping_t api_mappings[] = {
 
     // USER32.dll — additional stubs
     {"USER32.dll", "LoadStringW",          (void*)lsw_LoadStringW},
+    {"USER32.dll", "LoadStringA",          (void*)lsw_LoadStringA},
     {"USER32.dll", "CharLowerW",           (void*)lsw_CharLowerW},
     {"USER32.dll", "CharUpperW",           (void*)lsw_CharUpperW},
 
@@ -10659,6 +11629,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcrt.dll",   "wcscspn",     (void*)lsw_wcscspn},
     {"msvcrt.dll",   "_wcsupr",     (void*)lsw__wcsupr},
     {"msvcrt.dll",   "_wtoi",       (void*)lsw__wtoi},
+    {"msvcrt.dll",   "_wtoi64",     (void*)lsw__wtoi64},
     {"msvcrt.dll",   "iswctype",    (void*)lsw_iswctype},
     {"msvcrt.dll",   "_snwprintf_s",(void*)lsw__snwprintf_s},
     {"msvcrt.dll",   "_vsnwprintf_s",(void*)lsw__vsnwprintf_s},
@@ -10872,6 +11843,19 @@ static const win32_api_mapping_t api_mappings[] = {
     {"api-ms-win-security-base-l1-1-0.dll", "SetSecurityDescriptorDacl",  (void*)lsw_SetSecurityDescriptorDacl},
     {"api-ms-win-security-base-l1-1-0.dll", "GetSidSubAuthorityCount",    (void*)lsw_GetSidSubAuthorityCount},
     {"api-ms-win-security-base-l1-1-0.dll", "GetSidSubAuthority",         (void*)lsw_GetSidSubAuthority},
+
+    /* imagehlp.dll — debugging/module enumeration */
+    {"imagehlp.dll", "EnumerateLoadedModulesW64", (void*)lsw_EnumerateLoadedModulesW64},
+    {"imagehlp.dll", "EnumerateLoadedModules64",  (void*)lsw_EnumerateLoadedModulesW64},
+    {"imagehlp.dll", "EnumerateLoadedModules",    (void*)lsw_EnumerateLoadedModulesW64},
+    {"imagehlp.dll", "ImagehlpApiVersion",        (void*)lsw_ImagehlpApiVersion},
+
+    /* dbghelp.dll — debug helper stubs */
+    {"dbghelp.dll",  "SymInitialize",             (void*)lsw_SymInitialize},
+    {"dbghelp.dll",  "SymCleanup",                (void*)lsw_SymCleanup},
+    {"dbghelp.dll",  "EnumerateLoadedModulesW64", (void*)lsw_EnumerateLoadedModulesW64},
+    {"dbghelp.dll",  "EnumerateLoadedModules64",  (void*)lsw_EnumerateLoadedModulesW64},
+    {"dbghelp.dll",  "ImagehlpApiVersion",        (void*)lsw_ImagehlpApiVersion},
 };
 
 #pragma GCC diagnostic pop
@@ -10960,6 +11944,11 @@ static const lsw_ordinal_entry_t ordinal_table[] = {
     {"OLEAUT32.dll",  8, "SysStringByteLen"},
     {"OLEAUT32.dll",  9, "SysAllocStringByteLen"},
     {"OLEAUT32.dll", 10, "SysAllocStringByteLen"},  /* alias ordinal 10 */
+    {"OLEAUT32.dll", 12, "VariantInit"},             /* Variant init — VT_EMPTY */
+    {"OLEAUT32.dll", 13, "VariantClear"},
+    {"OLEAUT32.dll", 14, "VariantCopy"},
+    {"OLEAUT32.dll", 16, "VariantChangeType"},
+    {"OLEAUT32.dll", 150, "VariantTimeToSystemTime"},/* Var time conversions */
     /* {sentinel} */
     {NULL, 0, NULL}
 };

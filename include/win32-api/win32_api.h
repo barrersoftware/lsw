@@ -55,7 +55,8 @@ void lsw_set_exe_path(const char* path);
 // can walk the .pdata table to find matching catch blocks.
 void win32_api_set_pe_image_info(uint64_t image_base,
                                   void*    pdata_va,
-                                  uint32_t pdata_size);
+                                  uint32_t pdata_size,
+                                  uint32_t image_size);
 
 // Get all API mappings
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count);

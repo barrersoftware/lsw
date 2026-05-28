@@ -515,6 +515,15 @@ int32_t __attribute__((ms_abi)) lsw_VarDateFromStr(const uint16_t* strIn, uint32
     return S_OK;
 }
 
+/* VariantTimeToSystemTime — ordinal 150. Converts variant DATE (double) to SYSTEMTIME.
+ * A variant DATE is the number of days since 30 December 1899.
+ * We return a minimal stub (fails gracefully) to satisfy tasklist.exe ordinal imports. */
+int32_t __attribute__((ms_abi)) lsw_VariantTimeToSystemTime(double vtime, void* lpST) {
+    LSW_UNUSED(vtime);
+    if (lpST) { memset(lpST, 0, 16 /* sizeof SYSTEMTIME */); }
+    return 0; /* FALSE — caller must check */
+}
+
 int32_t __attribute__((ms_abi)) lsw_VarFormat(VARIANT* pvarIn, uint16_t* pstrFormat, int iFirstDay, int iFirstWeek, uint32_t dwFlags, uint16_t** pbstrOut) {
     LSW_UNUSED(pvarIn);
     LSW_UNUSED(iFirstDay);
@@ -1024,6 +1033,7 @@ const win32_api_mapping_t win32_api_oleaut32_mappings[] = {
     {"oleaut32.dll", "VarI4FromR8", (void*)lsw_VarI4FromR8},
     {"oleaut32.dll", "VarR8FromI4", (void*)lsw_VarR8FromI4},
     {"oleaut32.dll", "VarDateFromStr", (void*)lsw_VarDateFromStr},
+    {"oleaut32.dll", "VariantTimeToSystemTime", (void*)lsw_VariantTimeToSystemTime},
     {"oleaut32.dll", "VarFormat", (void*)lsw_VarFormat},
     {"oleaut32.dll", "VarCmp", (void*)lsw_VarCmp},
     {"oleaut32.dll", "SafeArrayCreate", (void*)lsw_SafeArrayCreate},
