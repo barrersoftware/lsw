@@ -8457,6 +8457,10 @@ void* __attribute__((ms_abi)) lsw_LoadLibraryExW(const uint16_t* lpLibFileName, 
     narrow[i] = 0;
     return lsw_LoadLibraryA(narrow);
 }
+void* __attribute__((ms_abi)) lsw_LoadLibraryExA(const char* lpLibFileName, void* hFile, uint32_t dwFlags) {
+    (void)hFile; (void)dwFlags;
+    return lsw_LoadLibraryA(lpLibFileName);
+}
 int __attribute__((ms_abi)) lsw_GetModuleHandleExW(uint32_t dwFlags, const uint16_t* lpModuleName, void** phModule) {
     (void)dwFlags;
     if (phModule) *phModule = lsw_LoadLibraryExW(lpModuleName, NULL, 0);
@@ -12435,6 +12439,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "FreeLibrary",              (void*)lsw_FreeLibrary},
     {"KERNEL32.dll", "FreeLibraryAndExitThread", (void*)lsw_FreeLibraryAndExitThread},
     {"KERNEL32.dll", "LoadLibraryExW",           (void*)lsw_LoadLibraryExW},
+    {"KERNEL32.dll", "LoadLibraryExA",           (void*)lsw_LoadLibraryExA},
     {"KERNEL32.dll", "SetDefaultDllDirectories", (void*)lsw_SetDefaultDllDirectories},
     {"KERNEL32.dll", "AddDllDirectory",          (void*)lsw_AddDllDirectory},
     {"KERNEL32.dll", "RemoveDllDirectory",       (void*)lsw_RemoveDllDirectory},
@@ -12800,6 +12805,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"api-ms-win-core-libraryloader-l1-2-0.dll","GetModuleFileNameW",(void*)lsw_GetModuleFileNameW},
     {"api-ms-win-core-libraryloader-l1-2-0.dll","FreeLibrary",       (void*)lsw_FreeLibrary},
     {"api-ms-win-core-libraryloader-l1-2-0.dll","LoadLibraryExW",    (void*)lsw_LoadLibraryExW},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll","LoadLibraryExA",    (void*)lsw_LoadLibraryExA},
+    {"KERNEL32.dll", "LoadLibraryExA",           (void*)lsw_LoadLibraryExA},
 
     /* api-ms-win-core-localization */
     {"api-ms-win-core-localization-l1-2-0.dll","SetThreadUILanguage",(void*)lsw_SetThreadUILanguage},
