@@ -588,15 +588,20 @@ int __attribute__((ms_abi)) lsw_vfprintf(FILE* stream, const char* format, va_li
 }
 
 int __attribute__((ms_abi)) lsw_fprintf(FILE* stream, const char* format, ...) {
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
     __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
     va_list ap; LSW_MS_TO_SYSV_VA(ap, ms_ap);
     char* buf = NULL; vasprintf(&buf, format, ap);
     __builtin_ms_va_end(ms_ap);
     if (!buf) return -1;
     int fd = -1;
-    if (stream == stdout) fd = 1; else if (stream == stderr) fd = 2;
+    fake_FILE* fake = (fake_FILE*)stream;
+    if (fake && fake->_file >= 0) fd = fake->_file;  /* handles stdin/stdout/stderr + files */
+    else if (stream == stdout) fd = 1;
+    else if (stream == stderr) fd = 2;
     int result = (fd >= 0) ? (int)write(fd, buf, strlen(buf))
-                           : (int)fwrite(buf, 1, strlen(buf), stream ? stream : stderr);
+                           : (int)write(1, buf, strlen(buf)); /* fallback to stdout */
     free(buf);
     return result;
 }
@@ -731,6 +736,7 @@ static int lsw_wide_vprintf_to_fd(int fd, const wchar_t* format_wc, char* ap) {
             } else {
                 /* narrow string */
                 const char* nstr = W64_VA(ap, const char*);
+                LSW_LOG_DEBUG("wide_vprintf: %%S arg=%s len=%d", nstr ? nstr : "(null)", nstr ? (int)strlen(nstr) : -1);
                 if (!nstr) nstr = "(null)";
                 int nl=(int)strlen(nstr); if(olen+nl<(int)sizeof(out)) { memcpy(out+olen,nstr,nl); olen+=nl; }
             }
@@ -790,6 +796,19 @@ static int lsw_wide_vprintf_to_fd(int fd, const wchar_t* format_wc, char* ap) {
 }
 
 int __attribute__((ms_abi)) lsw_wprintf(const wchar_t* format, ...) {
+    if (format) {
+        char dbg[64] = {0};
+        const uint16_t* wfmt = (const uint16_t*)format;
+        int di = 0;
+        for (int i = 0; wfmt[i] && di < 60; i++) {
+            uint16_t c = wfmt[i];
+            if (c == '\n' || c == '\r') { dbg[di++] = '\\'; dbg[di++] = 'n'; }
+            else if (c < 128) dbg[di++] = (char)c;
+            else dbg[di++] = '?';
+        }
+        dbg[di] = '\0';
+        LSW_LOG_INFO("wprintf: fmt=\"%s\"", dbg);
+    }
     __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
     int r = lsw_wide_vprintf_to_fd(1, format, (char*)ms_ap);
     __builtin_ms_va_end(ms_ap);
@@ -797,6 +816,19 @@ int __attribute__((ms_abi)) lsw_wprintf(const wchar_t* format, ...) {
 }
 
 int __attribute__((ms_abi)) lsw_vwprintf(const wchar_t* format, __builtin_ms_va_list ap) {
+    if (format) {
+        char dbg[64] = {0};
+        const uint16_t* wf = (const uint16_t*)format;
+        int di = 0;
+        for (int i = 0; wf[i] && di < 60; i++) {
+            uint16_t c = wf[i];
+            if (c == '\n' || c == '\r') { dbg[di++] = '\\'; dbg[di++] = 'n'; }
+            else if (c < 128) dbg[di++] = (char)c;
+            else dbg[di++] = '?';
+        }
+        dbg[di] = '\0';
+        LSW_LOG_INFO("vwprintf: fmt=\"%s\"", dbg);
+    }
     return lsw_wide_vprintf_to_fd(1, format, (char*)ap);
 }
 
@@ -810,6 +842,20 @@ int __attribute__((ms_abi)) lsw_fwprintf(FILE* stream, const wchar_t* format, ..
         else if (f->_file == 2 || stream == (FILE*)stderr) fd = 2;
         else if (f->_file == 0 || stream == (FILE*)stdin)  fd = 0;
         else fd = f->_file;
+    }
+    /* Debug: log format string */
+    if (format) {
+        char dbg[128] = {0};
+        const uint16_t* wfmt = (const uint16_t*)format;
+        int di = 0;
+        for (int i = 0; wfmt[i] && di < 120; i++) {
+            uint16_t c = wfmt[i];
+            if (c == '\n' || c == '\r') { dbg[di++] = '\\'; dbg[di++] = (c=='\n'?'n':'r'); }
+            else if (c < 128) dbg[di++] = (char)c;
+            else dbg[di++] = '?';
+        }
+        dbg[di] = '\0';
+        LSW_LOG_INFO("fwprintf(fd=%d): fmt=\"%s\"", fd, dbg);
     }
     __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, format);
     int r = lsw_wide_vprintf_to_fd(fd, format, (char*)ms_ap);
@@ -843,34 +889,18 @@ int __attribute__((ms_abi)) lsw_fputwc(wchar_t wc, FILE* stream) {
 }
 
 int __attribute__((ms_abi)) lsw_fflush(FILE* stream) {
-    // Handle NULL (flush all streams)
-    if (!stream) {
-        return fflush(NULL);
-    }
-    
-    // Define the fake FILE structure (same as in vfprintf)
     typedef struct {
-        char* _ptr;
-        int _cnt;
-        char* _base;
-        int _flag;
-        int _file;
-        int _charbuf;
-        int _bufsiz;
-        char* _tmpfname;
+        char* _ptr; int _cnt; char* _base; int _flag;
+        int _file; int _charbuf; int _bufsiz; char* _tmpfname;
     } fake_FILE;
-    
+    if (!stream) return 0;  /* flush all — no-op since we use write() */
     fake_FILE* fake = (fake_FILE*)stream;
-    
-    // Check if it's one of our fake stdio FILE structures
-    if (fake && fake->_file >= 0 && fake->_file <= 2) {
-        // For stdout/stderr/stdin fake structures, just return success
-        // Don't call real fflush as it will crash with fake FILE*
+    if (fake && fake->_file >= 0) {
+        fsync(fake->_file);  /* best-effort flush for file fds */
         return 0;
     }
-    
-    // Otherwise call real fflush
-    return fflush(stream);
+    if (stream == stdout || stream == stderr) return fflush(stream);
+    return 0;
 }
 
 void __attribute__((ms_abi)) lsw_exit(int status) {
@@ -882,36 +912,23 @@ void __attribute__((ms_abi)) lsw_abort(void) {
     abort();
 }
 
-// More stdio/string wrappers that need MS ABI
 int __attribute__((ms_abi)) lsw_fputc(int c, FILE* stream) {
-    // Check if this is our fake FILE structure
     typedef struct {
-        char* _ptr;
-        int _cnt;
-        char* _base;
-        int _flag;
-        int _file;
-        int _charbuf;
-        int _bufsiz;
-        char* _tmpfname;
+        char* _ptr; int _cnt; char* _base; int _flag;
+        int _file; int _charbuf; int _bufsiz; char* _tmpfname;
     } fake_FILE;
-    
     fake_FILE* fake = (fake_FILE*)stream;
-    
-    // Check if it's one of our fake stdio FILE structures (fd 0-2)
-    if (fake && fake->_file >= 0 && fake->_file <= 2) {
-        // Use Linux write() directly to the fd
+    if (fake && fake->_file >= 0) {
         char ch = (char)c;
         ssize_t written = write(fake->_file, &ch, 1);
         return (written == 1) ? c : EOF;
     }
-    
-    // Otherwise use real fputc
-    return fputc(c, stream);
+    if (stream == stdout || stream == stderr) return fputc(c, stream);
+    /* Unknown stream — write to stdout */
+    char ch = (char)c; write(1, &ch, 1); return c;
 }
 
 size_t __attribute__((ms_abi)) lsw_fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
-    // Check if this is our fake FILE structure
     typedef struct {
         char* _ptr;
         int _cnt;
@@ -922,19 +939,21 @@ size_t __attribute__((ms_abi)) lsw_fwrite(const void* ptr, size_t size, size_t n
         int _bufsiz;
         char* _tmpfname;
     } fake_FILE;
-    
+
     fake_FILE* fake = (fake_FILE*)stream;
-    
-    // Check if it's one of our fake stdio FILE structures (fd 0-2)
-    if (fake && fake->_file >= 0 && fake->_file <= 2) {
-        // Use Linux write() directly
+    /* If stream is our fake FILE* (any valid fd >= 0), use write() directly */
+    if (fake && fake->_file >= 0) {
         size_t total = size * nmemb;
         ssize_t written = write(fake->_file, ptr, total);
-        return written > 0 ? (size_t)written / size : 0;
+        return written > 0 ? (size_t)written / (size ? size : 1) : 0;
     }
-    
-    // Otherwise use real fwrite
-    return fwrite(ptr, size, nmemb, stream);
+    /* Fallback for real glibc FILE* (stdout/stderr directly) */
+    if (stream == stdout || stream == stderr || stream == stdin)
+        return fwrite(ptr, size, nmemb, stream);
+    /* Unknown stream — write to stdout as fallback */
+    size_t total = size * nmemb;
+    ssize_t written = write(1, ptr, total);
+    return written > 0 ? (size_t)written / (size ? size : 1) : 0;
 }
 
 char* __attribute__((ms_abi)) lsw_strerror(int errnum) {
@@ -2200,13 +2219,14 @@ int __attribute__((ms_abi)) lsw_fputs(const char* str, void* stream) {
     if (!str) return -1;
     typedef struct { char* _ptr; int _cnt; char* _base; int _flag; int _file; } fake_FILE;
     fake_FILE* fake = (fake_FILE*)stream;
-    if (fake && fake->_file >= 0 && fake->_file <= 2) {
+    if (fake && fake->_file >= 0) {
         size_t len = strlen(str);
         ssize_t written = write(fake->_file, str, len);
         return written >= 0 ? (int)written : EOF;
     }
-    if (!stream) return write(1, str, strlen(str)) >= 0 ? 0 : EOF;
-    return fputs(str, (FILE*)stream);
+    if (!stream || stream == stdout) return write(1, str, strlen(str)) >= 0 ? 0 : EOF;
+    if (stream == stderr) return write(2, str, strlen(str)) >= 0 ? 0 : EOF;
+    return write(1, str, strlen(str)) >= 0 ? 0 : EOF;  /* fallback to stdout */
 }
 
 /* _iob — pointer to FILE array (alias for __iob_func result) */
@@ -2281,12 +2301,12 @@ int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsig
     int len = srclen >= 0 ? srclen : (src ? (int)strlen(src) : 0);
 
     if (!dst) {
-        LSW_LOG_INFO("MultiByteToWideChar: query size for %d chars", len);
+        LSW_LOG_DEBUG("MultiByteToWideChar: query size for %d chars", len);
         return len;
     }
 
     if (len > dstlen) len = dstlen;
-    LSW_LOG_INFO("MultiByteToWideChar: cp=%u srclen=%d dstlen=%d -> %d chars", codepage, srclen, dstlen, len);
+    LSW_LOG_DEBUG("MultiByteToWideChar: cp=%u srclen=%d dstlen=%d -> %d chars", codepage, srclen, dstlen, len);
 
     /* Write UTF-16LE (2-byte) characters into dst — caller is Windows code expecting uint16_t */
     for (int i = 0; i < len; i++) {
@@ -2320,7 +2340,7 @@ int __attribute__((ms_abi)) lsw_WideCharToMultiByte(unsigned int codepage, unsig
         return (int)actual_srclen; /* Conservative: 1 byte per wide char for BMP */
     }
 
-    LSW_LOG_INFO("WideCharToMultiByte: cp=%u srclen=%d dstlen=%d actual=%zu", codepage, srclen, dstlen, actual_srclen);
+    LSW_LOG_DEBUG("WideCharToMultiByte: cp=%u srclen=%d dstlen=%d actual=%zu", codepage, srclen, dstlen, actual_srclen);
 
     size_t src_idx = 0, dst_idx = 0;
     while (src_idx < actual_srclen && dst_idx < (size_t)dstlen) {
@@ -2473,11 +2493,11 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA: %s -> %s (access=0x%x creation=%u flags=0x%x)", filename, linux_path, access, creation, flags);
+    LSW_LOG_DEBUG("CreateFileA: %s -> %s (access=0x%x creation=%u flags=0x%x)", filename, linux_path, access, creation, flags);
     
     // Route through kernel module if available
     if (g_kernel_fd >= 0) {
-        LSW_LOG_INFO("Routing CreateFileA through kernel NtCreateFile!");
+        LSW_LOG_DEBUG("Routing CreateFileA through kernel NtCreateFile!");
         
         struct lsw_syscall_request req;
         memset(&req, 0, sizeof(req));
@@ -2488,14 +2508,14 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         req.args[2] = creation;                          // Creation disposition
         req.args[3] = flags;                             // Flags
         
-        LSW_LOG_INFO("  Kernel NtCreateFile: path=%s, access=0x%x, creation=%u", 
+        LSW_LOG_DEBUG("  Kernel NtCreateFile: path=%s, access=0x%x, creation=%u", 
                      linux_path, access, creation);
         
         if (ioctl(g_kernel_fd, LSW_IOCTL_SYSCALL, &req) == 0) {
             uint64_t handle = req.return_value;
             if (handle != (uint64_t)-1 && handle != 0) {
                 // Success! Return the kernel handle
-                LSW_LOG_INFO("Kernel NtCreateFile success: handle=0x%llx", handle);
+                LSW_LOG_DEBUG("Kernel NtCreateFile success: handle=0x%llx", handle);
                 return (void*)(uintptr_t)handle;
             }
             // Kernel call succeeded but returned error - fall through to userspace
@@ -2535,7 +2555,7 @@ void* __attribute__((ms_abi)) lsw_CreateFileA(const char* filename, uint32_t acc
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileA: opened fd=%d", fd);
+    LSW_LOG_DEBUG("CreateFileA: opened fd=%d", fd);
     lsw_SetLastError(0); /* ERROR_SUCCESS */
     return (void*)(intptr_t)fd;
 }
@@ -2565,6 +2585,15 @@ int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
         if (pp->listen_fd >= 0) { close(pp->listen_fd); unlink(pp->path); pp->listen_fd = -1; }
         pp->magic = 0;
         free(pp);
+        return 1;
+    }
+
+    /* NT directory handle (from NtOpenFile/NtCreateFile) */
+    if (magic == LSW_DIR_MAGIC) {
+        lsw_nt_dir_handle_t* dh = (lsw_nt_dir_handle_t*)handle;
+        if (dh->dirp) closedir((DIR*)dh->dirp);
+        dh->magic = 0;
+        free(dh);
         return 1;
     }
 
@@ -3001,7 +3030,7 @@ int __attribute__((ms_abi)) lsw_DeleteFileA(const char* filename) {
 // Wide-char file operations
 void* __attribute__((ms_abi)) lsw_CreateFileW(const wchar_t* filename, uint32_t access, uint32_t share_mode,
                                                 void* security, uint32_t creation, uint32_t flags, void* template_file) {
-    LSW_LOG_INFO("CreateFileW called");
+    LSW_LOG_DEBUG("CreateFileW called");
     
     if (!filename) {
         LSW_LOG_ERROR("CreateFileW: null filename");
@@ -3016,7 +3045,7 @@ void* __attribute__((ms_abi)) lsw_CreateFileW(const wchar_t* filename, uint32_t 
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_INFO("CreateFileW: %s", filename_mb);
+    LSW_LOG_DEBUG("CreateFileW: %s", filename_mb);
     
     // Call CreateFileA with converted path
     return lsw_CreateFileA(filename_mb, access, share_mode, security, creation, flags, template_file);
@@ -3226,7 +3255,7 @@ int __attribute__((ms_abi)) lsw_RemoveDirectoryW(const wchar_t* pathname) {
 
 // File attribute operations
 uint32_t __attribute__((ms_abi)) lsw_GetFileAttributesW(const wchar_t* filename) {
-    LSW_LOG_INFO("GetFileAttributesW called");
+    LSW_LOG_DEBUG("GetFileAttributesW called");
     
     if (!filename) {
         LSW_LOG_ERROR("GetFileAttributesW: null filename");
@@ -3248,7 +3277,7 @@ uint32_t __attribute__((ms_abi)) lsw_GetFileAttributesW(const wchar_t* filename)
         return INVALID_FILE_ATTRIBUTES;
     }
     
-    LSW_LOG_INFO("GetFileAttributesW: %s -> %s", filename_mb, linux_path);
+    LSW_LOG_DEBUG("GetFileAttributesW: %s -> %s", filename_mb, linux_path);
     
     // Get file stats
     struct stat st;
@@ -3281,7 +3310,7 @@ uint32_t __attribute__((ms_abi)) lsw_GetFileAttributesW(const wchar_t* filename)
         attrs = FILE_ATTRIBUTE_NORMAL;
     }
     
-    LSW_LOG_INFO("GetFileAttributesW: attributes=0x%x", attrs);
+    LSW_LOG_DEBUG("GetFileAttributesW: attributes=0x%x", attrs);
     return attrs;
 }
 
@@ -3930,7 +3959,7 @@ static int match_pattern(const char* str, const char* pattern) {
 
 // KERNEL32.dll!FindFirstFileW - Start file search
 void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_FIND_DATAW* find_data) {
-    LSW_LOG_INFO("FindFirstFileW called");
+    LSW_LOG_DEBUG("FindFirstFileW called");
     
     if (!filename || !find_data) {
         LSW_LOG_ERROR("FindFirstFileW: null parameters");
@@ -3945,10 +3974,10 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_
         return (void*)-1;
     }
     
-    LSW_LOG_INFO("FindFirstFileW: searching for '%s' (len=%d)", filename_mb, result);
+    LSW_LOG_DEBUG("FindFirstFileW: searching for '%s' (len=%d)", filename_mb, result);
     
     // Debug: show first few bytes as hex
-    LSW_LOG_INFO("FindFirstFileW: hex dump: %02x %02x %02x %02x", 
+    LSW_LOG_DEBUG("FindFirstFileW: hex dump: %02x %02x %02x %02x", 
                  (unsigned char)filename_mb[0], (unsigned char)filename_mb[1], 
                  (unsigned char)filename_mb[2], (unsigned char)filename_mb[3]);
     
@@ -3974,7 +4003,7 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_
         strcpy(pattern, linux_path);
     }
     
-    LSW_LOG_INFO("FindFirstFileW: dir='%s', pattern='%s'", dir_path, pattern);
+    LSW_LOG_DEBUG("FindFirstFileW: dir='%s', pattern='%s'", dir_path, pattern);
     
     // Open directory
     DIR* dir = opendir(dir_path);
@@ -4000,13 +4029,13 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_
     while ((entry = readdir(dir)) != NULL) {
         if (match_pattern(entry->d_name, pattern)) {
             dirent_to_find_data(entry, dir_path, find_data);
-            LSW_LOG_INFO("FindFirstFileW: found '%s'", entry->d_name);
+            LSW_LOG_DEBUG("FindFirstFileW: found '%s'", entry->d_name);
             return (void*)find_handle;
         }
     }
     
     // No match found
-    LSW_LOG_INFO("FindFirstFileW: no matches found");
+    LSW_LOG_DEBUG("FindFirstFileW: no matches found");
     closedir(dir);
     free(find_handle);
     return (void*)-1;
@@ -4014,7 +4043,7 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_
 
 // KERNEL32.dll!FindNextFileW - Get next file in search
 int __attribute__((ms_abi)) lsw_FindNextFileW(void* find_handle, WIN32_FIND_DATAW* find_data) {
-    LSW_LOG_INFO("FindNextFileW called: handle=%p", find_handle);
+    LSW_LOG_DEBUG("FindNextFileW called: handle=%p", find_handle);
     
     if (!find_handle || find_handle == (void*)-1 || !find_data) {
         LSW_LOG_ERROR("FindNextFileW: invalid parameters");
@@ -4028,12 +4057,12 @@ int __attribute__((ms_abi)) lsw_FindNextFileW(void* find_handle, WIN32_FIND_DATA
     while ((entry = readdir(handle->dir)) != NULL) {
         if (match_pattern(entry->d_name, handle->pattern)) {
             dirent_to_find_data(entry, handle->dir_path, find_data);
-            LSW_LOG_INFO("FindNextFileW: found '%s'", entry->d_name);
+            LSW_LOG_DEBUG("FindNextFileW: found '%s'", entry->d_name);
             return 1; // TRUE
         }
     }
     
-    LSW_LOG_INFO("FindNextFileW: no more files");
+    LSW_LOG_DEBUG("FindNextFileW: no more files");
     return 0; // FALSE - no more files
 }
 
@@ -4071,7 +4100,7 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileExW(
     (void)search_filter;
     (void)flags;
     
-    LSW_LOG_INFO("FindFirstFileExW called (using standard FindFirstFileW)");
+    LSW_LOG_DEBUG("FindFirstFileExW called (using standard FindFirstFileW)");
     
     // For now, just delegate to FindFirstFileW
     return lsw_FindFirstFileW(filename, (WIN32_FIND_DATAW*)find_data);
@@ -4320,6 +4349,7 @@ void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
 
 uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t milliseconds)
 {
+    LSW_LOG_DEBUG("WaitForSingleObject: handle=%p ms=0x%x", handle, milliseconds);
     if (!handle || handle == INVALID_HANDLE_VALUE) return 0xFFFFFFFF; /* WAIT_FAILED */
 
     /* ---- Raw process handle (small-integer PID from CreateProcess) ---- */
@@ -7631,10 +7661,31 @@ int __attribute__((ms_abi)) lsw__wcsupr_s(wchar_t* s, size_t sz) {
     return 0;
 }
 int __attribute__((ms_abi)) lsw_fwprintf_s(void* stream, const wchar_t* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    int r = vfwprintf((FILE*)stream, fmt, ap);
-    va_end(ap);
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
+    int fd = 1;
+    if (stream) {
+        fake_FILE* f = (fake_FILE*)stream;
+        if (f->_file == 2 || stream == stderr) fd = 2;
+        else if (f->_file == 0 || stream == stdin)  fd = 0;
+        else fd = 1;
+    }
+    if (fmt) {
+        char dbg[64] = {0};
+        const uint16_t* wf = (const uint16_t*)fmt;
+        int di = 0;
+        for (int i = 0; wf[i] && di < 60; i++) {
+            uint16_t c = wf[i];
+            if (c == '\n' || c == '\r') { dbg[di++] = '\\'; dbg[di++] = 'n'; }
+            else if (c < 128) dbg[di++] = (char)c;
+            else dbg[di++] = '?';
+        }
+        dbg[di] = '\0';
+        LSW_LOG_INFO("fwprintf_s(fd=%d): fmt=\"%s\"", fd, dbg);
+    }
+    __builtin_ms_va_list ms_ap; __builtin_ms_va_start(ms_ap, fmt);
+    int r = lsw_wide_vprintf_to_fd(fd, fmt, (char*)ms_ap);
+    __builtin_ms_va_end(ms_ap);
     return r;
 }
 int __attribute__((ms_abi)) lsw__vsnprintf(char* buf, size_t n, const char* fmt, va_list ap) {
@@ -7821,24 +7872,46 @@ void* __attribute__((ms_abi)) lsw___acrt_iob_func(unsigned int index) {
 }
 
 // __stdio_common_vfprintf / __stdio_common_vsprintf: used by all printf family
-// Signature: int __stdio_common_vfprintf(uint64_t options, FILE* f, const char* fmt, ..., va_list ap)
+// Signature: int __stdio_common_vfprintf(uint64_t options, FILE* f, const char* fmt, locale, va_list ap)
+// NOTE: 'ap' is a Windows ms_abi va_list (= char* pointer); must convert to SysV before use.
 int __attribute__((ms_abi)) lsw___stdio_common_vfprintf(
     uint64_t opts, void* f, const char* fmt, void* locale, va_list ap)
 {
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
     (void)opts; (void)locale;
-    return vfprintf((FILE*)f, fmt, ap);
+    if (!fmt) return 0;
+    LSW_LOG_DEBUG("__stdio_common_vfprintf: fmt=\"%.80s\"", fmt);
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    char* buf = NULL; vasprintf(&buf, fmt, sysv_ap);
+    if (!buf) return -1;
+    LSW_LOG_DEBUG("__stdio_common_vfprintf: output=\"%.80s\"", buf);
+    int fd = -1;
+    fake_FILE* fake = (fake_FILE*)f;
+    if (fake && fake->_file >= 0 && fake->_file <= 2) fd = fake->_file;
+    else if (f == stdout) fd = 1;
+    else if (f == stderr) fd = 2;
+    else if (f == stdin)  fd = 0;
+    int r;
+    if (fd >= 0) r = (int)write(fd, buf, strlen(buf));
+    else r = f ? (int)fwrite(buf, 1, strlen(buf), (FILE*)f) : -1;
+    free(buf);
+    return r;
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vsprintf(
     uint64_t opts, char* buf, size_t bufsz, const char* fmt, void* locale, va_list ap)
 {
     (void)opts; (void)locale;
-    return vsnprintf(buf, bufsz, fmt, ap);
+    if (!fmt) return 0;
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    return vsnprintf(buf, bufsz, fmt, sysv_ap);
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vsscanf(
     uint64_t opts, const char* buf, size_t bufsz, const char* fmt, void* locale, va_list ap)
 {
     (void)opts; (void)locale; (void)bufsz;
-    return vsscanf(buf, fmt, ap);
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    return vsscanf(buf, fmt, sysv_ap);
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vswprintf(
     uint64_t opts, wchar_t* buf, size_t n, const wchar_t* fmt, void* locale, char* ap)
@@ -7849,8 +7922,33 @@ int __attribute__((ms_abi)) lsw___stdio_common_vswprintf(
 int __attribute__((ms_abi)) lsw___stdio_common_vfwprintf(
     uint64_t opts, void* f, const wchar_t* fmt, void* locale, va_list ap)
 {
+    /* Windows uses 2-byte wchar_t; Linux vfwprintf expects 4-byte — must NOT call it.
+     * Determine fd from the FILE* (fake or real), then use lsw_wide_vprintf_to_fd. */
     (void)opts; (void)locale;
-    return vfwprintf((FILE*)f, fmt, ap);
+    typedef struct { char* _ptr; int _cnt; char* _base; int _flag;
+                     int _file; int _charbuf; int _bufsiz; char* _tmpfname; } fake_FILE;
+    int fd = 1;
+    if (f) {
+        fake_FILE* ff = (fake_FILE*)f;
+        if (f == stderr  || ff->_file == 2) fd = 2;
+        else if (f == stdin  || ff->_file == 0) fd = 0;
+        else fd = 1;
+    }
+    /* Debug: log first 60 chars of the wide format string */
+    if (fmt) {
+        char dbg[128] = {0};
+        const uint16_t* wfmt = (const uint16_t*)fmt;
+        int di = 0;
+        for (int i = 0; wfmt[i] && di < 120; i++) {
+            uint16_t c = wfmt[i];
+            if (c == '\n' || c == '\r') { dbg[di++] = '\\'; dbg[di++] = (c=='\n'?'n':'r'); }
+            else if (c < 128) dbg[di++] = (char)c;
+            else dbg[di++] = '?';
+        }
+        dbg[di] = '\0';
+        LSW_LOG_INFO("__stdio_common_vfwprintf: fmt=\"%s\"", dbg);
+    }
+    return lsw_wide_vprintf_to_fd(fd, fmt, (char*)ap);
 }
 
 // _configure_narrow_argv / _configure_wide_argv — CRT startup config, return 0 = success
@@ -8162,8 +8260,20 @@ uint32_t __attribute__((ms_abi)) lsw_ReadConsoleW(
 
 // Misc KERNEL32
 uint32_t __attribute__((ms_abi)) lsw_GetFileType(void* h) {
-    (void)h;
-    return 2; // FILE_TYPE_CHAR (console)
+    /* FILE_TYPE_UNKNOWN=0, FILE_TYPE_DISK=1, FILE_TYPE_CHAR=2, FILE_TYPE_PIPE=3 */
+    if (LSW_IS_PSEUDO_HANDLE(h)) return 2; /* STD_IN/OUT/ERR = console */
+    if (!h || h == INVALID_HANDLE_VALUE) return 0;
+    intptr_t fd = (intptr_t)h;
+    if (fd >= 0 && fd < 65536) {
+        struct stat st;
+        if (fstat((int)fd, &st) == 0) {
+            if (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode)) return 1; /* FILE_TYPE_DISK */
+            if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) return 3; /* FILE_TYPE_PIPE */
+            if (S_ISCHR(st.st_mode)) return 2; /* FILE_TYPE_CHAR */
+        }
+        return 1; /* default to disk */
+    }
+    return 1; /* typed handle (heap struct) — disk */
 }
 int __attribute__((ms_abi)) lsw_DuplicateHandle(
     void* hsrcproc, void* hsrc, void* hdstproc, void** hdst,
@@ -9133,7 +9243,7 @@ int __attribute__((ms_abi)) lsw_UnlockFileEx(void* hFile, uint32_t dwReserved, u
 }
 int __attribute__((ms_abi)) lsw_SetFilePointerEx(void* hFile, int64_t liDistanceToMove, int64_t* lpNewFilePointer, uint32_t dwMoveMethod) {
     if (!hFile) return 0;
-    int fd = (int)(uintptr_t)hFile - 1;
+    int fd = (int)(intptr_t)hFile; /* handle IS the raw fd */
     int whence = (dwMoveMethod == 0) ? SEEK_SET : (dwMoveMethod == 1) ? SEEK_CUR : SEEK_END;
     off_t result = lseek(fd, (off_t)liDistanceToMove, whence);
     if (result == (off_t)-1) return 0;
@@ -9144,7 +9254,7 @@ int __attribute__((ms_abi)) lsw_SetFilePointerEx(void* hFile, int64_t liDistance
 // ---- GetFileTime / SetFileTime / GetFileInformationByHandle ----
 int __attribute__((ms_abi)) lsw_GetFileTime(void* hFile, void* lpCreationTime, void* lpLastAccessTime, void* lpLastWriteTime) {
     if (!hFile) return 0;
-    int fd = (int)(uintptr_t)hFile - 1;
+    int fd = (int)(intptr_t)hFile; /* handle IS the raw fd */
     struct stat st;
     if (fstat(fd, &st) != 0) return 0;
     // Convert Unix time to FILETIME (100ns intervals since 1601-01-01)
@@ -9161,7 +9271,7 @@ int __attribute__((ms_abi)) lsw_SetFileTime(void* hFile, const void* lpCreationT
 }
 int __attribute__((ms_abi)) lsw_GetFileInformationByHandle(void* hFile, void* lpFileInformation) {
     if (!hFile || !lpFileInformation) return 0;
-    int fd = (int)(uintptr_t)hFile - 1;
+    int fd = (int)(intptr_t)hFile; /* handle IS the raw fd */
     struct stat st;
     if (fstat(fd, &st) != 0) return 0;
     // BY_HANDLE_FILE_INFORMATION layout (80 bytes):
@@ -9180,10 +9290,54 @@ int __attribute__((ms_abi)) lsw_GetFileInformationByHandle(void* hFile, void* lp
     p[12] = (uint32_t)(st.st_ino >> 32);
     return 1;
 }
+
+/* GetFileInformationByHandleEx — supports common FileInformationClass values */
 int __attribute__((ms_abi)) lsw_GetFileInformationByHandleEx(void* hFile, int FileInformationClass, void* lpFileInformation, uint32_t dwBufferSize) {
-    (void)hFile; (void)FileInformationClass; (void)dwBufferSize;
-    if (lpFileInformation) memset(lpFileInformation, 0, dwBufferSize > 0 ? dwBufferSize : 16);
-    return 0;
+    if (!hFile || !lpFileInformation || dwBufferSize == 0) return 0;
+    int fd = (int)(intptr_t)hFile;
+    struct stat st;
+    uint64_t epoch_offset = 116444736000000000ULL;
+
+    memset(lpFileInformation, 0, dwBufferSize);
+
+    /* Attempt fstat; if it fails, still return sensible defaults below */
+    int have_stat = (fstat(fd, &st) == 0);
+
+    switch (FileInformationClass) {
+    case 0: { /* FileBasicInfo: CreationTime[8] LastAccessTime[8] LastWriteTime[8] ChangeTime[8] FileAttributes[4] */
+        if (dwBufferSize < 36) return 0;
+        uint64_t* t = (uint64_t*)lpFileInformation;
+        uint64_t ft = have_stat ? (uint64_t)st.st_mtime * 10000000ULL + epoch_offset : epoch_offset;
+        t[0] = ft; t[1] = ft; t[2] = ft; t[3] = ft;
+        uint32_t* attr = (uint32_t*)(t + 4);
+        *attr = have_stat ? (S_ISDIR(st.st_mode) ? 0x10 : 0x80) : 0x80;
+        return 1;
+    }
+    case 1: { /* FileStandardInfo: AllocationSize[8] EndOfFile[8] NumberOfLinks[4] DeletePending[1] Directory[1] */
+        if (dwBufferSize < 24) return 0;
+        int64_t* p = (int64_t*)lpFileInformation;
+        int64_t sz = have_stat ? (int64_t)st.st_size : 0;
+        p[0] = (sz + 4095) & ~4095LL; /* AllocationSize */
+        p[1] = sz;                     /* EndOfFile */
+        uint32_t* links = (uint32_t*)(p + 2);
+        links[0] = 1;  /* NumberOfLinks */
+        uint8_t* bp = (uint8_t*)(links + 1);
+        bp[0] = 0;    /* DeletePending */
+        bp[1] = (have_stat && S_ISDIR(st.st_mode)) ? 1 : 0; /* Directory */
+        return 1;
+    }
+    case 9: { /* FileAttributeTagInfo: FileAttributes[4] ReparseTag[4] */
+        if (dwBufferSize < 8) return 0;
+        uint32_t* p = (uint32_t*)lpFileInformation;
+        p[0] = have_stat ? (S_ISDIR(st.st_mode) ? 0x10 : 0x80) : 0x80;
+        p[1] = 0; /* no reparse tag */
+        return 1;
+    }
+    default:
+        /* Unknown class — zero-fill already done; return failure so caller can handle */
+        lsw_SetLastError(87); /* ERROR_INVALID_PARAMETER */
+        return 0;
+    }
 }
 
 // ---- GetFileAttributesExW/A ----

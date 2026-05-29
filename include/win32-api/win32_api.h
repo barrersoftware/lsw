@@ -61,4 +61,15 @@ void win32_api_set_pe_image_info(uint64_t image_base,
 // Get all API mappings
 const win32_api_mapping_t* win32_api_get_mappings(size_t* count);
 
+/* -----------------------------------------------------------------------
+ * NT directory handle — created by NtOpenFile/NtCreateFile for directories.
+ * Stored as a heap-allocated typed handle so CloseHandle can recognize it.
+ * ----------------------------------------------------------------------- */
+#define LSW_DIR_MAGIC 0x44495221U  /* "DIR!" */
+typedef struct {
+    uint32_t magic;
+    void*    dirp;   /* DIR* from opendir() — void* to avoid dirent.h in header */
+    int      dirfd;  /* fd from dirfd(dirp) */
+} lsw_nt_dir_handle_t;
+
 #endif // LSW_WIN32_API_H
