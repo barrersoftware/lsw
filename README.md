@@ -1,423 +1,252 @@
-# LSW - Linux Subsystem for Windows
+# LSW — Linux Subsystem for Windows
 
-**Windows binary support for Linux kernels - WSL2 in reverse**
+**Run real Windows executables natively on Linux. WSL2 in reverse.**
 
 [![License](https://img.shields.io/badge/License-BFSL_v1.2-blue.svg)](https://barrersoftware.com/foss-license.html)
-[![Status](https://img.shields.io/badge/Status-70%25_Complete-yellow.svg)]()
 [![Build](https://img.shields.io/badge/Build-Passing-success.svg)]()
-
-## 🚀 Current Status: ~70% Complete
-
-**What Works NOW:**
-- ✅ **PE Loader** - Parses and loads Windows executables (32-bit & 64-bit)
-- ✅ **Kernel Module** - `/dev/lsw` device interface for kernel-userspace communication
-- ✅ **Memory Mapping** - Sections loaded with proper RWX permissions
-- ✅ **Process Registration** - PE processes tracked in kernel space
-- ✅ **Import Resolution** - DLL imports parsed and resolved against Win32 API stubs
-- ✅ **Base Relocations** - PE `.reloc` section applied when loaded at non-preferred base
-- ✅ **Win32 API Stubs** - 175+ functions across KERNEL32, msvcrt, advapi32, ws2_32
-  - File I/O: CreateFileW/A, ReadFile, WriteFile, FindFirstFileW, FindNextFileW
-  - Memory: VirtualAlloc/Free, HeapAlloc/Free, LocalAlloc/Free, CreateFileMappingW, MapViewOfFile
-  - Threading: CreateThread, WaitForSingleObject, Critical Sections, SRW Locks, FLS
-  - Registry: RegOpenKeyExA/W, RegQueryValueExA, RegSetValueExA, RegCloseKey
-  - Filesystem: GetTempPath, GetWindowsDirectory, GetEnvironmentVariable, ExpandEnvironmentStrings
-  - Networking: WSAStartup, socket, connect, send, recv (via Winsock → POSIX)
-  - Misc: GetTickCount64, GetSystemInfo, GetVersionExW, IsDebuggerPresent, FormatMessageA/W
-- ✅ **Filesystem Translation** - Windows paths (`C:\`) → Linux paths (`/mnt/c/`)
-- ✅ **Registry Emulation** - Backed by `/etc/lsw/registry/`
-
-**What's Still Needed (~30% remaining):**
-- 🔨 Ordinal imports (some DLLs export by ordinal — currently skipped)
-- 🔨 Thread-local storage (TLS directory processing)
-- 🔨 GDI / USER32 windowing stubs for GUI apps
-- 🔨 MSI installer full support
-- 🔨 DirectX → Vulkan/OpenGL translation
-
-**Progress Roadmap:**
-- **70% → 85%**: Full console app compatibility (ordinal imports, TLS, more APIs)
-- **85% → 95%**: GUI app support (USER32/GDI surface)
-- **95% → 100%**: MSI installer + UWP modern app support
+[![APIs](https://img.shields.io/badge/Win32_APIs-1235+-brightgreen.svg)]()
+[![Apps](https://img.shields.io/badge/Tested_Apps-10+-brightgreen.svg)]()
 
 ---
 
-## 🆓 ALWAYS FREE
+## What is LSW?
 
-**LSW is and will always be free.**
-
-- ✅ Free to download
-- ✅ Free to use
-- ✅ Free to modify
-- ✅ Free to distribute
-- ❌ NEVER for sale
-
-If anyone is charging you for LSW, report them: legal@barrersoftware.com
-
-**Built on free resources (Microsoft Open Specs, WSL) → Must remain free forever**
-
-## Vision
-
-Enable native Windows application execution on Linux-based operating systems without emulation overhead. Just as WSL2 allows Linux binaries to run on Windows kernel, LSW allows Windows binaries to run on Linux kernel with native performance.
-
-## Project Goals
-
-- **Native Performance**: Direct syscall translation, no emulation layer
-- **Full Resource Access**: Windows apps access hardware directly through Linux kernel
-- **Universal Compatibility**: Works on any Linux distribution (Ubuntu, Arch, Fedora, BarrerOS, etc.)
-- **Open Source**: BarrerSoftware License - free forever, cannot be sold
-- **Standards-Based**: Built from Microsoft Open Specifications documentation
-
-## Architecture Overview
-
-### Core Components
-
-1. **Kernel Module** - LSW kernel integration
-   - PE (Portable Executable) binary loader
-   - Windows syscall interface implementation  
-   - Process and thread management translation
-   - Memory management mapping
-
-2. **Filesystem Translation Layer**
-   - Virtual drive letter mapping (`C:` → `/mnt/c`)
-   - Path separator translation (`\` → `/`)
-   - Case-insensitive filesystem overlay
-   - Windows special folders (AppData, ProgramFiles, etc.)
-
-3. **Registry Emulation**
-   - Registry hive storage in `/etc/lsw/registry/`
-   - Registry API implementation
-   - HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER support
-
-4. **Windows API Translation**
-   - Win32 API → Linux equivalent mapping
-   - GDI graphics subsystem
-   - DirectX to Vulkan/OpenGL translation
-   - Windows networking to Linux sockets
-
-### How It Works
+LSW loads and runs Windows PE executables directly on Linux — no Wine, no QEMU, no VM.
+It maps Win32 API calls to Linux equivalents at the binary level, translates Windows paths,
+emulates the TEB/PEB/registry, and handles the x64 ABI crossing so Windows code runs
+as-is on Linux hardware.
 
 ```
-Windows App (app.exe)
-       ↓
-PE Binary Loader (LSW Kernel Module)
-       ↓  
-Windows Syscall Interface
-       ↓
-Syscall Translation Layer
-       ↓
-Linux Kernel Native Syscalls
-       ↓
-Hardware
+Windows .exe
+    │
+    ▼
+lsw-pe-loader (PE parser + IAT patcher)
+    │
+    ▼
+Win32 API stubs (1235+ functions across 15 DLLs)
+    │
+    ▼
+Linux syscalls / glibc
+    │
+    ▼
+Native hardware
 ```
 
-**No emulation. No virtualization. Direct execution.**
+No emulation. No virtualization. Direct execution.
 
-## Technical Foundation
+---
 
-### Microsoft Open Specifications
+## Tested Applications
 
-Using official Microsoft protocol documentation:
-- **Windows Protocols** - Network and system protocols
-- **PE Format Specification** - Executable binary format
-- **Windows API Documentation** - System call interfaces
-- **Registry Format** - Windows registry structure
-- **Filesystem Protocols** - NTFS behaviors and expectations
+These real Windows system tools run today:
 
-Reference: `openspecs-windows_protocols-ms-rdpegfx.pdf` (404 pages of protocol specifications)
+| Application | Result |
+|---|---|
+| `hostname.exe` | ✅ Prints hostname |
+| `whoami.exe` | ✅ Prints `domain\user` |
+| `ipconfig.exe` | ✅ Shows Windows IP Configuration |
+| `netstat.exe` | ✅ Shows "Active Connections", exits 0 |
+| `systeminfo.exe` | ✅ Full system info output |
+| `robocopy.exe` | ✅ Runs, prints banner, processes arguments |
+| `ping.exe` | ✅ Sends ICMP pings |
+| `reg.exe` | ✅ Registry query/set/delete |
+| `7z.exe` (7-Zip) | ✅ Compresses and extracts archives |
+| `netstat.exe -a` | ✅ Lists connections |
 
-### Filesystem Mapping
+---
 
-```
-Linux Root          Windows View
------------         ------------
-/                   (hidden)
-/mnt/c/             C:\
-/mnt/d/             D:\
-/home/user/         C:\Users\user\
-/etc/lsw/registry/  Registry hives
-```
+## Quick Start
 
-### Example Use Case
-
-```bash
-# Install LSW kernel module
-sudo modprobe lsw
-
-# Enable Windows binary support
-sudo lsw-enable
-
-# Run Windows executable natively
-./myapp.exe
-
-# App sees:
-# - C:\Windows\ filesystem
-# - Registry access
-# - Windows API calls
-# - Native hardware access
-
-# Kernel translates everything to Linux equivalents
-```
-
-## Development Phases
-
-### Phase 1: Core Kernel Module (MVP)
-- PE binary loader implementation
-- Basic syscall translation (file I/O, memory, process)
-- Virtual filesystem mapping (C: drive)
-- Simple Win32 console app support
-
-### Phase 2: Graphics and GUI
-- GDI implementation
-- Window management
-- DirectX to Vulkan translation layer
-- GUI application support
-
-### Phase 3: Advanced Features
-- Full registry emulation
-- Windows networking stack
-- COM/DCOM support
-- .NET Framework support
-- Driver compatibility layer
-
-### Phase 4: Performance Optimization
-- JIT compilation for syscall translation
-- Aggressive caching
-- Zero-copy memory operations
-- Multi-threading optimizations
-
-## Advantages Over Wine
-
-| Feature | Wine | LSW |
-|---------|------|-----|
-| Execution Model | User-space emulation | Kernel-level native |
-| Performance | 60-80% of native | 95-100% of native |
-| Resource Access | Limited/translated | Direct hardware access |
-| Architecture | Compatibility layer | Kernel integration |
-| Overhead | High | Minimal |
-| Maintenance | App-by-app fixes | Syscall-level support |
-
-## Use Cases
-
-- **Desktop Linux**: Run Windows-only apps without dual-boot
-- **Gaming**: Native Windows game performance on Linux
-- **Enterprise**: Legacy Windows app support on Linux infrastructure  
-- **Development**: Test Windows apps on Linux workstations
-- **BarrerOS**: Unified OS running Linux + Android + Windows apps
-
-## Project Structure
-
-```
-lsw-project/
-├── kernel/              # Kernel module source
-│   ├── pe-loader.c      # PE binary loader
-│   ├── syscall.c        # Syscall translation
-│   ├── fs-mapping.c     # Filesystem virtualization
-│   └── registry.c       # Registry emulation
-├── userspace/           # Userspace utilities
-│   ├── lsw-enable       # Enable LSW support
-│   ├── lsw-config       # Configuration tool
-│   └── lsw-monitor      # Debug/monitoring tool
-├── docs/                # Documentation
-│   ├── ARCHITECTURE.md  # Technical architecture
-│   ├── API.md           # API documentation
-│   └── SPECS.md         # Microsoft specs reference
-├── tests/               # Test suite
-└── examples/            # Example Windows apps
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Linux kernel 5.15+ with module support
-- Build tools (gcc, make, kernel headers)
-- Microsoft Open Specifications documentation
-
-### Building LSW
+### Build
 
 ```bash
 git clone https://github.com/barrersoftware/lsw.git
 cd lsw
 make
-sudo make install
-sudo modprobe lsw
 ```
 
-### Running Windows Apps
+### Run a Windows executable
 
 ```bash
-# Enable LSW for current session
-lsw-enable
+# Any Windows .exe — no install needed
+./build/bin/lsw-pe-loader --launch /path/to/app.exe [args...]
 
-# Run Windows executable
-./myapp.exe
-
-# Or use the launcher
-lsw-run myapp.exe
+# Examples
+./build/bin/lsw-pe-loader --launch /mnt/c/Windows/System32/hostname.exe
+./build/bin/lsw-pe-loader --launch /mnt/c/Windows/System32/ipconfig.exe /all
+./build/bin/lsw-pe-loader --launch /mnt/c/Windows/System32/robocopy.exe 'C:\src' 'C:\dst' /MIR
+./build/bin/lsw-pe-loader --launch /path/to/7z.exe a archive.zip ./files/
 ```
 
-## Roadmap
+### With kernel module (optional, for deeper syscall routing)
 
-- **Q1 2026**: Phase 1 MVP - Basic console app support
-- **Q2 2026**: Phase 2 - GUI and graphics support
-- **Q3 2026**: Phase 3 - Advanced Windows features
-- **Q4 2026**: Phase 4 - Performance optimization
-- **2027**: 1.0 Release - Production ready
-
-## Community
-
-- **License**: BarrerSoftware License v1.0 (open source, free forever)
-- **Target**: All Linux distributions
-- **First Implementation**: BarrerOS (dogfooding)
-- **Goal**: Industry standard for Windows app support on Linux
-
-## 💝 Support BarrerSoftware
-
-LSW is FREE software and will always be free.
-
-If you'd like to support our work:
-- 🌟 Star this repo
-- 📢 Tell others about it  
-- 💰 [Support our mission](https://barrersoftware.com/support)
-
-Or check out our paid products:
-- **Velocity Panel** - Premium server management
-- **CleanVM Enterprise** - Enterprise virtualization
-
-**No pressure. Just appreciation.**
-
-## Why LSW?
-
-**WSL brought Linux to Windows users.**  
-**LSW brings Windows to Linux users.**
-
-One kernel. Two worlds. Native performance.
+```bash
+sudo insmod build/lsw.ko
+./build/bin/lsw-pe-loader --launch app.exe   # automatically uses /dev/lsw
+```
 
 ---
 
-## Technical References
+## Architecture
 
-- **Microsoft Open Specifications**: `~/openspecs-windows_protocols-ms-rdpegfx.pdf` (404 pages)
-- **WSL2 Open Source**: https://github.com/microsoft/WSL (MIT License)
-- **WSL2 Linux Kernel**: https://github.com/microsoft/WSL2-Linux-Kernel  
-- **WSL Architecture**: Microsoft's proven integration model (inverse approach)
-- **Wine Project**: Lessons learned from user-space compatibility layer
-- **PE Format**: Microsoft Portable Executable specification
-- **Windows Kernel**: NT kernel syscall interface documentation
+### Components
 
-**Note**: WSL1's syscall translation layer (`lxcore.sys`) remains closed source, but we don't need it - we're building our own from specs and open source references.
+| Component | Description |
+|---|---|
+| `src/pe-loader/` | PE parser, section mapper, IAT patcher, base relocations, PE DLL loader |
+| `src/win32-api/` | 1235+ Win32 API stub implementations |
+| `src/kernel-module/` | Optional Linux kernel module for deeper syscall routing |
+| `include/` | Shared headers (TEB, PEB, PE structures, Win32 types) |
+
+### Win32 API Coverage
+
+| DLL | Functions | Coverage |
+|---|---|---|
+| `KERNEL32.dll` | CreateFile, ReadFile, WriteFile, VirtualAlloc, CreateThread, WaitForSingleObject, FindFirstFile, GetModuleHandle, LoadLibrary, FreeLibrary, CreateProcess, GetProcAddress, 200+ more | ~350 stubs |
+| `ntdll.dll` | NtQueryInformationProcess, RtlAllocateHeap, RtlFreeHeap, Rtl string/memory utils, hash tables, SEH/unwind, NtOpenFile, NtQueryDirectoryFile, 80+ more | ~130 stubs |
+| `ADVAPI32.dll` | Registry CRUD, tokens, security descriptors, crypto APIs, services, event log, EFS stubs | ~120 stubs |
+| `msvcrt.dll` / `ucrtbase.dll` | malloc/free, printf family, string ops, file I/O, locale, math | ~180 stubs |
+| `WS2_32.dll` | WSAStartup, socket, connect, send, recv, getaddrinfo, select, full Winsock | ~60 stubs |
+| `ole32.dll` / `oleaut32.dll` | CoInitialize, CoCreateInstance, COM dispatch, BSTR, VARIANT, SafeArray | ~80 stubs |
+| `IPHLPAPI.dll` | GetAdaptersInfo, GetIfTable, InternalGetTcpTable, InternalGetBound\*EndpointTable, GetAdaptersAddresses | ~40 stubs |
+| `USER32.dll` | MessageBox, GetDesktopWindow, SendMessage, console & window basics | ~50 stubs |
+| `SHELL32.dll` | SHGetFolderPath, ShellExecute, path utilities | ~25 stubs |
+| `GDI32.dll` | Stub surface for apps that link but don't draw | ~15 stubs |
+| `snmpapi.dll`, `shlwapi.dll`, `comctl32.dll`, game APIs | Additional coverage | ~60 stubs |
+
+### Key Technical Details
+
+- **PE Loading**: Full x64 PE support — sections, imports, exports (by name + ordinal), base relocations, bound imports, PE DLL chain loading
+- **ABI Crossing**: Windows uses `__ms_abi` (registers RCX/RDX/R8/R9, caller-saves R10/R11), Linux uses System V AMD64; all stubs marked `__attribute__((ms_abi))`
+- **TEB/PEB Emulation**: Full Thread Environment Block at `gs:0x00`; critical offsets (0x30 = Self, 0x60 = PEB, 0x68 = LastError, 0x1480 = TlsSlots) verified with compile-time asserts
+- **`__chkstk` Fix**: TEB.StackLimit forced to NULL so Windows stack-probe loop always skips (Linux kernel auto-extends stack on access — no probing needed)
+- **SEH / C++ Exceptions**: Signal-to-Windows-exception translation (SIGSEGV→EXCEPTION_ACCESS_VIOLATION, etc.), `.pdata` UNWIND_INFO registered, `_CxxThrowException` support
+- **Registry**: Backed by `~/.lsw/registry/` (SQLite), HKLM/HKCU/HKCR
+- **Filesystem**: `C:\path` → `/mnt/c/path`, `%TEMP%` → `/tmp`, Windows special folders mapped
+- **Threading**: `CreateThread` → `pthread_create`, full mutex/semaphore/event/critical-section/SRW-lock/condition-variable/thread-pool emulation
+- **Networking**: Full Winsock 2 → POSIX sockets (TCP, UDP, DNS via getaddrinfo)
+
+---
+
+## What Works
+
+- ✅ Console applications (Win32 + CRT)
+- ✅ Multi-threaded applications
+- ✅ Network applications (TCP/UDP/DNS)
+- ✅ Registry access
+- ✅ File I/O (CreateFile, ReadFile, WriteFile, FindFirst/NextFile)
+- ✅ PE DLL loading (LoadLibrary chains)
+- ✅ COM/OLE basics (CoInitialize, dispatch stubs)
+- ✅ C++ exceptions across Win32 code
+- ✅ MSI installer launch
+- ✅ 7-Zip, compression tools
+- ✅ Windows system utilities (ipconfig, netstat, systeminfo, etc.)
+
+## What Doesn't Work Yet
+
+- ❌ **GUI applications** — USER32/GDI windowing creates actual windows but no rendering backend yet
+- ❌ **DirectX / graphics** — stubs exist, no translation to Vulkan/OpenGL
+- ❌ **WMI-heavy tools** — `tasklist.exe` needs framedynos.dll CHString vtable emulation
+- ❌ **Full NT file I/O** — `NtOpenFile`/`NtQueryDirectoryFile` are stubs; apps using NT paths for file enumeration see no files
+- ❌ **Driver-dependent features** — anything requiring actual Windows kernel drivers
+
+---
+
+## 🆓 Always Free
+
+LSW is and will always be free.
+
+- ✅ Free to download, use, modify, distribute
+- ❌ NEVER for sale
+
+**Built from Microsoft Open Specifications (published, free documentation) → must remain free.**
+
+If anyone charges you for LSW, report it: legal@barrersoftware.com
+
+---
+
+## Roadmap
+
+### Near Term
+- Full NT path translation (`RtlDosPathNameToRelativeNtPathName_U`) so `robocopy` and similar tools can actually enumerate and copy files
+- `tasklist.exe` — minimal CHString class vtable so framedynos.dll works
+- More real-world app testing (browsers, .NET CLI tools, games)
+
+### Medium Term
+- GUI surface — X11/Wayland backend for USER32/GDI calls
+- DirectX → Vulkan translation layer
+
+### Long Term
+- `.NET` / CLR runtime hosting
+- UWP / AppX support
+- MSI full installation (registry, shortcuts, services)
+
+---
+
+## Project Structure
+
+```
+lsw/
+├── src/
+│   ├── pe-loader/          # PE binary loader (main.c, pe_loader.c, pe_parser.c)
+│   ├── win32-api/          # Win32 API stubs (15 source files, 1235+ mappings)
+│   │   ├── win32_api.c     # KERNEL32, msvcrt, WS2_32, and core stubs
+│   │   ├── ntdll_api.c     # ntdll stubs
+│   │   ├── advapi32_api.c  # Security, registry, crypto, services
+│   │   ├── ole32_api.c     # COM/OLE
+│   │   ├── oleaut32_api.c  # Automation, BSTR, VARIANT
+│   │   ├── misc_api.c      # IPHLPAPI, DNSAPI, snmpapi, DirectX stubs
+│   │   ├── user32_api.c    # USER32 basics
+│   │   ├── shell32_api.c   # Shell APIs
+│   │   ├── win32_teb.c     # TEB/PEB emulation + GS register setup
+│   │   └── ...
+│   └── kernel-module/      # Optional Linux kernel module (/dev/lsw)
+├── include/                # Shared headers
+├── build/                  # Build output (bin/, lib/)
+├── tests/                  # Test apps
+└── Makefile
+```
+
+---
+
+## Legal
+
+LSW is a clean-room implementation using Microsoft's publicly available specifications.
+
+- **APIs are not copyrightable** — Google v. Oracle (2021)
+- **Same legal basis as Wine, ReactOS, Samba** (30+ years of precedent)
+- **No decompilation, no leaked code, no proprietary sources**
+
+See [LEGAL.md](LEGAL.md) for the full legal foundation.
+
+---
+
+## Advantages Over Wine
+
+| Feature | Wine | LSW |
+|---|---|---|
+| Execution model | User-space PE loader + translation | Same — user-space PE loader + translation |
+| API approach | Per-app fixes, decades of work | Clean modern implementation |
+| Kernel module | No | Optional (for deeper syscall routing) |
+| Target | Full compatibility (30+ years) | Console/server apps (2026) |
+| Architecture | i386 + x86_64 | x86_64 native |
+
+---
 
 ## Authors
 
-- **Captain CP** - Architecture, Design, Initial Implementation
-- **Daniel** - Vision, Requirements, Testing
-- **BarrerSoftware** - Project sponsor, first deployment target
-
-## Status
-
-**Current**: Planning and Architecture Phase  
-**Next**: Kernel module MVP implementation  
-**Timeline**: 2026 Development cycle
+- **BarrerSoftware** — Architecture, implementation, testing
 
 ---
 
 🏴‍☠️ Built by BarrerSoftware  
-💙 Open Source, Community Driven  
-🚀 The Future of Cross-Platform Computing
-
-**LSW - Because Linux users deserve Windows apps too.**
-
+💙 Open Source, always free  
+🚀 Because Linux users deserve Windows apps too
 
 ---
 
 ## Trademark Disclaimer
 
-LSW (Linux Subsystem for Windows) is an independent open-source project and is **not affiliated with, endorsed by, or sponsored by Microsoft Corporation or the Windows Subsystem for Linux (WSL) project.**
-
-"Windows," "WSL," and "Windows Subsystem for Linux" are trademarks or registered trademarks of Microsoft Corporation.
-
-LSW is a descriptive name referring to functionality (running Windows applications on Linux systems) and is not intended to cause confusion with Microsoft's WSL product.
-
-## Package Management Integration
-
-LSW integrates with Windows package managers for seamless app installation:
-
-### Winget Support
-
-```bash
-# Install Windows apps using Microsoft's official package manager
-lsw winget install Microsoft.VisualStudioCode
-lsw winget install Google.Chrome
-lsw winget search photoshop
-lsw winget upgrade --all
-
-# Full winget compatibility on Linux
-```
-
-### MSI Installer Support
-
-```bash
-# Install from .msi files
-lsw install application.msi
-
-# Silent installation
-lsw install --silent app.msi
-```
-
-### Benefits
-- No manual downloads needed
-- Uses Microsoft's official repositories
-- Automatic updates via winget
-- Familiar Windows package management on Linux
-
-## 📚 Resources & Documentation
-
-LSW is built using official Microsoft specifications and documentation:
-
-### Microsoft Open Specifications
-- **PE/COFF Format**: [Microsoft Open Specifications](https://www.microsoft.com/openspecifications/)
-  - Portable Executable (PE) file format
-  - Common Object File Format (COFF)
-  - Import/Export tables
-  - Base relocations
-
-- **MSI Installer Format**: [Microsoft Open Specifications](https://www.microsoft.com/openspecifications/)
-  - Windows Installer package format
-  - Installation database structure
-  - Custom actions and transforms
-
-- **UWP API Documentation**: [Microsoft OpenSpecs Dev Center](https://learn.microsoft.com/en-us/openspecs/dev_center/ms-devcentlp/51a0d3ff-9f77-464c-b83f-2de08ed28134)
-  - Universal Windows Platform APIs
-  - Modern Windows app runtime
-  - AppX package format
-
-### Why Official Specs?
-
-Using Microsoft's official documentation ensures:
-- ✅ **Accuracy** - Built from authoritative sources
-- ✅ **Compatibility** - Matches Windows behavior exactly
-- ✅ **Legal** - No reverse engineering, clean room implementation
-- ✅ **Maintainable** - Documented and verifiable
-
----
-
-**Built with official specifications. Protected by BFSL v1.2. Free forever.** 🏴‍☠️
-
----
-
-## 📜 Legal Documentation
-
-**LSW is 100% legal and based on Supreme Court precedent.**
-
-- 📖 **[LEGAL.md](LEGAL.md)** - Complete legal foundation, case law, and compliance
-- 📚 **[SOURCES.md](SOURCES.md)** - All references and documentation sources  
-- ⚖️ **Clean-room implementation** - Zero proprietary Microsoft code
-- ✅ **30+ years of precedent** - Same legal basis as Wine, ReactOS, Samba
-
-**Key Legal Facts:**
-- ✅ APIs are not copyrightable (Google v. Oracle, 2021)
-- ✅ We use only Microsoft's published specifications
-- ✅ Clean-room methodology with full attribution
-- ✅ No decompilation, no leaked code, no proprietary sources
-
-**Microsoft Legal Notice:** We respect your intellectual property. LSW implements published specifications only. See [LEGAL.md](LEGAL.md) for full documentation.
-
+LSW is an independent open-source project not affiliated with, endorsed by, or sponsored by
+Microsoft Corporation. "Windows," "WSL," and "Windows Subsystem for Linux" are trademarks
+of Microsoft Corporation. LSW is a descriptive project name.
