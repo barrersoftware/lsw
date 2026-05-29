@@ -2,7 +2,7 @@
 # Copyright (c) 2025 BarrerSoftware
 # Licensed under BarrerSoftware License (BSL) v1.0
 
-.PHONY: all clean shared pe-loader msi-installer test install help test-kernel-comm kernel-module
+.PHONY: all clean shared pe-loader msi-installer test install help test-kernel-comm test-invariants kernel-module
 
 # Compiler settings
 CC := gcc
@@ -27,6 +27,9 @@ WIN32_OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(WIN32_SOURCES))
 
 # Tests
 TEST_KERNEL_COMM := $(BIN_DIR)/test-kernel-comm
+TEST_INVARIANTS  := $(BIN_DIR)/test-invariant-lsw-memory
+CHECK_CFLAGS     := $(shell pkg-config --cflags check 2>/dev/null)
+CHECK_LIBS       := $(shell pkg-config --libs check 2>/dev/null)
 
 # PE loader
 PE_SOURCES := $(wildcard $(SRC_DIR)/pe-loader/*.c)
@@ -111,7 +114,7 @@ debug: clean all
 	@echo "$(COLOR_GREEN)✅ Debug build complete$(COLOR_RESET)"
 
 # Run tests
-test: test-kernel-comm
+test: test-kernel-comm test-invariants
 	@echo "$(COLOR_GREEN)✅ All tests complete$(COLOR_RESET)"
 
 # Build and run kernel communication test
@@ -124,6 +127,15 @@ test-kernel-comm: shared $(TEST_KERNEL_COMM)
 $(TEST_KERNEL_COMM): $(SRC_DIR)/tests/test_kernel_comm.c $(SHARED_LIB)
 	@echo "$(COLOR_BLUE)🔗 Building kernel communication test...$(COLOR_RESET)"
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< -L$(LIB_DIR) -llsw-shared
+
+# Build and run security invariant tests (requires libcheck)
+test-invariants: $(TEST_INVARIANTS)
+	@echo "$(COLOR_BLUE)🧪 Running security invariant tests...$(COLOR_RESET)"
+	$(TEST_INVARIANTS)
+
+$(TEST_INVARIANTS): tests/test_invariant_lsw_memory.c | $(BIN_DIR)
+	@echo "$(COLOR_BLUE)🔗 Building security invariant tests...$(COLOR_RESET)"
+	$(CC) $(CFLAGS) -o $@ $< $(CHECK_CFLAGS) $(CHECK_LIBS)
 
 # Build kernel module
 kernel-module:
