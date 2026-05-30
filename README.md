@@ -52,6 +52,7 @@ These real Windows system tools run today:
 | `reg.exe` | ✅ Registry query/set/delete |
 | `7z.exe` (7-Zip) | ✅ Compresses and extracts archives |
 | `netstat.exe -a` | ✅ Lists connections |
+| .NET 8 framework-dependent console app | ✅ Runs via Linux CLR bridge |
 
 ---
 
@@ -142,6 +143,7 @@ sudo insmod build/lsw.ko
 - ✅ 7-Zip, compression tools
 - ✅ Windows system utilities (ipconfig, netstat, systeminfo, etc.)
 - ✅ **.NET 8 NativeAOT self-contained executables** — 20/20 stability, GC write-barrier and card-scan exceptions fully intercepted
+- ✅ **.NET 8 framework-dependent apps** — CLR hosting bridge auto-detects Linux .NET, maps `hostfxr.dll` to `libhostfxr.so`, converts UTF-16 paths, runs managed code via Linux CLR
 
 ## What Doesn't Work Yet
 
@@ -150,7 +152,6 @@ sudo insmod build/lsw.ko
 - ❌ **WMI-heavy tools** — `tasklist.exe` needs framedynos.dll CHString vtable emulation
 - ❌ **Full NT file I/O** — `NtOpenFile`/`NtQueryDirectoryFile` are stubs; apps using NT paths for file enumeration see no files
 - ❌ **Driver-dependent features** — anything requiring actual Windows kernel drivers
-- ❌ **.NET CLR runtime hosting** — framework-dependent .NET apps (not self-contained) still need CLR hosting support
 
 ---
 
@@ -173,13 +174,13 @@ If anyone charges you for LSW, report it: legal@barrersoftware.com
 - Full NT path translation (`RtlDosPathNameToRelativeNtPathName_U`) so `robocopy` and similar tools can actually enumerate and copy files
 - `tasklist.exe` — minimal CHString class vtable so framedynos.dll works
 - More real-world app testing (browsers, .NET CLI tools, games)
+- `.NET` assembly loading for managed DLLs loaded by framework-dependent apps via `AssemblyLoadContext`
 
 ### Medium Term
 - GUI surface — X11/Wayland backend for USER32/GDI calls
 - DirectX → Vulkan translation layer
 
 ### Long Term
-- `.NET` CLR runtime hosting (framework-dependent apps, not self-contained NativeAOT)
 - UWP / AppX support
 - MSI full installation (registry, shortcuts, services)
 

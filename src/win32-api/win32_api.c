@@ -10,6 +10,9 @@
 
 #include "win32_api.h"
 #include "win32_teb.h"
+/* Forward declaration — avoids pulling in pe_parser.h which conflicts with
+ * the local pe_rva_to_ptr() helper defined below. */
+extern void pe_call_tls_thread_attach(void);
 #include "lsw_log.h"
 #include "shared/lsw_kernel_client.h"
 #include "shared/lsw_filesystem.h"
@@ -38,6 +41,7 @@
 #include <dlfcn.h>
 #include <sys/time.h>
 #include <sys/statvfs.h>
+#include <execinfo.h>
 #include <sched.h>
 #include <ctype.h>
 #include <sys/wait.h>
@@ -51,6 +55,14 @@
 #include <execinfo.h>   /* backtrace, backtrace_symbols_fd */
 #include <setjmp.h>      /* longjmp — for C++ exception delivery */
 #include <pwd.h>         /* getpwuid — for username lookup */
+
+/* Forward declarations for ntdll_api.c functions used in the mapping table */
+int __attribute__((ms_abi)) lsw_RtlAddFunctionTable(void*, uint32_t, uint64_t);
+int __attribute__((ms_abi)) lsw_RtlInstallFunctionTableCallback(uint64_t, uint64_t, uint32_t, void*, void*, const uint16_t*);
+void __attribute__((ms_abi)) lsw_RtlUnwind(void*, void*, void*, void*);
+void __attribute__((ms_abi)) lsw_RtlUnwindEx(void*, void*, void*, void*, void*, void*);
+void __attribute__((ms_abi)) lsw_RtlRestoreContext(void*, void*);
+int __attribute__((ms_abi)) lsw_RtlDeleteFunctionTable(void*);
 
 /* ---- DllMain crash recovery ----
  * Some DLLs (e.g. inetmib1.dll, snmpapi.dll) access kernel facilities that
@@ -255,7 +267,15 @@ void win32_api_set_pe_image_info(uint64_t image_base,
 }
 
 void lsw_set_exe_path(const char* path) {
-    if (path) strncpy(g_lsw_exe_path, path, sizeof(g_lsw_exe_path) - 1);
+    if (!path) return;
+    /* Always store an absolute path so GetModuleFileNameW returns a rooted path */
+    char resolved[4096];
+    if (realpath(path, resolved)) {
+        strncpy(g_lsw_exe_path, resolved, sizeof(g_lsw_exe_path) - 1);
+    } else {
+        strncpy(g_lsw_exe_path, path, sizeof(g_lsw_exe_path) - 1);
+    }
+    g_lsw_exe_path[sizeof(g_lsw_exe_path) - 1] = '\0';
 }
 
 /* ---- Named pipe handle ---- */
@@ -283,6 +303,100 @@ typedef struct lsw_pipe_s lsw_pipe_t;
 #define LSW_TIMER_MAGIC   0x54494D52U  /* "TIMR" */
 #define LSW_IOCP_MAGIC    0x494F4350U  /* "IOCP" */
 #define LSW_TPWORK_MAGIC  0x54505744U  /* "TPWD" */
+#define LSW_THREAD_MAGIC  0x54485244U  /* "THRD" */
+
+/* Thread handle — wraps a pthread so WaitForSingleObject/CloseHandle work */
+typedef struct {
+    uint32_t        magic;      /* LSW_THREAD_MAGIC */
+    pthread_t       thread;
+    volatile int    finished;
+    uint32_t        exit_code;
+    pthread_mutex_t lock;
+    pthread_cond_t  cond;
+    volatile int    suspended;  /* CREATE_SUSPENDED: 1=suspended, 0=running */
+    pthread_mutex_t suspend_lock;
+    pthread_cond_t  suspend_cond;
+} lsw_thread_handle_t;
+
+/* Trampoline context: converts sysv_abi pthread call → ms_abi Win32 thread func */
+typedef struct {
+    uint32_t (__attribute__((ms_abi)) *start_fn)(void*);
+    void               *param;
+    lsw_thread_handle_t *handle;
+} lsw_thread_trampoline_t;
+
+static void lsw_thread_cleanup(void* arg)
+{
+    lsw_thread_handle_t* h = (lsw_thread_handle_t*)arg;
+    if (h) {
+        pthread_mutex_lock(&h->lock);
+        if (!h->finished) {
+            h->finished = 1;       /* mark as done even if crashed */
+            h->exit_code = 0xDEAD; /* signal abnormal exit */
+            pthread_cond_broadcast(&h->cond);
+        }
+        pthread_mutex_unlock(&h->lock);
+    }
+}
+
+static void* lsw_thread_trampoline(void* arg)
+{
+    lsw_thread_trampoline_t* t = (lsw_thread_trampoline_t*)arg;
+    uint32_t (__attribute__((ms_abi)) *fn)(void*) = t->start_fn;
+    void* param = t->param;
+    lsw_thread_handle_t* h = t->handle;
+    free(t);
+
+    /* Set up TEB + GS register for this thread (Windows code requires gs:0x30 etc.) */
+    win32_teb_init();
+
+    /* Track return value outside the cleanup scope */
+    uint32_t ret = 0;
+
+    /* Register cleanup handler so WaitForSingleObject won't hang if we crash */
+    pthread_cleanup_push(lsw_thread_cleanup, h);
+
+    /* If thread was created suspended, wait until ResumeThread() is called */
+    if (h) {
+        pthread_mutex_lock(&h->suspend_lock);
+        while (h->suspended)
+            pthread_cond_wait(&h->suspend_cond, &h->suspend_lock);
+        pthread_mutex_unlock(&h->suspend_lock);
+    }
+
+    /* Notify all loaded modules that a new thread is starting.
+     * On real Windows, DllMain(DLL_THREAD_ATTACH) is broadcast to every loaded
+     * DLL so each module can set up per-thread state (GC segments, CRT state,
+     * write barrier patching, etc.).  For NativeAOT single-file exes this is
+     * handled by TLS callbacks in the PE's TLS directory — call them NOW,
+     * BEFORE yielding.  This ensures the GC server thread patches the write
+     * barrier before we give control back to the ResumeThread caller (which
+     * may immediately execute managed code that triggers the write barrier). */
+    pe_call_tls_thread_attach();
+
+    if (h) {
+        /* Yield to the thread that called ResumeThread so it can finish any
+           post-resume setup before the new thread's start function runs.
+           DLL_THREAD_ATTACH (above) has already patched the write barrier, so
+           the main thread is safe to use managed code while we wait. */
+        sched_yield();
+    }
+
+    LSW_LOG_INFO("Thread[%lu] fn=%p param=%p starting", (unsigned long)pthread_self(), fn, param);
+    ret = fn(param);
+    LSW_LOG_INFO("Thread[%lu] fn=%p returned %u", (unsigned long)pthread_self(), fn, ret);
+
+    if (h) {
+        pthread_mutex_lock(&h->lock);
+        h->exit_code = ret;
+        h->finished = 1;
+        pthread_cond_broadcast(&h->cond);
+        pthread_mutex_unlock(&h->lock);
+    }
+
+    pthread_cleanup_pop(0);
+    return (void*)(uintptr_t)ret;
+}
 
 typedef struct {
     uint32_t magic;       /* LSW_EVENT_MAGIC */
@@ -1197,6 +1311,21 @@ uintptr_t __attribute__((ms_abi)) lsw__beginthreadex(void* security, unsigned st
 void __attribute__((ms_abi)) lsw__endthreadex(unsigned retval) {
     pthread_exit((void*)(uintptr_t)retval);
 }
+/* _beginthread — simpler CRT thread launcher (no security/flags) */
+uintptr_t __attribute__((ms_abi)) lsw__beginthread(void* start, unsigned stack_size, void* arglist) {
+    (void)stack_size;
+    _beginthreadex_ctx_t* ctx = malloc(sizeof(_beginthreadex_ctx_t));
+    if (!ctx) return (uintptr_t)-1;
+    ctx->fn = (_beginthreadex_start_t)start;
+    ctx->arg = arglist;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, _beginthreadex_trampoline, ctx) != 0) {
+        free(ctx);
+        return (uintptr_t)-1;
+    }
+    pthread_detach(tid);
+    return (uintptr_t)tid;
+}
 
 /* Wide-char version of __getmainargs — used by MSVCRT CRT startup in 64-bit apps */
 int __attribute__((ms_abi)) lsw__wgetmainargs(int* argc, wchar_t*** wargv, wchar_t*** wenvp,
@@ -1332,6 +1461,18 @@ int __attribute__((ms_abi)) lsw___CxxFrameHandler(void* pExcept, void* pRN, void
 /* Forward declarations: TLS exception state variables (defined later) */
 static __thread void* tls_cxx_exception_obj;
 static __thread void* tls_cxx_exception_type;
+static __thread uint64_t tls_cxx_exception_entry_rsp = 0; /* saved entry_rsp from last catch dispatch */
+
+/* TLS state for full SEH dispatch / RtlUnwindEx communication */
+__thread sigjmp_buf* tls_seh_unwind_jmp   = NULL; /* longjmp target set during search phase */
+__thread uint64_t    tls_seh_target_frame = 0;     /* TargetFrame passed to RtlUnwindEx */
+__thread uint64_t    tls_seh_target_ip    = 0;     /* TargetIp   passed to RtlUnwindEx */
+
+/* Saved original exception args (for re-throw exc_rec reconstruction) */
+static __thread uint32_t tls_cxx_exc_code  = 0;
+static __thread uint32_t tls_cxx_exc_flags = 0;
+static __thread uint32_t tls_cxx_exc_nargs = 0;
+static __thread uint64_t tls_cxx_exc_args[16];
 
 /* ==========================================================================
  * x64 MSVC C++ Exception Dispatch
@@ -2113,15 +2254,46 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
             /* Place the exception object in the catch frame if disp != 0.
              * EH4 uses body_rsp as the frame base; EH3 uses entry_rsp. */
             uint64_t frame_base = is_eh4 ? body_rsp : entry_rsp;
+
+            /* Copy the exception object to heap before calling the funclet.
+             *
+             * The original object lives in the THROW frame's stack, which sits
+             * BELOW body_rsp on the stack (stack grows down).  When we call the
+             * catch funclet it extends the stack further, potentially overwriting
+             * the original exception object and corrupting its vtable pointer.
+             * Copying to heap ensures the pointer stored in the catch slot stays
+             * valid after the funclet (and any callee of the funclet) runs.
+             */
+            void* obj_safe = obj;
+            if (obj && throwInfo) {
+                lsw_ThrowInfo* ti = (lsw_ThrowInfo*)throwInfo;
+                size_t obj_size = 0;
+                if (ti->pCatchableTypeArray) {
+                    lsw_CatchableTypeArray* cta =
+                        (lsw_CatchableTypeArray*)lsw_rva2va(ti->pCatchableTypeArray);
+                    if (cta && cta->nCatchableTypes > 0) {
+                        lsw_CatchableType* ct =
+                            (lsw_CatchableType*)lsw_rva2va(cta->arrayOfCatchableTypes[0]);
+                        if (ct && ct->sizeOrOffset > 0 && ct->sizeOrOffset <= 65536)
+                            obj_size = (size_t)ct->sizeOrOffset;
+                    }
+                }
+                if (obj_size == 0) obj_size = 512; /* safe fallback */
+                void* copy = malloc(obj_size);
+                if (copy) {
+                    memcpy(copy, obj, obj_size);
+                    obj_safe = copy;
+                    LSW_LOG_INFO("[exception] copied exception obj: %zu bytes %p→%p",
+                                 obj_size, obj, copy);
+                }
+            }
+
             if (disp_catch_obj != 0) {
                 void** slot = (void**)(frame_base + (int64_t)disp_catch_obj);
-                if (catch_adjectives & 0x8) {
-                    /* reference catch: slot holds pointer to exception object */
-                    *slot = obj;
-                } else {
-                    /* value catch: ideally copy via copyFunction; store ptr for now */
-                    *slot = obj;
-                }
+                /* Both reference and value catches store the (heap-copied) pointer;
+                 * for value catches a proper copy-constructor call would be needed,
+                 * but the heap copy above is sufficient for the vtable to be valid. */
+                *slot = obj_safe;
             }
 
             /* Call the catch funclet.
@@ -2144,15 +2316,15 @@ void __attribute__((ms_abi)) lsw__CxxThrowException(void* obj, void* throwInfo) 
 
             uint64_t cont_va = 0;
             if (is_eh4 && eh4_cont_cnt > 0) {
-                /* EH4: continuation is a 0-based index */
+                /* EH4 with embedded cont table: continuation is a 0-based index */
                 uint64_t cont_idx = (uint64_t)(uintptr_t)continuation;
                 if (cont_idx >= eh4_cont_cnt) cont_idx = 0;
                 cont_va = eh4_cont_vas[cont_idx];
                 LSW_LOG_INFO("[exception] EH4 cont_idx=%lu cont_va=0x%lx",
                              (unsigned long)cont_idx, (unsigned long)cont_va);
-            } else if (!is_eh4 && continuation) {
-                /* EH3: continuation is a direct VA */
-                cont_va = (uint64_t)continuation;
+            } else if (continuation) {
+                /* EH3 or EH4-with-cont_cnt=0: funclet returns VA directly */
+                cont_va = (uint64_t)(uintptr_t)continuation;
             }
 
             if (cont_va) {
@@ -2298,10 +2470,16 @@ int __attribute__((ms_abi)) lsw_MultiByteToWideChar(unsigned int codepage, unsig
     (void)codepage;
     (void)flags;
 
-    int len = srclen >= 0 ? srclen : (src ? (int)strlen(src) : 0);
+    /* -1 means null-terminated: include the null terminator in length */
+    int len;
+    if (srclen == -1) {
+        len = src ? (int)strlen(src) + 1 : 1; /* +1 for null terminator */
+    } else {
+        len = srclen >= 0 ? srclen : 0;
+    }
 
     if (!dst) {
-        LSW_LOG_DEBUG("MultiByteToWideChar: query size for %d chars", len);
+        LSW_LOG_DEBUG("MultiByteToWideChar: query size for %d chars (incl null)", len);
         return len;
     }
 
@@ -2374,11 +2552,101 @@ void* __attribute__((ms_abi)) lsw_TlsGetValue(unsigned long index) {
     return NULL; // No TLS for now
 }
 
-int __attribute__((ms_abi)) lsw_VirtualQuery(const void* addr, void* buffer, size_t length) {
-    (void)addr;
-    (void)buffer;
-    (void)length;
-    return 0; // Stub
+/* MEMORY_BASIC_INFORMATION layout (64-bit, 48 = 0x30 bytes) */
+typedef struct {
+    uint64_t BaseAddress;        /* 0x00 */
+    uint64_t AllocationBase;     /* 0x08 */
+    uint32_t AllocationProtect;  /* 0x10 */
+    uint16_t PartitionId;        /* 0x14 */
+    uint16_t _mbi_pad;           /* 0x16 */
+    uint64_t RegionSize;         /* 0x18 */
+    uint32_t State;              /* 0x20 */
+    uint32_t Protect;            /* 0x24 */
+    uint32_t Type;               /* 0x28 */
+    uint32_t _mbi_pad2;          /* 0x2C */
+} LSW_MEMORY_BASIC_INFORMATION;  /* total: 0x30 = 48 */
+
+#define LSW_PAGE_NOACCESS          0x01
+#define LSW_PAGE_READONLY          0x02
+#define LSW_PAGE_READWRITE         0x04
+#define LSW_PAGE_EXECUTE           0x10
+#define LSW_PAGE_EXECUTE_READ      0x20
+#define LSW_PAGE_EXECUTE_READWRITE 0x40
+#define LSW_MEM_COMMIT    0x1000
+#define LSW_MEM_IMAGE     0x1000000
+#define LSW_MEM_MAPPED    0x40000
+#define LSW_MEM_PRIVATE   0x20000
+
+size_t __attribute__((ms_abi)) lsw_VirtualQuery(const void* addr, void* buffer, size_t length) {
+    if (!addr || !buffer || length < sizeof(LSW_MEMORY_BASIC_INFORMATION))
+        return 0;
+
+    uintptr_t target = (uintptr_t)addr;
+
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    char line[512];
+    int found = 0;
+    uintptr_t map_start = 0, map_end = 0;
+    char perms[8] = {0};
+    char pathname[256] = {0};
+
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t start, end;
+        char p[8] = {0};
+        char path[256] = {0};
+        int n = sscanf(line, "%lx-%lx %7s %*x %*s %*u %255s", &start, &end, p, path);
+        if (n >= 3 && target >= start && target < end) {
+            map_start = start;
+            map_end   = end;
+            strncpy(perms, p, 7);
+            if (n >= 4) strncpy(pathname, path, 255);
+            found = 1;
+            break;
+        }
+    }
+    fclose(maps);
+
+    if (!found) return 0;
+
+    LSW_MEMORY_BASIC_INFORMATION* mbi = (LSW_MEMORY_BASIC_INFORMATION*)buffer;
+    memset(mbi, 0, sizeof(*mbi));
+
+    uintptr_t base = target & ~((uintptr_t)0xfff); /* page-align */
+    mbi->BaseAddress   = base;
+    mbi->AllocationBase = map_start;
+    mbi->RegionSize    = map_end - base;
+    mbi->State         = LSW_MEM_COMMIT;
+
+    int r = (perms[0] == 'r');
+    int w = (perms[1] == 'w');
+    int x = (perms[2] == 'x');
+    uint32_t protect;
+    if      (x && w) protect = LSW_PAGE_EXECUTE_READWRITE;
+    else if (x && r) protect = LSW_PAGE_EXECUTE_READ;
+    else if (x)      protect = LSW_PAGE_EXECUTE;
+    else if (w)      protect = LSW_PAGE_READWRITE;
+    else if (r)      protect = LSW_PAGE_READONLY;
+    else             protect = LSW_PAGE_NOACCESS;
+    mbi->Protect          = protect;
+    mbi->AllocationProtect = protect;
+
+    if (pathname[0] && pathname[0] != '[') {
+        const char* ext = strrchr(pathname, '.');
+        if (ext && (strcasecmp(ext, ".exe") == 0 || strcasecmp(ext, ".dll") == 0))
+            mbi->Type = LSW_MEM_IMAGE;
+        else
+            mbi->Type = LSW_MEM_MAPPED;
+    } else {
+        mbi->Type = LSW_MEM_PRIVATE;
+    }
+
+    LSW_LOG_INFO("VirtualQuery(%p) → base=%p alloc=%p size=%zu state=%u prot=%u type=%u",
+                  addr, (void*)mbi->BaseAddress, (void*)mbi->AllocationBase,
+                  (size_t)mbi->RegionSize, mbi->State, mbi->Protect, mbi->Type);
+
+    return sizeof(LSW_MEMORY_BASIC_INFORMATION);
 }
 
 // KERNEL32.dll stub implementations
@@ -2444,17 +2712,111 @@ void __attribute__((ms_abi)) lsw_LeaveCriticalSection(void* cs) {
 }
 
 int __attribute__((ms_abi)) lsw_VirtualProtect(void* addr, size_t size, uint32_t new_protect, uint32_t* old_protect) {
-    (void)addr; (void)size; (void)new_protect; (void)old_protect;
-    // Stub - return success
+    if (!addr || !size) return 0;
+    if (old_protect) *old_protect = 0x04; /* PAGE_READWRITE — we can't easily query previous */
+    int prot;
+    switch (new_protect & 0xFF) {
+        case 0x01: prot = PROT_NONE; break;
+        case 0x02: prot = PROT_READ; break;
+        case 0x04: case 0x08: prot = PROT_READ | PROT_WRITE; break;
+        case 0x10: prot = PROT_EXEC; break;
+        case 0x20: prot = PROT_READ | PROT_EXEC; break;
+        case 0x40: prot = PROT_READ | PROT_WRITE | PROT_EXEC; break;
+        default:   prot = PROT_READ | PROT_WRITE; break;
+    }
+    uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)4095;
+    size_t aligned_size = (size + ((uintptr_t)addr - aligned) + 4095) & ~(size_t)4095;
+    if (mprotect((void*)aligned, aligned_size, prot) != 0) {
+        LSW_LOG_WARN("VirtualProtect: mprotect(%p,%zu,0x%x) failed: %s", addr, size, prot, strerror(errno));
+        lsw_SetLastError(0x1e7); /* ERROR_INVALID_ADDRESS */
+        return 0;
+    }
+    LSW_LOG_DEBUG("VirtualProtect: addr=%p size=%zu protect=0x%x -> ok", addr, size, new_protect);
     return 1;
 }
 
 // Memory management functions
 void* __attribute__((ms_abi)) lsw_VirtualAlloc(void* addr, size_t size, uint32_t alloc_type, uint32_t protect) {
-    (void)addr; (void)alloc_type; (void)protect;
-    // Simple implementation using mmap
-    void* result = mmap(addr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (size == 0) size = 4096;
+    LSW_LOG_INFO("VirtualAlloc: addr=%p size=%zu alloc_type=0x%x protect=0x%x", addr, size, alloc_type, protect);
+
+    /* Translate Windows PAGE_* protection to Linux PROT_* */
+    int prot;
+    switch (protect & 0xFF) {
+        case 0x01: /* PAGE_NOACCESS */        prot = PROT_NONE; break;
+        case 0x02: /* PAGE_READONLY */        prot = PROT_READ; break;
+        case 0x04: /* PAGE_READWRITE */       prot = PROT_READ | PROT_WRITE; break;
+        case 0x08: /* PAGE_WRITECOPY */       prot = PROT_READ | PROT_WRITE; break;
+        case 0x10: /* PAGE_EXECUTE */         prot = PROT_EXEC; break;
+        case 0x20: /* PAGE_EXECUTE_READ */    prot = PROT_READ | PROT_EXEC; break;
+        case 0x40: /* PAGE_EXECUTE_READWRITE*/prot = PROT_READ | PROT_WRITE | PROT_EXEC; break;
+        default:                              prot = PROT_READ | PROT_WRITE; break;
+    }
+
+#define LSW_MEM_COMMIT   0x1000u
+#define LSW_MEM_RESERVE  0x2000u
+#define LSW_MEM_RESET    0x80000u
+
+    /* MEM_COMMIT without MEM_RESERVE on an existing address: mprotect the
+     * already-reserved (PROT_NONE) region to make it accessible.
+     * NOTE: When EXEC is requested, also include WRITE — NativeAOT GC commits
+     * executable pages and then writes to them before calling VirtualProtect
+     * to restrict access.  VirtualProtect will remove WRITE when needed. */
+    if ((alloc_type & LSW_MEM_COMMIT) && !(alloc_type & LSW_MEM_RESERVE) && addr) {
+        /* Ensure writable so the caller can populate the committed region */
+        int commit_prot = prot | PROT_WRITE;
+        uintptr_t aligned = (uintptr_t)addr & ~(uintptr_t)4095;
+        size_t   aligned_size = (size + ((uintptr_t)addr - aligned) + 4095) & ~(size_t)4095;
+        if (mprotect((void*)aligned, aligned_size, commit_prot) == 0) {
+            LSW_LOG_INFO("VirtualAlloc MEM_COMMIT: addr=%p size=%zu win_protect=0x%x linux_prot=0x%x -> ok",
+                         addr, size, protect, commit_prot);
+            return addr;
+        }
+        /* mprotect failed — region not yet reserved; fall through to mmap at hint */
+        LSW_LOG_WARN("VirtualAlloc MEM_COMMIT: mprotect(%p,%zu) failed (%s), allocating fresh",
+                     (void*)aligned, aligned_size, strerror(errno));
+        void* r2 = mmap((void*)aligned, aligned_size, commit_prot,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (r2 == MAP_FAILED)
+            r2 = mmap(NULL, aligned_size, commit_prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (r2 == MAP_FAILED) { LSW_LOG_ERROR("VirtualAlloc MEM_COMMIT fallback: mmap failed"); return NULL; }
+        LSW_LOG_INFO("VirtualAlloc MEM_COMMIT (fresh): addr=%p -> %p", addr, r2);
+        return (uint8_t*)r2 + ((uintptr_t)addr - aligned);
+    }
+
+    /* MEM_RESERVE [+ MEM_COMMIT]: allocate virtual address range */
+    if (alloc_type & LSW_MEM_RESERVE) {
+#define LSW_MEM_WRITE_WATCH 0x200000u
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        /* MEM_WRITE_WATCH: Linux has no write-watch equivalent; commit immediately
+         * so the GC's metadata arrays are accessible without a separate MEM_COMMIT. */
+        int has_commit = (alloc_type & LSW_MEM_COMMIT) || (alloc_type & LSW_MEM_WRITE_WATCH);
+        int rprot = has_commit ? prot : PROT_NONE;
+        if (!has_commit) flags |= MAP_NORESERVE;
+        void* result;
+        if (addr) {
+            result = mmap(addr, size, rprot, flags | MAP_FIXED_NOREPLACE, -1, 0);
+            if (result == MAP_FAILED)
+                result = mmap(NULL, size, rprot, flags, -1, 0);
+        } else {
+            result = mmap(NULL, size, rprot, flags, -1, 0);
+        }
+        if (result == MAP_FAILED) {
+            LSW_LOG_ERROR("VirtualAlloc MEM_RESERVE: mmap failed (size=%zu): %s", size, strerror(errno));
+            return NULL;
+        }
+        const char* suffix = (alloc_type & LSW_MEM_COMMIT) ? "|MEM_COMMIT" :
+                             (alloc_type & LSW_MEM_WRITE_WATCH) ? "|MEM_WRITE_WATCH(auto-commit)" : "";
+        LSW_LOG_INFO("VirtualAlloc MEM_RESERVE%s: addr_hint=%p size=%zu protect=0x%x -> %p",
+                     suffix, addr, size, protect, result);
+        return result;
+    }
+
+    /* Default legacy path (alloc_type not specified or unknown): allocate R/W */
+    void* result = mmap(NULL, size, (prot != PROT_NONE) ? prot : (PROT_READ | PROT_WRITE),
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (result == MAP_FAILED) {
+        LSW_LOG_ERROR("VirtualAlloc: mmap failed (size=%zu): %s", size, strerror(errno));
         return NULL;
     }
     LSW_LOG_INFO("VirtualAlloc: size=%zu, result=%p", size, result);
@@ -2462,13 +2824,41 @@ void* __attribute__((ms_abi)) lsw_VirtualAlloc(void* addr, size_t size, uint32_t
 }
 
 int __attribute__((ms_abi)) lsw_VirtualFree(void* addr, size_t size, uint32_t free_type) {
-    (void)size; (void)free_type;
-    // Simple implementation using munmap
-    if (addr) {
-        munmap(addr, size ? size : 4096); // If size is 0, unmap at least a page
+    LSW_LOG_INFO("VirtualFree: addr=%p size=%zu type=0x%x", addr, size, free_type);
+    if (!addr) return 1;
+    if (free_type & 0x4000u /* MEM_DECOMMIT */) {
+        /* Decommit: return pages to reserved-but-uncommitted state */
+        if (size == 0) { lsw_SetLastError(0x57 /* ERROR_INVALID_PARAMETER */); return 0; }
+        size_t aligned_size = (size + 4095) & ~(size_t)4095;
+        mprotect(addr, aligned_size, PROT_NONE);
+        madvise(addr, aligned_size, MADV_DONTNEED);
+        LSW_LOG_INFO("VirtualFree MEM_DECOMMIT: addr=%p size=%zu", addr, size);
+    } else if (free_type & 0x8000u /* MEM_RELEASE */) {
+        if (free_type & 0x0002u /* MEM_PRESERVE_PLACEHOLDER */) {
+            /* Split placeholder: release [addr, addr+size), keep rest as PROT_NONE placeholder.
+             * Used by NativeAOT bundle extractor to trim an over-reserved placeholder. */
+            if (size == 0) { lsw_SetLastError(0x57 /* ERROR_INVALID_PARAMETER */); return 0; }
+            size_t aligned_size = (size + 4095) & ~(size_t)4095;
+            if (munmap(addr, aligned_size) != 0) {
+                LSW_LOG_WARN("VirtualFree MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER: munmap failed: %s", strerror(errno));
+                lsw_SetLastError(8 /* ERROR_NOT_ENOUGH_MEMORY */); return 0;
+            }
+            LSW_LOG_INFO("VirtualFree MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER (split): addr=%p size=%zu", addr, aligned_size);
+        } else {
+            /* Full release: unmap the entire reserved region (size must be 0) */
+            if (size != 0) { lsw_SetLastError(0x57 /* ERROR_INVALID_PARAMETER */); return 0; }
+            /* We don't track the original region size, so walk /proc/self/maps would
+             * be ideal; for now use munmap on the page containing addr and hope the
+             * caller manages regions correctly.  A common pattern is to unmap the
+             * entire mapping returned by VirtualAlloc(MEM_RESERVE). */
+            munmap(addr, 4096); /* minimal safe unmap; region size unknown at this point */
+            LSW_LOG_INFO("VirtualFree MEM_RELEASE: addr=%p", addr);
+        }
+    } else {
+        munmap(addr, size ? size : 4096);
+        LSW_LOG_INFO("VirtualFree fallback: addr=%p size=%zu type=0x%x", addr, size, free_type);
     }
-    LSW_LOG_INFO("VirtualFree: addr=%p", addr);
-    return 1; // Success
+    return 1;
 }
 
 // File I/O functions
@@ -2642,6 +3032,17 @@ int __attribute__((ms_abi)) lsw_CloseHandle(void* handle) {
         return 1;
     }
 
+    /* Thread handle */
+    if (magic == LSW_THREAD_MAGIC) {
+        lsw_thread_handle_t* th = (lsw_thread_handle_t*)handle;
+        pthread_detach(th->thread);
+        pthread_mutex_destroy(&th->lock);
+        pthread_cond_destroy(&th->cond);
+        th->magic = 0;
+        free(th);
+        return 1;
+    }
+
     /* IOCP handle */
     if (magic == LSW_IOCP_MAGIC) {
         lsw_iocp_t* io = (lsw_iocp_t*)handle;
@@ -2682,14 +3083,21 @@ int __attribute__((ms_abi)) lsw_SetEvent(void* handle) {
         pthread_mutex_unlock(&ev->lock);
         return 1;
     }
-    LSW_LOG_INFO("SetEvent: handle=%p (unknown type)", handle);
+    /* Print caller address so we can identify who passes handle=0x1 */
+    void* caller = __builtin_return_address(0);
+    char dbg[128];
+    int n = snprintf(dbg, sizeof(dbg),
+        "[lsw] SetEvent UNKNOWN handle=%p caller=%p\n", handle, caller);
+    write(2, dbg, (size_t)n);
+    LSW_LOG_INFO("SetEvent: handle=%p (unknown type) caller=%p", handle, caller);
     return 1; /* best effort */
 }
 
 // Process functions
 uint32_t __attribute__((ms_abi)) lsw_GetCurrentProcessId(void) {
     uint32_t pid = (uint32_t)getpid();
-    LSW_LOG_INFO("GetCurrentProcessId: %u", pid);
+    void* caller = __builtin_return_address(0);
+    LSW_LOG_INFO("GetCurrentProcessId: %u (caller=%p)", pid, caller);
     return pid;
 }
 
@@ -2717,10 +3125,10 @@ void* __attribute__((ms_abi)) lsw_GetStdHandle(uint32_t std_handle) {
     // pass them directly to ReadFile/WriteFile without going through GetStdHandle
     // get consistent behavior. -10=stdin, -11=stdout, -12=stderr.
     switch (std_handle) {
-        case (uint32_t)-10: return (void*)(intptr_t)-10;
-        case (uint32_t)-11: return (void*)(intptr_t)-11;
-        case (uint32_t)-12: return (void*)(intptr_t)-12;
-        default: return (void*)(intptr_t)-1;  /* INVALID_HANDLE_VALUE */
+        case (uint32_t)-10: LSW_LOG_INFO("GetStdHandle(STDIN)"); return (void*)(intptr_t)-10;
+        case (uint32_t)-11: LSW_LOG_INFO("GetStdHandle(STDOUT)"); return (void*)(intptr_t)-11;
+        case (uint32_t)-12: LSW_LOG_INFO("GetStdHandle(STDERR)"); return (void*)(intptr_t)-12;
+        default: LSW_LOG_WARN("GetStdHandle(unknown=0x%x)", std_handle); return (void*)(intptr_t)-1;  /* INVALID_HANDLE_VALUE */
     }
 }
 
@@ -3030,8 +3438,6 @@ int __attribute__((ms_abi)) lsw_DeleteFileA(const char* filename) {
 // Wide-char file operations
 void* __attribute__((ms_abi)) lsw_CreateFileW(const wchar_t* filename, uint32_t access, uint32_t share_mode,
                                                 void* security, uint32_t creation, uint32_t flags, void* template_file) {
-    LSW_LOG_DEBUG("CreateFileW called");
-    
     if (!filename) {
         LSW_LOG_ERROR("CreateFileW: null filename");
         return INVALID_HANDLE_VALUE;
@@ -3045,7 +3451,7 @@ void* __attribute__((ms_abi)) lsw_CreateFileW(const wchar_t* filename, uint32_t 
         return INVALID_HANDLE_VALUE;
     }
     
-    LSW_LOG_DEBUG("CreateFileW: %s", filename_mb);
+    LSW_LOG_INFO("CreateFileW: %s (access=%x creation=%u flags=%x)", filename_mb, access, creation, flags);
     
     // Call CreateFileA with converted path
     return lsw_CreateFileA(filename_mb, access, share_mode, security, creation, flags, template_file);
@@ -3269,14 +3675,17 @@ uint32_t __attribute__((ms_abi)) lsw_GetFileAttributesW(const wchar_t* filename)
         LSW_LOG_ERROR("GetFileAttributesW: WideCharToMultiByte failed");
         return INVALID_FILE_ATTRIBUTES;
     }
-    
-    // Translate Windows path to Linux path
+
+    /* .NET hosting: redirect C:\Program Files\dotnet paths to the Linux bridge */
+    extern int lsw_dotnet_translate_win_path(const char*, char*, size_t);
     char linux_path[LSW_MAX_PATH];
-    if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
-        LSW_LOG_ERROR("GetFileAttributesW: path translation failed");
-        return INVALID_FILE_ATTRIBUTES;
+    if (!lsw_dotnet_translate_win_path(filename_mb, linux_path, sizeof(linux_path))) {
+        // Translate Windows path to Linux path
+        if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+            LSW_LOG_ERROR("GetFileAttributesW: path translation failed");
+            return INVALID_FILE_ATTRIBUTES;
+        }
     }
-    
     LSW_LOG_DEBUG("GetFileAttributesW: %s -> %s", filename_mb, linux_path);
     
     // Get file stats
@@ -3983,9 +4392,13 @@ void* __attribute__((ms_abi)) lsw_FindFirstFileW(const wchar_t* filename, WIN32_
     
     // Translate Windows path to Linux
     char linux_path[LSW_MAX_PATH];
-    if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
-        LSW_LOG_ERROR("FindFirstFileW: path translation failed");
-        return (void*)-1;
+    /* .NET hosting: redirect C:\Program Files\dotnet paths to the Linux bridge */
+    extern int lsw_dotnet_translate_win_path(const char*, char*, size_t);
+    if (!lsw_dotnet_translate_win_path(filename_mb, linux_path, sizeof(linux_path))) {
+        if (lsw_fs_win_to_linux(filename_mb, linux_path, sizeof(linux_path)) != LSW_SUCCESS) {
+            LSW_LOG_ERROR("FindFirstFileW: path translation failed");
+            return (void*)-1;
+        }
     }
     
     // Extract directory and pattern
@@ -4125,7 +4538,7 @@ void* __attribute__((ms_abi)) lsw_GetProcessHeap(void) {
 void* __attribute__((ms_abi)) lsw_HeapAlloc(void* heap, uint32_t flags, size_t size) {
     (void)heap; // Ignore heap parameter, use malloc
     
-    LSW_LOG_INFO("HeapAlloc called: size=%zu, flags=0x%x", size, flags);
+    LSW_LOG_DEBUG("HeapAlloc called: size=%zu, flags=0x%x", size, flags);
     
     void* ptr = malloc(size);
     
@@ -4134,7 +4547,7 @@ void* __attribute__((ms_abi)) lsw_HeapAlloc(void* heap, uint32_t flags, size_t s
         memset(ptr, 0, size);
     }
     
-    LSW_LOG_INFO("HeapAlloc: allocated %p", ptr);
+    LSW_LOG_DEBUG("HeapAlloc: allocated %p", ptr);
     return ptr;
 }
 
@@ -4143,7 +4556,7 @@ int __attribute__((ms_abi)) lsw_HeapFree(void* heap, uint32_t flags, void* mem) 
     (void)heap;
     (void)flags;
     
-    LSW_LOG_INFO("HeapFree called: mem=%p", mem);
+    LSW_LOG_DEBUG("HeapFree called: mem=%p", mem);
     
     if (mem) {
         free(mem);
@@ -4262,6 +4675,14 @@ void* __attribute__((ms_abi)) lsw_CreateThread(
 {
     (void)thread_attributes; // Not used yet
     
+    /* Use raw write to guarantee this appears even if logger has buffering issues */
+    {
+        char dbg[128];
+        int n = snprintf(dbg, sizeof(dbg),
+            "[lsw] CreateThread STUB ENTERED start=%p param=%p flags=0x%x\n",
+            start_address, parameter, creation_flags);
+        write(2, dbg, (size_t)n);
+    }
     LSW_LOG_INFO("CreateThread called: start=0x%p, param=0x%p, flags=0x%x",
                  start_address, parameter, creation_flags);
     
@@ -4302,25 +4723,51 @@ void* __attribute__((ms_abi)) lsw_CreateThread(
         }
     }
     
-    // Fallback: create pthread
-    LSW_LOG_WARN("Using pthread fallback for CreateThread");
-    
-    pthread_t thread;
-    int ret = pthread_create(&thread, NULL, (void*(*)(void*))start_address, parameter);
-    
-    if (ret != 0) {
-        LSW_LOG_ERROR("pthread_create failed: %s", strerror(ret));
+    // Fallback: create pthread with ABI trampoline
+    LSW_LOG_INFO("Using pthread fallback for CreateThread (with ms_abi trampoline)");
+
+    lsw_thread_handle_t* th = (lsw_thread_handle_t*)malloc(sizeof(lsw_thread_handle_t));
+    if (!th) {
+        LSW_LOG_ERROR("CreateThread: malloc for thread handle failed");
         return NULL;
     }
-    
-    if (thread_id) {
-        *thread_id = (uint32_t)(uintptr_t)thread;
+    th->magic    = LSW_THREAD_MAGIC;
+    th->finished = 0;
+    th->exit_code = 0;
+    pthread_mutex_init(&th->lock, NULL);
+    pthread_cond_init(&th->cond, NULL);
+    th->suspended = (creation_flags & 0x4) ? 1 : 0;
+    pthread_mutex_init(&th->suspend_lock, NULL);
+    pthread_cond_init(&th->suspend_cond, NULL);
+
+    lsw_thread_trampoline_t* tram = (lsw_thread_trampoline_t*)malloc(sizeof(lsw_thread_trampoline_t));
+    if (!tram) {
+        LSW_LOG_ERROR("CreateThread: malloc for trampoline failed");
+        free(th);
+        return NULL;
     }
-    
-    LSW_LOG_INFO("CreateThread fallback: pthread=%lu", (unsigned long)thread);
-    
-    // Return pthread handle as Win32 handle
-    return (void*)(uintptr_t)thread;
+    tram->start_fn = (uint32_t (__attribute__((ms_abi)) *)(void*))start_address;
+    tram->param    = parameter;
+    tram->handle   = th;
+
+    /* CREATE_SUSPENDED (0x4): thread waits in trampoline until ResumeThread() */
+    if (creation_flags & 0x4)
+        LSW_LOG_INFO("CreateThread: CREATE_SUSPENDED requested — thread will wait for ResumeThread");
+
+    int ret = pthread_create(&th->thread, NULL, lsw_thread_trampoline, tram);
+    if (ret != 0) {
+        LSW_LOG_ERROR("pthread_create failed: %s", strerror(ret));
+        free(tram);
+        free(th);
+        return NULL;
+    }
+
+    if (thread_id) {
+        *thread_id = (uint32_t)(uintptr_t)th->thread;
+    }
+
+    LSW_LOG_INFO("CreateThread: handle=%p pthread=%lu", (void*)th, (unsigned long)th->thread);
+    return (void*)th;
 }
 
 void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
@@ -4349,7 +4796,7 @@ void __attribute__((ms_abi)) lsw_ExitThread(uint32_t exit_code)
 
 uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t milliseconds)
 {
-    LSW_LOG_DEBUG("WaitForSingleObject: handle=%p ms=0x%x", handle, milliseconds);
+    LSW_LOG_INFO("WaitForSingleObject: handle=%p ms=0x%x", handle, milliseconds);
     if (!handle || handle == INVALID_HANDLE_VALUE) return 0xFFFFFFFF; /* WAIT_FAILED */
 
     /* ---- Raw process handle (small-integer PID from CreateProcess) ---- */
@@ -4386,8 +4833,19 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
         lsw_event_t* ev = handle;
         pthread_mutex_lock(&ev->lock);
         if (milliseconds == 0xFFFFFFFF) {
-            while (!ev->signaled)
-                pthread_cond_wait(&ev->cond, &ev->lock);
+            /* Cap INFINITE at 5s: if the signaling thread crashed it will never fire.
+               On timeout, force-signal the event so CLR shutdown can proceed. */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            while (!ev->signaled) {
+                if (pthread_cond_timedwait(&ev->cond, &ev->lock, &ts) != 0)
+                    break;
+            }
+            if (!ev->signaled) {
+                LSW_LOG_WARN("WaitForSingleObject(INFINITE): event %p never signaled after 5s, force-completing", handle);
+                ev->signaled = 1; /* force-signal so the caller moves forward */
+            }
         } else if (milliseconds == 0) {
             if (!ev->signaled) {
                 pthread_mutex_unlock(&ev->lock);
@@ -4461,6 +4919,33 @@ uint32_t __attribute__((ms_abi)) lsw_WaitForSingleObject(void* handle, uint32_t 
             return 0;
         }
         return (r == 0) ? 0x00000102 : 0xFFFFFFFF;
+    }
+
+    if (magic == LSW_THREAD_MAGIC) {
+        lsw_thread_handle_t* th = handle;
+        pthread_mutex_lock(&th->lock);
+        if (milliseconds == 0xFFFFFFFF) {
+            while (!th->finished)
+                pthread_cond_wait(&th->cond, &th->lock);
+            pthread_mutex_unlock(&th->lock);
+            return 0; /* WAIT_OBJECT_0 */
+        } else if (milliseconds == 0) {
+            int done = th->finished;
+            pthread_mutex_unlock(&th->lock);
+            return done ? 0 : 0x00000102; /* WAIT_TIMEOUT */
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += milliseconds / 1000;
+            ts.tv_nsec += (milliseconds % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            while (!th->finished) {
+                if (pthread_cond_timedwait(&th->cond, &th->lock, &ts) != 0) break;
+            }
+            int done = th->finished;
+            pthread_mutex_unlock(&th->lock);
+            return done ? 0 : 0x00000102;
+        }
     }
 
     /* ---- Kernel path ---- */
@@ -4811,6 +5296,8 @@ static int is_system_dll(const char* name) {
         "ole32.dll","oleaut32.dll","comctl32.dll","msvcrt.dll",
         "ucrtbase.dll","ws2_32.dll","ws2_32","msvcp140.dll",
         "vcruntime140.dll","vcruntime140_1.dll","msvcp_win.dll",
+        /* .NET CLR hosting — intercepted and bridged to Linux libhostfxr.so */
+        "hostfxr.dll","nethost.dll","hostpolicy.dll",
         NULL
     };
     char lower[128]; size_t n = strlen(name);
@@ -7192,32 +7679,79 @@ void* __attribute__((ms_abi)) lsw_CreateEventW(void* attrs, int manual_reset, in
     return (void*)ev;
 }
 
-// ---- File Mapping (backed by anonymous mmap) ----
+// ---- File Mapping (backed by anonymous mmap or file-backed mmap) ----
 typedef struct {
     void*  base;
     size_t size;
+    int    fd;          /* -1 if anonymous; file fd for file-backed mappings */
+    int    reserved_only; /* 1 = SEC_RESERVE: PROT_NONE reservation; pages committed via VirtualAlloc */
 } lsw_file_mapping_t;
 
 void* __attribute__((ms_abi)) lsw_CreateFileMappingW(
     void* hfile, void* attrs, uint32_t protect,
     uint32_t size_high, uint32_t size_low, const uint16_t* name)
 {
-    (void)hfile; (void)attrs; (void)protect; (void)name;
+    (void)attrs; (void)name;
     size_t size = ((size_t)size_high << 32) | (size_t)size_low;
-    if (size == 0) {
-        LSW_LOG_WARN("CreateFileMappingW: size 0 not supported");
-        return NULL;
+
+    /* Resolve file descriptor from Windows handle.
+     * CreateFileA/W returns the raw fd as (void*)(intptr_t)fd.
+     * INVALID_HANDLE_VALUE = (void*)-1 → no file.  NULL → no file. */
+    int fd = -1;
+    uintptr_t h = (uintptr_t)hfile;
+    /* Small positive integers (< 0x10000) are raw fds from CreateFileA/W */
+    if (h != 0 && h != (uintptr_t)-1 && h < 0x10000u) {
+        fd = (int)h;
     }
+
+    LSW_LOG_INFO("CreateFileMappingW: hfile=%p fd=%d protect=0x%x size=%zu",
+                 hfile, fd, protect, size);
+    if (size == 0) {
+        if (fd < 0) {
+            LSW_LOG_WARN("CreateFileMappingW: size 0 with no file handle not supported");
+            return NULL;
+        }
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            LSW_LOG_WARN("CreateFileMappingW: fstat failed: %s", strerror(errno));
+            return NULL;
+        }
+        size = (size_t)st.st_size;
+    }
+
     lsw_file_mapping_t* fm = malloc(sizeof(lsw_file_mapping_t));
     if (!fm) return NULL;
-    fm->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    fm->fd = fd;
+    fm->reserved_only = 0;
+
+    int prot = PROT_READ;
+    if ((protect & 0xFF) == 0x04 /* PAGE_READWRITE */ || (protect & 0xFF) == 0x08 /* PAGE_WRITECOPY */)
+        prot = PROT_READ | PROT_WRITE;
+
+    /* SEC_RESERVE (0x4000000): reserve virtual address space without committing.
+     * Use PROT_NONE + MAP_NORESERVE so no physical memory is consumed.
+     * The caller will commit individual pages via VirtualAlloc(MEM_COMMIT). */
+    int is_sec_reserve = (protect & 0x4000000u) != 0;
+
+    if (is_sec_reserve && fd < 0) {
+        fm->base = mmap(NULL, size, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        fm->reserved_only = 1;
+    } else if (fd >= 0) {
+        /* File-backed mapping */
+        fm->base = mmap(NULL, size, prot, MAP_PRIVATE, fd, 0);
+    } else {
+        /* Anonymous read/write mapping */
+        fm->base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    }
     if (fm->base == MAP_FAILED) {
-        LSW_LOG_ERROR("CreateFileMappingW: mmap failed: %s", strerror(errno));
+        LSW_LOG_ERROR("CreateFileMappingW: mmap failed: %s (size=%zu protect=0x%x)",
+                      strerror(errno), size, protect);
         free(fm);
         return NULL;
     }
     fm->size = size;
-    LSW_LOG_INFO("CreateFileMappingW: size=%zu -> %p", size, fm->base);
+    LSW_LOG_INFO("CreateFileMappingW: fd=%d size=%zu -> %p", fd, size, fm->base);
     return (void*)fm;
 }
 
@@ -7265,7 +7799,9 @@ void* __attribute__((ms_abi)) lsw_GetModuleHandleW(const uint16_t* name) {
     return lsw_GetModuleHandleA(buf);
 }
 
-/* Convert a Linux path (/mnt/c/...) to Windows path (C:\...) for wide output */
+/* Convert a Linux path (/mnt/c/...) to Windows path (C:\...) for wide output.
+ * Windows behavior: if buffer too small, copies size-1 chars + null, returns size.
+ * Returns actual length on success (< size). */
 static uint32_t lsw_linux_to_winpath_w(const char* src, uint16_t* buf, uint32_t size) {
     if (!buf || size == 0) return 0;
     char win[4096];
@@ -7282,21 +7818,32 @@ static uint32_t lsw_linux_to_winpath_w(const char* src, uint16_t* buf, uint32_t 
         win[wi] = (*src == '/') ? '\\' : *src;
     }
     win[wi] = '\0';
+    /* Copy up to size-1 chars, null terminate, and return count.
+     * Per Windows API: if path >= size, copy truncated, return size (signals truncation). */
     uint32_t i = 0;
     while (win[i] && i < size - 1) { buf[i] = (uint16_t)(unsigned char)win[i]; i++; }
     buf[i] = 0;
+    if (win[i] != '\0') {
+        /* Path was truncated — Windows returns nSize to signal buffer too small */
+        return size;
+    }
     return i;
 }
 
 uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameW(void* module, uint16_t* buf, uint32_t size) {
-    (void)module;
-    if (!buf || size == 0) return 0;
+    LSW_LOG_INFO("GetModuleFileNameW: module=%p buf=%p size=%u", module, buf, size);
+    if (!buf || size == 0) {
+        LSW_LOG_INFO("GetModuleFileNameW: null buf or size=0, returning 0");
+        return 0;
+    }
+    /* NULL module or the PE image base both refer to the main executable */
     const char* src = (g_lsw_exe_path[0]) ? g_lsw_exe_path : "";
-    uint32_t i = lsw_linux_to_winpath_w(src, buf, size);
+    LSW_LOG_INFO("GetModuleFileNameW: src='%s'", src);
+    uint32_t result = lsw_linux_to_winpath_w(src, buf, size);
     char dbg[256]; uint32_t di = 0;
     while (buf[di] && di < 255) { dbg[di] = (char)(buf[di] & 0xFF); di++; } dbg[di] = '\0';
-    LSW_LOG_INFO("GetModuleFileNameW -> %s (%u chars)", dbg, i);
-    return i;
+    LSW_LOG_INFO("GetModuleFileNameW -> '%s' (ret=%u, size=%u)", dbg, result, size);
+    return result;
 }
 
 uint32_t __attribute__((ms_abi)) lsw_GetModuleFileNameA(void* module, char* buf, uint32_t size) {
@@ -7545,6 +8092,27 @@ size_t __attribute__((ms_abi)) lsw_strftime(char* s, size_t max, const char* fmt
 // Environment
 char* __attribute__((ms_abi)) lsw_getenv(const char* n) { return getenv(n); }
 int   __attribute__((ms_abi)) lsw__putenv(const char* s) { return putenv((char*)s); }
+
+/* _putenv_s / _wputenv_s — used by .NET PAL pal::setenv */
+int __attribute__((ms_abi)) lsw__putenv_s(const char* name, const char* value) {
+    if (!name) return EINVAL;
+    if (!value || value[0] == '\0') {
+        return unsetenv(name) == 0 ? 0 : errno;
+    }
+    return setenv(name, value, 1) == 0 ? 0 : errno;
+}
+
+int __attribute__((ms_abi)) lsw__wputenv_s(const uint16_t* name, const uint16_t* value) {
+    if (!name) return EINVAL;
+    char name_mb[512] = {0};
+    for (int i = 0; i < 511 && name[i]; i++) name_mb[i] = (char)name[i];
+    char val_mb[4096] = {0};
+    if (value) {
+        for (int i = 0; i < 4095 && value[i]; i++) val_mb[i] = (char)value[i];
+        return setenv(name_mb, val_mb, 1) == 0 ? 0 : errno;
+    }
+    return unsetenv(name_mb) == 0 ? 0 : errno;
+}
 
 /* msvcrt/ucrtbase _wgetenv — return wide env var (UTF-16 in static buffer) */
 static uint16_t lsw_wgetenv_buf[LSW_MAX_PATH];
@@ -7917,6 +8485,13 @@ int __attribute__((ms_abi)) lsw___stdio_common_vswprintf(
     uint64_t opts, wchar_t* buf, size_t n, const wchar_t* fmt, void* locale, char* ap)
 {
     (void)opts; (void)locale;
+    /* Windows measure-only convention: buf=NULL or n=0 → return required char count.
+     * lsw__vsnwprintf returns -1 for NULL/0 so we must handle this case specially. */
+    if (!buf || n == 0) {
+        uint16_t tmp[4096];
+        int r = lsw__vsnwprintf((wchar_t*)tmp, 4096, fmt, ap);
+        return r >= 0 ? r : 0;
+    }
     return lsw__vsnwprintf(buf, n, fmt, ap);
 }
 int __attribute__((ms_abi)) lsw___stdio_common_vfwprintf(
@@ -8070,18 +8645,322 @@ void __attribute__((ms_abi)) lsw__register_thread_local_exe_atexit_callback(void
 /* _set_fmode / _set_new_mode / _seh_filter_exe / _resetstkoflw */
 void __attribute__((ms_abi)) lsw__set_fmode(int mode) { lsw_crt_fmode = mode; }
 void __attribute__((ms_abi)) lsw__set_new_mode(int mode) { (void)mode; }
-int __attribute__((ms_abi)) lsw__seh_filter_exe(uint32_t code, void* ep) { (void)code; (void)ep; return 0; }
+int __attribute__((ms_abi)) lsw__seh_filter_exe(uint32_t code, void* ep) {
+    (void)ep;
+    /* C++ exceptions (0xe06d7363) must be caught; report EXCEPTION_EXECUTE_HANDLER. */
+    return (code == 0xe06d7363u) ? 1 : 0;
+}
 int __attribute__((ms_abi)) lsw__resetstkoflw(void) { return 1; }
 
-/* _get_initial_wide_environment — return pointer to wenvp */
-wchar_t** __attribute__((ms_abi)) lsw__get_initial_wide_environment(void) { return lsw_crt_wenvp; }
+/* _get_initial_wide_environment — return pointer to wenvp, lazy-init if needed */
+wchar_t** __attribute__((ms_abi)) lsw__get_initial_wide_environment(void) {
+    if (!lsw_crt_wenvp)
+        lsw__initialize_wide_environment();
+    return lsw_crt_wenvp;
+}
+
+/* _get_initial_narrow_environment — return char** environ */
+char** __attribute__((ms_abi)) lsw__get_initial_narrow_environment(void) {
+    return lsw_crt_environ ? lsw_crt_environ : environ;
+}
 
 /* _configthreadlocale — no-op */
 int __attribute__((ms_abi)) lsw__configthreadlocale(int per_thread) { (void)per_thread; return 0; }
 
+/*
+ * host_runtime_contract stub for .NET AppHost integration.
+ *
+ * .NET self-contained single-file bundles pass a host_runtime_contract pointer
+ * via an env-var-style array to the embedded hostfxr. The AppHost allocates
+ * this struct, formats its address as "0x<hex>" and passes it. On Linux the
+ * allocator used by the AppHost's internal initialization code may not go
+ * through our Win32 stubs, so the address can be unmapped in our process.
+ *
+ * The embedded hostfxr (function at ~0x140565ff0) reads the struct fields at
+ * offset +0x18 (load_assembly) and +0x20 (get_function_pointer) — both have
+ * explicit NULL-checks before use, so returning a zeroed stub is safe and lets
+ * the initialisation proceed past the crash point.
+ *
+ * Layout (from dotnet/runtime host_runtime_contract.h, .NET 8 / v6.0 bundle):
+ *   +0x00  size_t  size
+ *   +0x08  void*   context
+ *   +0x10  void*   get_runtime_property  (fn ptr)
+ *   +0x18  void*   bundle_probe          (fn ptr)  — CLR calls this to locate bundle entries
+ *   +0x20  void*   pinvoke_override      (fn ptr)
+ */
+typedef struct {
+    size_t size;
+    void*  context;
+    void*  get_runtime_property;  /* const wchar_t* (*)(key, buf, buf_sz, ctx) */
+    void*  bundle_probe;          /* bool (*)(const char* path_utf8, int64_t* off, int64_t* sz, int64_t* csz) */
+    void*  pinvoke_override;      /* void* (*)(lib_name, entry_point_name) */
+} lsw_host_runtime_contract_t;
+
+/* ---- .NET 8 bundle manifest parser ---- */
+
+#define LSW_BUNDLE_MAX_ENTRIES 1024
+#define LSW_BUNDLE_PATH_MAX    512
+
+typedef struct {
+    char     path[LSW_BUNDLE_PATH_MAX];
+    int64_t  offset;
+    int64_t  size;
+    int64_t  compressed_size;
+    uint8_t  type;
+} lsw_bundle_entry_t;
+
+static lsw_bundle_entry_t g_bundle_entries[LSW_BUNDLE_MAX_ENTRIES];
+static int g_bundle_entry_count = 0;
+static int g_bundle_parsed      = 0;
+
+/*
+ * Decode a 7-bit LEB128 integer (as used by .NET BinaryWriter.Write7BitEncodedInt).
+ * Reads at most 5 bytes from data+*pos, advancing *pos past the encoded value.
+ * Returns -1 if the encoding is invalid or truncated.
+ */
+static int32_t lsw_read_7bit_int(const uint8_t* data, size_t* pos, size_t file_size) {
+    int32_t result = 0;
+    int     shift  = 0;
+    while (*pos < file_size && shift < 35) {
+        uint8_t b = data[(*pos)++];
+        result |= (int32_t)(b & 0x7F) << shift;
+        if ((b & 0x80) == 0) return result;
+        shift += 7;
+    }
+    return -1; /* truncated or too wide */
+}
+
+/*
+ * Find the .NET 8 bundle header by scanning the PE section (first 9.5 MB) for
+ * the 8-byte bundle_header_offset pointer that the apphost stores after bundling.
+ * This pointer is patched in by the .NET SDK and always points into the file at
+ * whatever alignment the bundler chose (which may not be 4-byte aligned, so
+ * scanning the bundle data itself with a stride > 1 can miss it).
+ *
+ * Returns the bundle header offset within the file, or -1 if not found.
+ */
+static int64_t lsw_find_bundle_header(const uint8_t* data, size_t file_size) {
+    /* Scan only the PE code/data sections for the pointer; the bundle data
+     * starts after ~9.5 MB in a typical self-contained publish. */
+    size_t pe_scan_end = file_size < 10*1024*1024u ? file_size : 10*1024*1024u;
+
+    for (size_t i = 0; i + 8 <= pe_scan_end; i += 4) {
+        int64_t val;
+        memcpy(&val, data + i, 8);
+
+        /* Must point well past the PE header and not past EOF */
+        if (val <= (int64_t)(1024*1024) || val >= (int64_t)(file_size - 20))
+            continue;
+
+        /* Validate potential header */
+        size_t h = (size_t)val;
+        uint32_t major, minor;
+        int32_t  num_files;
+        memcpy(&major,    data + h,     4);
+        memcpy(&minor,    data + h + 4, 4);
+        memcpy(&num_files,data + h + 8, 4);
+
+        if (major < 1 || major > 20 || minor != 0) continue;
+        if (num_files <= 0 || num_files > 10000)   continue;
+
+        /* Decode bundle_id via 7-bit LEB128 and check it's printable ASCII */
+        size_t id_pos = h + 12;
+        int32_t id_len = lsw_read_7bit_int(data, &id_pos, file_size);
+        if (id_len <= 0 || id_len > 512) continue;
+        if (id_pos + (size_t)id_len > file_size) continue;
+
+        int id_ok = 1;
+        for (int j = 0; j < id_len && id_ok; j++) {
+            uint8_t c = data[id_pos + j];
+            if (c < 0x20 || c > 0x7e) id_ok = 0;
+        }
+        if (!id_ok) continue;
+
+        /* Spot-check first entry: offset and size must be plausible */
+        size_t entries_off = id_pos + (size_t)id_len + 40; /* 5×int64 after id */
+        if (entries_off + 16 >= file_size) continue;
+
+        int64_t e0_off, e0_sz;
+        memcpy(&e0_off, data + entries_off,     8);
+        memcpy(&e0_sz,  data + entries_off + 8, 8);
+        if (e0_off <= 0 || e0_off >= (int64_t)file_size) continue;
+        if (e0_sz  <= 0 || e0_sz  >= (int64_t)file_size) continue;
+
+        return val; /* return the header offset, not the pointer offset */
+    }
+    return -1;
+}
+
+/*
+ * Parse the .NET 8 bundle manifest from g_lsw_exe_path.
+ * Populates g_bundle_entries[] for use by lsw_bundle_probe().
+ */
+static void lsw_parse_bundle_manifest(void) {
+    if (g_bundle_parsed) return;
+    g_bundle_parsed = 1;
+
+    if (!g_lsw_exe_path[0]) {
+        fprintf(stderr, "[lsw] bundle_probe: no exe path set\n");
+        return;
+    }
+
+    int fd = open(g_lsw_exe_path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "[lsw] bundle_probe: cannot open '%s': %s\n",
+                g_lsw_exe_path, strerror(errno));
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return; }
+    size_t file_size = (size_t)st.st_size;
+
+    const uint8_t* data = (const uint8_t*)mmap(NULL, file_size,
+                                                PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) {
+        fprintf(stderr, "[lsw] bundle_probe: mmap failed: %s\n", strerror(errno));
+        return;
+    }
+
+    int64_t hdr_off = lsw_find_bundle_header(data, file_size);
+    if (hdr_off < 0) {
+        fprintf(stderr, "[lsw] bundle_probe: bundle header not found in '%s'\n",
+                g_lsw_exe_path);
+        munmap((void*)data, file_size);
+        return;
+    }
+
+    int32_t num_files;
+    memcpy(&num_files, data + hdr_off + 8, 4);
+
+    /* bundle_id uses 7-bit LEB128 length prefix */
+    size_t id_pos = (size_t)hdr_off + 12;
+    int32_t id_len = lsw_read_7bit_int(data, &id_pos, file_size);
+
+    char id_buf[64] = {0};
+    if (id_len > 0 && id_len < 63)
+        memcpy(id_buf, data + id_pos, id_len);
+    fprintf(stderr, "[lsw] bundle_probe: header at 0x%llx, %d files, id='%s'\n",
+            (long long)hdr_off, num_files, id_buf);
+
+    /* After id: 5 int64 fields (40 bytes), then entries */
+    size_t pos = id_pos + (size_t)(id_len > 0 ? id_len : 0) + 40;
+    g_bundle_entry_count = 0;
+
+    for (int i = 0; i < num_files && g_bundle_entry_count < LSW_BUNDLE_MAX_ENTRIES; i++) {
+        if (pos + 25 > file_size) break; /* minimum entry: 8+8+8+1+LEB128(1) = 26 bytes */
+
+        lsw_bundle_entry_t* e = &g_bundle_entries[g_bundle_entry_count];
+        memcpy(&e->offset,          data + pos,      8); pos += 8;
+        memcpy(&e->size,            data + pos,      8); pos += 8;
+        memcpy(&e->compressed_size, data + pos,      8); pos += 8;
+        e->type = data[pos++];
+
+        /* path uses 7-bit LEB128 length prefix (.NET BinaryWriter.Write(string)) */
+        int32_t path_len = lsw_read_7bit_int(data, &pos, file_size);
+        if (path_len <= 0 || path_len >= LSW_BUNDLE_PATH_MAX) {
+            if (path_len > 0) pos += (size_t)path_len;
+            continue;
+        }
+        if (pos + (size_t)path_len > file_size) break;
+
+        memcpy(e->path, data + pos, path_len);
+        e->path[path_len] = '\0';
+        pos += (size_t)path_len;
+
+        g_bundle_entry_count++;
+    }
+
+    fprintf(stderr, "[lsw] bundle_probe: parsed %d bundle entries\n", g_bundle_entry_count);
+    munmap((void*)data, file_size);
+}
+
+/*
+ * bundle_probe — called by the .NET 8 CLR to look up a managed assembly in the
+ * single-file bundle.  Returns true + file offset/size if found, false otherwise.
+ * The CLR then opens the host EXE (via CreateFileW) and memory-maps the assembly
+ * at the returned offset.
+ *
+ * NOTE: The .NET host_runtime_contract bundle_probe uses const char* (UTF-8),
+ * NOT const wchar_t*, even in the Windows PE build.  The Windows PE CLR still
+ * uses UTF-8 for bundle entry names in this internal contract.
+ */
+static int __attribute__((ms_abi)) lsw_bundle_probe(
+    const char* entry_name_utf8,
+    int64_t* out_offset, int64_t* out_size, int64_t* out_compressed_size)
+{
+    if (!entry_name_utf8 || !out_offset || !out_size || !out_compressed_size) return 0;
+
+    const char* entry_name = entry_name_utf8;
+
+    /* Extract the basename — CLR typically passes bare filenames */
+    const char* basename = strrchr(entry_name, '/');
+    if (!basename) basename = strrchr(entry_name, '\\');
+    if (basename) basename++;
+    else          basename = entry_name;
+
+    for (int i = 0; i < g_bundle_entry_count; i++) {
+        const char* stored = g_bundle_entries[i].path;
+
+        /* Full-path match */
+        if (strcasecmp(stored, entry_name) == 0) goto found;
+
+        /* Basename-only match */
+        const char* stored_base = strrchr(stored, '/');
+        if (!stored_base) stored_base = strrchr(stored, '\\');
+        if (stored_base) stored_base++;
+        else             stored_base = stored;
+        if (strcasecmp(stored_base, basename) == 0) goto found;
+        continue;
+
+    found:
+        *out_offset          = g_bundle_entries[i].offset;
+        *out_size            = g_bundle_entries[i].size;
+        *out_compressed_size = g_bundle_entries[i].compressed_size;
+        fprintf(stderr,
+            "[lsw] bundle_probe: found '%s' offset=0x%llx size=%lld csize=%lld\n",
+            entry_name, (long long)*out_offset,
+            (long long)*out_size, (long long)*out_compressed_size);
+        return 1; /* TRUE */
+    }
+
+    fprintf(stderr, "[lsw] bundle_probe: NOT found '%s'\n", entry_name);
+    return 0; /* FALSE */
+}
+
+static lsw_host_runtime_contract_t g_host_runtime_contract_stub = {
+    .size                = sizeof(lsw_host_runtime_contract_t),
+    .context             = NULL,
+    .get_runtime_property = NULL,
+    .bundle_probe        = NULL,  /* set when _wcstoui64 substitutes the stub */
+    .pinvoke_override    = NULL,
+};
+
 /* _wcstoui64 — wide string to uint64 */
 uint64_t __attribute__((ms_abi)) lsw__wcstoui64(const wchar_t* s, wchar_t** end, int base) {
-    return (uint64_t)wcstoull(s, end, base);
+    char buf[64]; u16_to_utf8((const u16*)s, buf, sizeof(buf));
+    char* ep; uint64_t r = (uint64_t)strtoull(buf, &ep, base);
+    if (end) *(u16**)end = (u16*)s + (ep - buf);
+
+    /* If the result looks like a host_runtime_contract pointer but the page is
+     * not mapped in our Linux process (the AppHost may have used an allocator
+     * that bypasses our Win32 stubs), substitute our bundle-aware stub so
+     * the CLR can locate managed assemblies in the single-file bundle. */
+    if (r >= 0x10000) {
+        unsigned char vec = 0;
+        if (mincore((void*)(r & ~0xFFFUL), 4096, &vec) != 0) {
+            fprintf(stderr,
+                "[lsw] _wcstoui64: parsed ptr 0x%llx is unmapped "
+                "(src='%s') — substituting host_runtime_contract stub\n",
+                (unsigned long long)r, buf);
+            /* Parse the bundle manifest now so bundle_probe is ready */
+            lsw_parse_bundle_manifest();
+            g_host_runtime_contract_stub.bundle_probe = (void*)lsw_bundle_probe;
+            return (uint64_t)&g_host_runtime_contract_stub;
+        }
+    }
+    return r;
 }
 
 /* getwchar / getwc */
@@ -8092,6 +8971,216 @@ int __attribute__((ms_abi)) lsw_getwchar(void) { return (int)getwchar(); }
 // terminate / unexpected
 void __attribute__((ms_abi)) lsw__crt_atexit(void* fn) { (void)fn; }
 void __attribute__((ms_abi)) lsw___crt_at_quick_exit(void* fn) { (void)fn; }
+
+/* terminate — C++ terminate(), called on unhandled exception */
+void __attribute__((ms_abi)) lsw_terminate(void) { abort(); }
+
+/* RoInitialize / RoUninitialize — defined in game_api.c */
+extern int32_t __attribute__((ms_abi)) lsw_RoInitialize(uint32_t init_type);
+extern void    __attribute__((ms_abi)) lsw_RoUninitialize(void);
+
+/* _invoke_watson — Windows error reporting stub */
+void __attribute__((ms_abi)) lsw__invoke_watson(const wchar_t* expr, const wchar_t* fn,
+        const wchar_t* file, unsigned line, uintptr_t reserved) {
+    (void)expr; (void)fn; (void)file; (void)line; (void)reserved;
+    LSW_LOG_ERROR("_invoke_watson called (assertion/invalid param) — aborting");
+    abort();
+}
+
+/* _invalid_parameter_noinfo — stub */
+void __attribute__((ms_abi)) lsw__invalid_parameter_noinfo(void) {
+    LSW_LOG_WARN("_invalid_parameter_noinfo called");
+}
+void __attribute__((ms_abi)) lsw__invalid_parameter_noinfo_noreturn(void) {
+    LSW_LOG_ERROR("_invalid_parameter_noinfo_noreturn called — aborting");
+    abort();
+}
+
+/* _flushall — flush all open streams */
+int __attribute__((ms_abi)) lsw__flushall(void) {
+    fflush(NULL);
+    return 0;
+}
+
+/* _fdopen — open FILE* from file descriptor */
+FILE* __attribute__((ms_abi)) lsw__fdopen(int fd, const char* mode) {
+    return fdopen(fd, mode);
+}
+
+/* _lock_file / _unlock_file — FILE locking no-ops */
+void __attribute__((ms_abi)) lsw__lock_file(FILE* f) { (void)f; }
+void __attribute__((ms_abi)) lsw__unlock_file(FILE* f) { (void)f; }
+
+/* _lock_locales / _unlock_locales — locale locking no-ops */
+void __attribute__((ms_abi)) lsw__lock_locales(void) {}
+void __attribute__((ms_abi)) lsw__unlock_locales(void) {}
+
+/* _time64 — time() as __int64 */
+int64_t __attribute__((ms_abi)) lsw__time64(int64_t* t) {
+    int64_t v = (int64_t)time(NULL);
+    if (t) *t = v;
+    return v;
+}
+
+/* _gmtime64_s — gmtime with __int64 */
+int __attribute__((ms_abi)) lsw__gmtime64_s(struct tm* tmout, const int64_t* t) {
+    if (!tmout || !t) return 22; /* EINVAL */
+    time_t tt = (time_t)*t;
+    struct tm* r = gmtime(&tt);
+    if (!r) return 22;
+    *tmout = *r;
+    return 0;
+}
+
+/* _isnan / _isnanf / _finite / _isinf */
+int __attribute__((ms_abi)) lsw__isnan(double x)  { return isnan(x); }
+int __attribute__((ms_abi)) lsw__isnanf(float x)  { return isnan(x); }
+int __attribute__((ms_abi)) lsw__finite(double x) { return isfinite(x); }
+int __attribute__((ms_abi)) lsw__finitef(float x) { return isfinite(x); }
+
+/* _copysign / _copysignf */
+double __attribute__((ms_abi)) lsw__copysign(double x, double y) { return copysign(x, y); }
+float  __attribute__((ms_abi)) lsw__copysignf(float x, float y)  { return copysignf(x, y); }
+
+/* _dclass / _ldclass — fpclassify wrappers (return FP_* values) */
+int __attribute__((ms_abi)) lsw__dclass(double x)  { return fpclassify(x); }
+int __attribute__((ms_abi)) lsw__ldclass(long double x) { return fpclassify(x); }
+
+/* __setusermatherr — set user math error handler (no-op) */
+void __attribute__((ms_abi)) lsw___setusermatherr(void* fn) { (void)fn; }
+
+/* _controlfp_s — FP control word stub */
+int __attribute__((ms_abi)) lsw__controlfp_s(unsigned* cur, unsigned newval, unsigned mask) {
+    (void)newval; (void)mask;
+    LSW_LOG_INFO("_controlfp_s called: cur=%p newval=%u mask=%u", (void*)cur, newval, mask);
+    if (cur) *cur = 0;
+    return 0;
+}
+
+/* __pctype_func — pointer to ctype lookup table */
+static const unsigned short lsw_pctype_table[257] = {0};
+const unsigned short** __attribute__((ms_abi)) lsw___pctype_func(void) {
+    static const unsigned short* ptr = lsw_pctype_table;
+    return &ptr;
+}
+
+/* ___lc_codepage_func — current locale code page */
+unsigned int __attribute__((ms_abi)) lsw____lc_codepage_func(void) { return 1252; } /* CP_ACP */
+
+/* ___lc_locale_name_func — locale name array
+ * Returns a pointer to an array of LC_MAX+1 wide locale name strings.
+ * .NET and CRT code index into this: result[category] = locale name.
+ * Return "C" for all categories — enough to prevent null deref crashes. */
+const wchar_t** __attribute__((ms_abi)) lsw____lc_locale_name_func(void) {
+    static const u16 lc_c_name[] = {'C', 0};
+    static const wchar_t* lc_names[6] = {
+        (const wchar_t*)lc_c_name, (const wchar_t*)lc_c_name,
+        (const wchar_t*)lc_c_name, (const wchar_t*)lc_c_name,
+        (const wchar_t*)lc_c_name, (const wchar_t*)lc_c_name,
+    };
+    return lc_names;
+}
+
+/* ___mb_cur_max_func — max multibyte char length */
+int __attribute__((ms_abi)) lsw____mb_cur_max_func(void) { return 1; }
+
+/* strtoull */
+unsigned long long __attribute__((ms_abi)) lsw_strtoull(const char* s, char** end, int base) {
+    return strtoull(s, end, base);
+}
+
+/* wcstoul */
+unsigned long __attribute__((ms_abi)) lsw_wcstoul_crt(const wchar_t* s, wchar_t** end, int base) {
+    /* Windows wchar_t is 2 bytes (UTF-16); use u16_strtoul for correct behavior */
+    return u16_strtoul((const u16*)s, (u16**)end, base);
+}
+
+/* wcsftime */
+size_t __attribute__((ms_abi)) lsw_wcsftime(wchar_t* s, size_t max, const wchar_t* fmt, const struct tm* t) {
+    return wcsftime(s, max, fmt, t);
+}
+
+/* _wcserror_s — wchar_t strerror_s */
+int __attribute__((ms_abi)) lsw__wcserror_s(wchar_t* buf, size_t bufsz, int errnum) {
+    if (!buf || bufsz == 0) return 22;
+    const char* msg = strerror(errnum);
+    size_t i;
+    for (i = 0; i < bufsz - 1 && msg[i]; i++)
+        buf[i] = (wchar_t)(unsigned char)msg[i];
+    buf[i] = 0;
+    return 0;
+}
+
+/* _itow_s — int to wide string */
+int __attribute__((ms_abi)) lsw__itow_s(int val, wchar_t* buf, size_t bufsz, int radix) {
+    if (!buf || bufsz == 0) return 22;
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), radix == 16 ? "%x" : radix == 8 ? "%o" : "%d", val);
+    size_t i;
+    for (i = 0; i < bufsz - 1 && tmp[i]; i++) buf[i] = (wchar_t)(unsigned char)tmp[i];
+    buf[i] = 0;
+    return 0;
+}
+
+/* _ltow_s — long to wide string */
+int __attribute__((ms_abi)) lsw__ltow_s(long val, wchar_t* buf, size_t bufsz, int radix) {
+    return lsw__itow_s((int)val, buf, bufsz, radix);
+}
+
+/* Math forwarding stubs — just call the libc equivalents */
+float  __attribute__((ms_abi)) lsw_acosf(float x)   { return acosf(x); }
+double __attribute__((ms_abi)) lsw_acosh(double x)   { return acosh(x); }
+float  __attribute__((ms_abi)) lsw_acoshf(float x)   { return acoshf(x); }
+float  __attribute__((ms_abi)) lsw_asinf(float x)    { return asinf(x); }
+double __attribute__((ms_abi)) lsw_asinh(double x)   { return asinh(x); }
+float  __attribute__((ms_abi)) lsw_asinhf(float x)   { return asinhf(x); }
+float  __attribute__((ms_abi)) lsw_atan2f(float y, float x) { return atan2f(y, x); }
+float  __attribute__((ms_abi)) lsw_atanf(float x)    { return atanf(x); }
+double __attribute__((ms_abi)) lsw_atanh(double x)   { return atanh(x); }
+float  __attribute__((ms_abi)) lsw_atanhf(float x)   { return atanhf(x); }
+double __attribute__((ms_abi)) lsw_cbrt(double x)    { return cbrt(x); }
+float  __attribute__((ms_abi)) lsw_cbrtf(float x)    { return cbrtf(x); }
+double __attribute__((ms_abi)) lsw_cosh(double x)    { return cosh(x); }
+float  __attribute__((ms_abi)) lsw_coshf(float x)    { return coshf(x); }
+double __attribute__((ms_abi)) lsw_fma(double x, double y, double z) { return fma(x,y,z); }
+float  __attribute__((ms_abi)) lsw_fmaf(float x, float y, float z)   { return fmaf(x,y,z); }
+int    __attribute__((ms_abi)) lsw_ilogb(double x)   { return ilogb(x); }
+int    __attribute__((ms_abi)) lsw_ilogbf(float x)   { return ilogbf(x); }
+float  __attribute__((ms_abi)) lsw_log10f(float x)   { return log10f(x); }
+float  __attribute__((ms_abi)) lsw_log2f(float x)    { return log2f(x); }
+float  __attribute__((ms_abi)) lsw_modff(float x, float* i) { return modff(x, i); }
+double __attribute__((ms_abi)) lsw_sinh(double x)    { return sinh(x); }
+float  __attribute__((ms_abi)) lsw_sinhf(float x)    { return sinhf(x); }
+float  __attribute__((ms_abi)) lsw_tanf(float x)     { return tanf(x); }
+double __attribute__((ms_abi)) lsw_tanh(double x)    { return tanh(x); }
+float  __attribute__((ms_abi)) lsw_tanhf(float x)    { return tanhf(x); }
+double __attribute__((ms_abi)) lsw_trunc(double x)   { return trunc(x); }
+float  __attribute__((ms_abi)) lsw_truncf(float x)   { return truncf(x); }
+
+/* __stdio_common_vsnwprintf_s — wide vsnprintf_s */
+int __attribute__((ms_abi)) lsw___stdio_common_vsnwprintf_s(
+        uint64_t opts, wchar_t* buf, size_t bufsz, size_t count,
+        const wchar_t* fmt, void* locale, va_list args) {
+    (void)opts; (void)locale;
+    if (!fmt) return -1;
+    size_t lim = (count == (size_t)-1 || count >= bufsz) ? bufsz - 1 : count;
+    if (!buf || bufsz == 0) return -1;
+    int r = lsw__vsnwprintf(buf, lim + 1, fmt, (char*)args);
+    if (r < 0 && bufsz > 0) buf[0] = 0;
+    return r;
+}
+
+/* __stdio_common_vsprintf_s — narrow vsprintf_s */
+int __attribute__((ms_abi)) lsw___stdio_common_vsprintf_s(
+        uint64_t opts, char* buf, size_t bufsz, const char* fmt,
+        void* locale, va_list args) {
+    (void)opts; (void)locale;
+    if (!fmt) return -1;
+    if (!buf || bufsz == 0) return -1;
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, args);
+    int r = vsnprintf(buf, bufsz, fmt, sysv_ap);
+    return r;
+}
 
 // vcruntime: memory functions
 void* __attribute__((ms_abi)) lsw___std_type_info_destroy_list(void* p) { (void)p; return NULL; }
@@ -8861,6 +9950,92 @@ int __attribute__((ms_abi)) lsw_InitOnceExecuteOnce(
     return 0;
 }
 
+/* InitOnceBeginInitialize / InitOnceComplete — lightweight one-time init primitives.
+ * The INIT_ONCE structure is a single PVOID (8 bytes on 64-bit).
+ * States: 0=uninitialized, 1=in-progress, 2=complete.
+ * We implement a simple non-concurrent version sufficient for single-threaded CLR startup. */
+int __attribute__((ms_abi)) lsw_InitOnceBeginInitialize(
+    void* lpInitOnce, uint32_t dwFlags, int* fPending, void** lpContext) {
+    (void)dwFlags;
+    if (!lpInitOnce) {
+        if (fPending) *fPending = 0;
+        return 0; /* FALSE — error */
+    }
+    uintptr_t *state = (uintptr_t*)lpInitOnce;
+    if (*state == 2) {
+        /* Already complete */
+        if (fPending) *fPending = 0; /* FALSE = already done */
+        if (lpContext) *lpContext = NULL;
+        return 1; /* TRUE */
+    }
+    /* Mark in progress; caller must complete initialization */
+    *state = 1;
+    if (fPending) *fPending = 1; /* TRUE = caller must initialize */
+    if (lpContext) *lpContext = NULL;
+    return 1; /* TRUE */
+}
+
+int __attribute__((ms_abi)) lsw_InitOnceComplete(
+    void* lpInitOnce, uint32_t dwFlags, void* lpContext) {
+    (void)dwFlags; (void)lpContext;
+    if (!lpInitOnce) return 0;
+    uintptr_t *state = (uintptr_t*)lpInitOnce;
+    *state = 2; /* complete */
+    return 1; /* TRUE */
+}
+
+/* _o_abort — internal CRT function called to abort the process */
+void __attribute__((ms_abi)) lsw__o_abort(void) {
+    LSW_LOG_ERROR("_o_abort() called — CRT abort");
+    abort();
+}
+
+/* msvcp_win.dll C++ threading primitives (used by icu.dll and other MSVC STL DLLs).
+ * LSW is effectively single-threaded for PE execution, so these are no-op stubs
+ * that claim success. _thrd_success = 0 in the MSVC C11 threading enum. */
+int __attribute__((ms_abi)) lsw__Mtx_init_in_situ(void* mtx, int flags) {
+    (void)mtx; (void)flags;
+    return 0; /* thrd_success */
+}
+void __attribute__((ms_abi)) lsw__Mtx_destroy_in_situ(void* mtx, int flags) {
+    (void)mtx; (void)flags;
+}
+int __attribute__((ms_abi)) lsw__Mtx_lock(void* mtx) {
+    (void)mtx;
+    return 0; /* thrd_success */
+}
+int __attribute__((ms_abi)) lsw__Mtx_unlock(void* mtx) {
+    (void)mtx;
+    return 0; /* thrd_success */
+}
+int __attribute__((ms_abi)) lsw__Mtx_trylock(void* mtx) {
+    (void)mtx;
+    return 0; /* thrd_success */
+}
+int __attribute__((ms_abi)) lsw__Cnd_init_in_situ(void* cnd) {
+    (void)cnd;
+    return 0; /* thrd_success */
+}
+void __attribute__((ms_abi)) lsw__Cnd_destroy_in_situ(void* cnd) {
+    (void)cnd;
+}
+int __attribute__((ms_abi)) lsw__Cnd_signal(void* cnd) {
+    (void)cnd;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw__Cnd_broadcast(void* cnd) {
+    (void)cnd;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw__Cnd_wait(void* cnd, void* mtx) {
+    (void)cnd; (void)mtx;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw__Cnd_timedwait(void* cnd, void* mtx, void* ts) {
+    (void)cnd; (void)mtx; (void)ts;
+    return 0;
+}
+
 // SetHandleInformation / GetHandleInformation (stubs)
 int __attribute__((ms_abi)) lsw_SetHandleInformation(void* h, uint32_t mask, uint32_t flags) {
     (void)h; (void)mask; (void)flags; return 1;
@@ -9183,27 +10358,21 @@ void* __attribute__((ms_abi)) lsw_OpenFileMappingA(uint32_t dwDesiredAccess, int
     return NULL;
 }
 void* __attribute__((ms_abi)) lsw_CreateFileMappingA(void* hFile, void* lpFileMappingAttributes, uint32_t flProtect, uint32_t dwMaximumSizeHigh, uint32_t dwMaximumSizeLow, const char* lpName) {
-    (void)lpName; (void)hFile; (void)lpFileMappingAttributes; (void)flProtect;
-    // Convert and delegate to W version
-    size_t size = ((size_t)dwMaximumSizeHigh << 32) | dwMaximumSizeLow;
-    if (size == 0) size = 4096;
-    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
-    lsw_file_mapping_t* fm = (lsw_file_mapping_t*)malloc(sizeof(*fm));
-    if (!fm) return NULL;
-    fm->base = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (fm->base == MAP_FAILED) { free(fm); return NULL; }
-    fm->size = size;
-    return fm;
+    /* Delegate to the W version — all logic lives there */
+    (void)lpName;
+    return lsw_CreateFileMappingW(hFile, lpFileMappingAttributes, flProtect,
+                                   dwMaximumSizeHigh, dwMaximumSizeLow, NULL);
 }
 void* __attribute__((ms_abi)) lsw_MapViewOfFileEx(void* hFileMappingObject, uint32_t dwDesiredAccess, uint32_t dwFileOffsetHigh, uint32_t dwFileOffsetLow, size_t dwNumberOfBytesToMap, void* lpBaseAddress) {
-    (void)dwDesiredAccess; (void)lpBaseAddress;
-    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
+    (void)dwDesiredAccess;
     lsw_file_mapping_t* fm = (lsw_file_mapping_t*)hFileMappingObject;
     if (!fm) return NULL;
-    size_t offset = ((size_t)dwFileOffsetHigh << 32) | dwFileOffsetLow;
+    size_t offset = ((size_t)dwFileOffsetHigh << 32) | (size_t)dwFileOffsetLow;
     size_t bytes = dwNumberOfBytesToMap ? dwNumberOfBytesToMap : fm->size;
-    (void)offset;
-    return fm->base;
+    void* view = (uint8_t*)fm->base + offset;
+    LSW_LOG_INFO("MapViewOfFileEx: map=%p offset=%zu bytes=%zu lpBase=%p -> %p",
+                 fm->base, offset, bytes, lpBaseAddress, view);
+    return view;
 }
 int __attribute__((ms_abi)) lsw_FlushViewOfFile(const void* lpBaseAddress, size_t dwNumberOfBytesToFlush) {
     (void)lpBaseAddress; (void)dwNumberOfBytesToFlush; return 1;
@@ -9212,16 +10381,17 @@ int __attribute__((ms_abi)) lsw_FlushFileBuffers(void* hFile) { (void)hFile; ret
 
 // ---- GetFileSizeEx / SetEndOfFile / LockFile ----
 int __attribute__((ms_abi)) lsw_GetFileSizeEx(void* hFile, void* lpFileSize) {
-    if (!hFile || !lpFileSize) return 0;
-    int fd = (int)(uintptr_t)hFile - 1;
+    if (!hFile || hFile == (void*)(intptr_t)-1 || !lpFileSize) return 0;
+    int fd = (int)(uintptr_t)hFile;
     struct stat st;
     if (fstat(fd, &st) != 0) { *(int64_t*)lpFileSize = 0; return 0; }
     *(int64_t*)lpFileSize = (int64_t)st.st_size;
+    LSW_LOG_INFO("GetFileSizeEx: hFile=%p fd=%d size=%lld", hFile, fd, (long long)st.st_size);
     return 1;
 }
 int __attribute__((ms_abi)) lsw_SetEndOfFile(void* hFile) {
     if (!hFile) return 0;
-    int fd = (int)(uintptr_t)hFile - 1;
+    int fd = (int)(uintptr_t)hFile;
     off_t pos = lseek(fd, 0, SEEK_CUR);
     return ftruncate(fd, pos) == 0 ? 1 : 0;
 }
@@ -9346,8 +10516,14 @@ int __attribute__((ms_abi)) lsw_GetFileAttributesExW(const uint16_t* lpFileName,
     if (!lpFileName || !lpFileInformation) return 0;
     char path[4096]; int i=0;
     while (lpFileName[i] && i<4095) { path[i]=(char)lpFileName[i]; i++; } path[i]=0;
+    char lpath[4096];
+    /* .NET hosting: redirect C:\Program Files\dotnet paths to the Linux bridge */
+    extern int lsw_dotnet_translate_win_path(const char*, char*, size_t);
+    if (!lsw_dotnet_translate_win_path(path, lpath, sizeof(lpath)))
+        lsw_windows_to_linux_path(path, lpath, sizeof(lpath));
+    LSW_LOG_INFO("GetFileAttributesExW: '%s' -> '%s'", path, lpath);
     struct stat st;
-    if (stat(path, &st) != 0) return 0;
+    if (stat(lpath, &st) != 0) return 0;
     uint32_t* p = (uint32_t*)lpFileInformation;
     p[0] = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
     uint64_t epoch_offset = 116444736000000000ULL;
@@ -9360,8 +10536,10 @@ int __attribute__((ms_abi)) lsw_GetFileAttributesExW(const uint16_t* lpFileName,
 int __attribute__((ms_abi)) lsw_GetFileAttributesExA(const char* lpFileName, int fInfoLevelId, void* lpFileInformation) {
     (void)fInfoLevelId;
     if (!lpFileName || !lpFileInformation) return 0;
+    char lpath[4096];
+    lsw_windows_to_linux_path(lpFileName, lpath, sizeof(lpath));
     struct stat st;
-    if (stat(lpFileName, &st) != 0) return 0;
+    if (stat(lpath, &st) != 0) return 0;
     uint32_t* p = (uint32_t*)lpFileInformation;
     p[0] = S_ISDIR(st.st_mode) ? 0x10 : 0x80;
     uint64_t epoch_offset = 116444736000000000ULL;
@@ -9451,7 +10629,24 @@ int __attribute__((ms_abi)) lsw_SetCriticalSectionSpinCount(void* lpCriticalSect
 
 // ---- Thread extras ----
 int __attribute__((ms_abi)) lsw_SuspendThread(void* hThread) { (void)hThread; return 0xFFFFFFFF; }
-int __attribute__((ms_abi)) lsw_ResumeThread(void* hThread) { (void)hThread; return 1; }
+int __attribute__((ms_abi)) lsw_ResumeThread(void* hThread) {
+    if (IS_TYPED_HANDLE(hThread)) {
+        uint32_t magic = *(const uint32_t*)hThread;
+        if (magic == LSW_THREAD_MAGIC) {
+            lsw_thread_handle_t* th = hThread;
+            pthread_mutex_lock(&th->suspend_lock);
+            int was_suspended = th->suspended;
+            if (th->suspended) {
+                th->suspended = 0;
+                pthread_cond_broadcast(&th->suspend_cond);
+            }
+            pthread_mutex_unlock(&th->suspend_lock);
+            LSW_LOG_INFO("ResumeThread: handle=%p was_suspended=%d", hThread, was_suspended);
+            return was_suspended ? 1 : 0; /* returns previous suspend count */
+        }
+    }
+    return 1;
+}
 int __attribute__((ms_abi)) lsw_TerminateThread(void* hThread, uint32_t dwExitCode) { (void)hThread; (void)dwExitCode; return 1; }
 int __attribute__((ms_abi)) lsw_TerminateProcess(void* hProcess, uint32_t uExitCode) {
     pid_t pid = (pid_t)(uintptr_t)hProcess;
@@ -9463,7 +10658,18 @@ int __attribute__((ms_abi)) lsw_TerminateProcess(void* hProcess, uint32_t uExitC
     exit((int)uExitCode);
     return 1;
 }
-int __attribute__((ms_abi)) lsw_GetExitCodeThread(void* hThread, uint32_t* lpExitCode) { (void)hThread; if (lpExitCode) *lpExitCode = 0; return 1; }
+int __attribute__((ms_abi)) lsw_GetExitCodeThread(void* hThread, uint32_t* lpExitCode) {
+    if (IS_TYPED_HANDLE(hThread)) {
+        uint32_t magic = *(const uint32_t*)hThread;
+        if (magic == LSW_THREAD_MAGIC) {
+            lsw_thread_handle_t* th = hThread;
+            if (lpExitCode) *lpExitCode = th->finished ? th->exit_code : 259; /* STILL_ACTIVE=259 */
+            return 1;
+        }
+    }
+    if (lpExitCode) *lpExitCode = 0;
+    return 1;
+}
 int __attribute__((ms_abi)) lsw_GetExitCodeProcess(void* hProcess, uint32_t* lpExitCode) {
     pid_t pid = (pid_t)(uintptr_t)hProcess;
     if (lpExitCode) *lpExitCode = 259; /* STILL_ACTIVE */
@@ -10083,10 +11289,52 @@ int __attribute__((ms_abi)) lsw_CancelSynchronousIo(void* hThread) { (void)hThre
 
 // ---- Memory extras ----
 void* __attribute__((ms_abi)) lsw_MapViewOfFile3(void* FileMappingObject, void* Process, void* BaseAddress, uint64_t Offset, size_t ViewSize, uint32_t AllocationType, uint32_t PageProtection, void* ExtendedParameters, uint32_t ParameterCount) {
-    (void)Process; (void)BaseAddress; (void)Offset; (void)ViewSize; (void)AllocationType; (void)PageProtection; (void)ExtendedParameters; (void)ParameterCount;
-    typedef struct { void* base; size_t size; } lsw_file_mapping_t;
+    (void)Process; (void)ExtendedParameters; (void)ParameterCount;
+    LSW_LOG_INFO("MapViewOfFile3: called with obj=%p base=%p offset=%llu size=%zu alloc=0x%x prot=0x%x",
+                 FileMappingObject, BaseAddress, (unsigned long long)Offset, ViewSize, AllocationType, PageProtection);
     lsw_file_mapping_t* fm = (lsw_file_mapping_t*)FileMappingObject;
-    return fm ? fm->base : NULL;
+    if (!fm) {
+        LSW_LOG_WARN("MapViewOfFile3: NULL FileMappingObject, returning NULL");
+        return NULL;
+    }
+    size_t bytes = ViewSize ? ViewSize : fm->size;
+    void* view = (uint8_t*)fm->base + Offset;
+    if (BaseAddress && BaseAddress != view) {
+        /* Caller wants the view at a specific virtual address (e.g. MEM_REPLACE_PLACEHOLDER).
+         * Prefer file-backed MAP_FIXED when we have an fd — avoids a copy and
+         * correctly handles any page protection. */
+        int prot = PROT_READ;
+        if ((PageProtection & 0xFF) == 0x04 || (PageProtection & 0xFF) == 0x08) prot = PROT_READ | PROT_WRITE;
+        if ((PageProtection & 0xFF) == 0x20 || (PageProtection & 0xFF) == 0x10) prot = PROT_READ | PROT_EXEC;
+
+        if (fm->fd >= 0) {
+            /* File-backed: map directly from fd at the requested address. */
+            void* mapped = mmap(BaseAddress, bytes, prot, MAP_PRIVATE | MAP_FIXED, fm->fd, (off_t)Offset);
+            if (mapped != MAP_FAILED) {
+                LSW_LOG_INFO("MapViewOfFile3: fd=%d offset=%llu bytes=%zu -> %p (file-backed fixed)",
+                             fm->fd, (unsigned long long)Offset, bytes, mapped);
+                return mapped;
+            }
+            LSW_LOG_WARN("MapViewOfFile3: file-backed MAP_FIXED at %p failed (%s), trying anon copy",
+                         BaseAddress, strerror(errno));
+        }
+
+        /* Anonymous mapping or file-backed fallback: mmap R/W, copy, then mprotect to final prot. */
+        void* mapped = mmap(BaseAddress, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (mapped != MAP_FAILED) {
+            memcpy(mapped, view, bytes);
+            if (prot != (PROT_READ | PROT_WRITE))
+                mprotect(mapped, bytes, prot);
+            LSW_LOG_INFO("MapViewOfFile3: fd=%d offset=%llu bytes=%zu -> %p (anon copy)",
+                         fm->fd, (unsigned long long)Offset, bytes, mapped);
+            return mapped;
+        }
+        LSW_LOG_WARN("MapViewOfFile3: MAP_FIXED at %p failed (%s), returning offset view",
+                     BaseAddress, strerror(errno));
+    }
+    LSW_LOG_INFO("MapViewOfFile3: fd=%d offset=%llu bytes=%zu base=%p -> %p (offset view)",
+                 fm->fd, (unsigned long long)Offset, bytes, BaseAddress, view);
+    return view;
 }
 void* __attribute__((ms_abi)) lsw_VirtualAllocEx(void* hProcess, void* lpAddress, size_t dwSize, uint32_t flAllocationType, uint32_t flProtect) {
     (void)hProcess;
@@ -10125,11 +11373,399 @@ int __attribute__((ms_abi)) lsw_QueryFullProcessImageNameW(void* hProcess, uint3
     if (lpExeName && lpdwSize && *lpdwSize > 4) { lpExeName[0]='l'; lpExeName[1]='s'; lpExeName[2]='w'; lpExeName[3]=0; *lpdwSize=3; }
     return 1;
 }
-void __attribute__((ms_abi)) lsw_RaiseException(uint32_t dwExceptionCode, uint32_t dwExceptionFlags, uint32_t nNumberOfArguments, const uint64_t* lpArguments) {
-    (void)dwExceptionFlags; (void)nNumberOfArguments; (void)lpArguments;
-    LSW_LOG_ERROR("RaiseException: code=0x%08x", dwExceptionCode);
-    // Don't actually raise — log and return
+/* ==========================================================================
+ * Windows x64 SEH data structures for full SEH dispatch
+ * ========================================================================== */
+
+/* EXCEPTION_RECORD (x64): 0x98 bytes */
+typedef struct {
+    uint32_t  ExceptionCode;
+    uint32_t  ExceptionFlags;
+    uint64_t  ExceptionRecord;       /* nested exception pointer */
+    uint64_t  ExceptionAddress;
+    uint32_t  NumberParameters;
+    uint32_t  __pad;
+    uint64_t  ExceptionInformation[15];
+} lsw_EXCEPTION_RECORD;
+
+/* DISPATCHER_CONTEXT (x64): 0x50 bytes */
+typedef struct {
+    uint64_t ControlPc;
+    uint64_t ImageBase;
+    void*    FunctionEntry;
+    uint64_t EstablisherFrame;
+    uint64_t TargetIp;
+    void*    ContextRecord;
+    void*    LanguageHandler;
+    void*    HandlerData;
+    void*    HistoryTable;
+    uint32_t ScopeIndex;
+    uint32_t Fill0;
+} lsw_DISPATCHER_CONTEXT;
+
+#define LSW_CTX_SIZE       0x4D0  /* Windows x64 CONTEXT total size */
+#define LSW_CTX_OFFS_FLAGS 0x30   /* +ContextFlags */
+#define LSW_CTX_OFFS_RSP   0x98   /* +Rsp */
+#define LSW_CTX_OFFS_RIP   0xF8   /* +Rip */
+
+/* Retrieve the SEH language handler VA (absolute) for a RUNTIME_FUNCTION, or
+ * 0 if the UNWIND_INFO has no EHANDLER/UHANDLER.  Sets *handler_data_out to
+ * the pointer AFTER after[0] (= the HandlerData pointer). */
+static uint64_t lsw_get_frame_seh_handler(lsw_RUNTIME_FUNCTION* rf,
+                                           void** handler_data_out)
+{
+    uint8_t* ui = (uint8_t*)lsw_rva2va(rf->UnwindData);
+    if (!ui) return 0;
+    for (int d = 0; d < 8; d++) {
+        uint8_t  flags     = (ui[0] >> 3) & 0x1Fu;
+        uint8_t  code_cnt  = ui[2];
+        int      codes_sz  = (int)(((code_cnt + 1) & ~1) * 2);
+        if (flags & UNW_FLAG_CHAININFO) {
+            lsw_RUNTIME_FUNCTION* chain = (lsw_RUNTIME_FUNCTION*)(ui + 4 + codes_sz);
+            ui = (uint8_t*)lsw_rva2va(chain->UnwindData);
+            if (!ui) return 0;
+            continue;
+        }
+        if (!(flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER))) return 0;
+        uint32_t* after    = (uint32_t*)(ui + 4 + codes_sz);
+        uint32_t  hrva     = after[0];
+        if (!hrva) return 0;
+        if (handler_data_out) *handler_data_out = &after[1];
+        return g_lsw_image_base + (uint64_t)hrva;
+    }
+    return 0;
 }
+
+void __attribute__((ms_abi)) lsw_RaiseException(uint32_t dwExceptionCode, uint32_t dwExceptionFlags, uint32_t nNumberOfArguments, const uint64_t* lpArguments) {
+    (void)dwExceptionFlags;
+    LSW_LOG_ERROR("RaiseException: code=0x%08x flags=0x%x nArgs=%u caller=0x%llx",
+                  dwExceptionCode, dwExceptionFlags, nNumberOfArguments,
+                  (unsigned long long)(uintptr_t)__builtin_return_address(0));
+
+    if (nNumberOfArguments > 0 && lpArguments) {
+        for (uint32_t i = 0; i < nNumberOfArguments && i < 16; i++)
+            LSW_LOG_ERROR("  arg[%u] = 0x%llx", i, (unsigned long long)lpArguments[i]);
+    }
+
+    if (dwExceptionCode == 0xe06d7363 && nNumberOfArguments >= 3 && lpArguments) {
+        /* MSVC C++ exception: args may be {magic, obj_ptr, throw_info_ptr [,imagebase]}.
+         * Dump the exception object if the pointer looks valid (raise threshold to
+         * 0x10000 to avoid crashing on near-null values like 0x2001). */
+        uint64_t obj_ptr = lpArguments[1];
+        if (obj_ptr >= 0x10000 && obj_ptr < 0x800000000000ULL) {
+            uint64_t* objq = (uint64_t*)(uintptr_t)obj_ptr;
+            for (int qi = 0; qi < 4; qi++)
+                LSW_LOG_ERROR("  obj[%d] = 0x%016llx", qi, (unsigned long long)objq[qi]);
+            for (int qi = 1; qi < 4; qi++) {
+                uint64_t p = objq[qi];
+                if (p < 0x10000 || p > 0x800000000000ULL) continue; /* ← was 0x1000 */
+                const char* s = (const char*)(uintptr_t)p;
+                int printable = 0;
+                for (int ci = 0; ci < 512 && s[ci]; ci++) {
+                    if ((unsigned char)s[ci] >= 0x20 && (unsigned char)s[ci] < 0x7f) printable++;
+                    else break;
+                }
+                if (printable > 3)
+                    LSW_LOG_ERROR("  C++ exception message (obj[%d]): %.512s", qi, s);
+            }
+        }
+    }
+
+    /* Print call stack — PE addresses show where the exception was thrown */
+    void* bt[64];
+    int bt_size = backtrace(bt, 64);
+    LSW_LOG_ERROR("  Call stack (%d frames):", bt_size);
+    for (int i = 0; i < bt_size; i++) {
+        uint64_t addr = (uint64_t)(uintptr_t)bt[i];
+        if (addr >= g_lsw_image_base && addr < g_lsw_image_base + g_lsw_image_size)
+            LSW_LOG_ERROR("    [%d] 0x%llx  (PE RVA=0x%llx)", i, (unsigned long long)addr,
+                          (unsigned long long)(addr - g_lsw_image_base));
+        else
+            LSW_LOG_ERROR("    [%d] 0x%llx", i, (unsigned long long)addr);
+    }
+
+    /* For C++ exceptions (0xe06d7363): attempt dispatch via our .pdata exception walker.
+     * This handles PE code that has inlined _CxxThrowException and calls RaiseException
+     * directly.  We reconstruct the PE caller's frame from the RBP chain, using the
+     * same approach as lsw__CxxThrowException. */
+    if (dwExceptionCode == 0xe06d7363 && g_lsw_pdata_va && g_lsw_image_base && lpArguments) {
+        void* exc_obj    = (nNumberOfArguments >= 2) ? (void*)(uintptr_t)lpArguments[1] : NULL;
+        void* throw_info = (nNumberOfArguments >= 3) ? (void*)(uintptr_t)lpArguments[2] : NULL;
+
+        /* If throw_info looks like a small RVA (< 16 MB, not a VA), convert it */
+        if ((uint64_t)(uintptr_t)throw_info < 0x1000000ULL && throw_info) {
+            throw_info = (void*)(uintptr_t)(g_lsw_image_base + (uint64_t)(uintptr_t)throw_info);
+            LSW_LOG_INFO("[exception] RaiseException: throw_info was RVA, VA=0x%llx",
+                         (unsigned long long)(uintptr_t)throw_info);
+        }
+
+        /* Capture the PE caller's frame from the GCC RBP chain.
+         * Stack at entry to this ms_abi function (GCC prolog):
+         *   PE code did: sub rsp,0x20 ; call RaiseException
+         *   GCC prolog:  push rbp ; mov rbp,rsp ; [saves] ; sub rsp,N
+         * So: [my_rbp+8] = return address into PE  (the throw site)
+         *     my_rbp+0x10 = entry RSP of this function = body RSP of caller */
+        uint64_t my_rbp;
+        __asm__ volatile ("mov %%rbp, %0" : "=r"(my_rbp));
+        uint64_t ret_to_pe = *(uint64_t*)(my_rbp + 8);
+        uint64_t body_rsp  = my_rbp + 0x10;
+        uint64_t rip       = ret_to_pe - 1;  /* point inside the CALL instruction */
+
+        LSW_LOG_INFO("[exception] RaiseException C++ dispatch: obj=%p ti=%p ret=0x%llx",
+                     exc_obj, throw_info, (unsigned long long)ret_to_pe);
+
+        /* Re-throw detection: magic=0x19930520 with null obj/ti means `throw;` inside a
+         * catch block.  Detect BEFORE overwriting TLS. */
+        bool is_rethrow = (nNumberOfArguments >= 1 && lpArguments[0] == 0x19930520 &&
+                           (nNumberOfArguments < 2 || lpArguments[1] == 0));
+
+        if (is_rethrow) {
+            /* Restore exception from TLS — don't clobber it */
+            exc_obj    = tls_cxx_exception_obj;
+            throw_info = tls_cxx_exception_type;
+            LSW_LOG_INFO("[exception] RaiseException: re-throw detected, using TLS exception "
+                         "obj=%p ti=%p entry_rsp=0x%llx",
+                         exc_obj, throw_info,
+                         (unsigned long long)tls_cxx_exception_entry_rsp);
+            if (tls_cxx_exception_entry_rsp >= 0x10000 &&
+                tls_cxx_exception_entry_rsp < 0x800000000000ULL) {
+                /* Start walk from the outer caller of the try-containing function,
+                 * bypassing the catch funclet frame entirely. */
+                uint64_t outer_entry_rsp = tls_cxx_exception_entry_rsp;
+                uint64_t outer_rip = *(uint64_t*)outer_entry_rsp;
+                if (outer_rip >= g_lsw_image_base &&
+                    outer_rip < g_lsw_image_base + 0x10000000ULL) {
+                    rip      = outer_rip - 1;
+                    body_rsp = outer_entry_rsp + 8;
+                    LSW_LOG_INFO("[exception] RaiseException re-throw: outer walk from "
+                                 "rip=0x%llx rsp=0x%llx",
+                                 (unsigned long long)(rip + 1),
+                                 (unsigned long long)body_rsp);
+                }
+            }
+        } else {
+            /* New exception — store to TLS */
+            tls_cxx_exception_obj  = exc_obj;
+            tls_cxx_exception_type = throw_info;
+            /* Save original exception args for later re-throw exc_rec reconstruction */
+            tls_cxx_exc_code  = dwExceptionCode;
+            tls_cxx_exc_flags = dwExceptionFlags;
+            tls_cxx_exc_nargs = nNumberOfArguments > 16 ? 16 : nNumberOfArguments;
+            if (lpArguments)
+                for (uint32_t i = 0; i < tls_cxx_exc_nargs; i++)
+                    tls_cxx_exc_args[i] = lpArguments[i];
+        }
+
+        /* Walk the PE call stack looking for a matching catch handler */
+        for (int depth = 0; depth < 128; depth++) {
+            if (rip < g_lsw_image_base || rip >= g_lsw_image_base + 0x10000000ULL) {
+                LSW_LOG_WARN("[exception] RaiseException: RIP 0x%llx outside PE, stop walk",
+                             (unsigned long long)rip);
+                break;
+            }
+
+            lsw_RUNTIME_FUNCTION* rf = lsw_find_rf(rip);
+            if (!rf) {
+                LSW_LOG_WARN("[exception] RaiseException: no RUNTIME_FUNCTION for RIP 0x%llx depth=%d",
+                             (unsigned long long)rip, depth);
+                break;
+            }
+
+            LSW_LOG_INFO("[exception] RaiseException depth=%d rip=0x%llx func=[0x%x,0x%x)",
+                         depth, (unsigned long long)rip, rf->BeginAddress, rf->EndAddress);
+
+            uint64_t caller_rip, caller_rsp;
+            uint64_t entry_rsp = lsw_unwind_frame(rf, body_rsp, &caller_rip, &caller_rsp);
+            if (!entry_rsp) {
+                LSW_LOG_WARN("[exception] RaiseException: unwind_frame failed depth=%d", depth);
+                break;
+            }
+
+            uint64_t catch_handler_va = 0;
+            int32_t  disp_catch_obj   = 0;
+            uint32_t catch_adjectives = 0;
+            bool     is_eh4           = false;
+            uint64_t eh4_cont_vas[2]  = {0, 0};
+            uint32_t eh4_cont_cnt     = 0;
+
+            if (lsw_find_catch_in_frame(rf, rip, entry_rsp,
+                                        (lsw_ThrowInfo*)throw_info,
+                                        &catch_handler_va, &disp_catch_obj,
+                                        &catch_adjectives,
+                                        &is_eh4, eh4_cont_vas, &eh4_cont_cnt)) {
+                LSW_LOG_INFO("[exception] RaiseException: catch at 0x%llx body_rsp=0x%llx "
+                             "entry_rsp=0x%llx disp=%d adj=0x%x is_eh4=%d",
+                             (unsigned long long)catch_handler_va,
+                             (unsigned long long)body_rsp,
+                             (unsigned long long)entry_rsp,
+                             disp_catch_obj, catch_adjectives, (int)is_eh4);
+
+                /* Save entry_rsp so a re-throw from inside the catch handler can start
+                 * the outer walk above this frame. */
+                tls_cxx_exception_entry_rsp = entry_rsp;
+
+                uint64_t frame_base = is_eh4 ? body_rsp : entry_rsp;
+                if (disp_catch_obj != 0) {
+                    void** slot = (void**)(frame_base + (int64_t)disp_catch_obj);
+                    if (catch_adjectives & 0x8)
+                        *slot = exc_obj;        /* reference catch */
+                    else
+                        *slot = exc_obj;        /* value catch — copy omitted for now */
+                }
+
+                typedef void* (__attribute__((ms_abi)) *funclet_t)(uint64_t, uint64_t);
+                funclet_t funclet = (funclet_t)catch_handler_va;
+                void* continuation = funclet(0, frame_base);
+
+                LSW_LOG_INFO("[exception] RaiseException: funclet returned cont=%p", continuation);
+
+                uint64_t cont_va = 0;
+                if (is_eh4 && eh4_cont_cnt > 0) {
+                    uint64_t cont_idx = (uint64_t)(uintptr_t)continuation;
+                    if (cont_idx >= eh4_cont_cnt) cont_idx = 0;
+                    cont_va = eh4_cont_vas[cont_idx];
+                } else if (continuation) {
+                    /* EH3 or EH4-with-cont_cnt=0: funclet returns VA directly */
+                    cont_va = (uint64_t)(uintptr_t)continuation;
+                }
+
+                if (cont_va) {
+                    LSW_LOG_INFO("[exception] RaiseException: jmp to cont 0x%llx rsp=0x%llx",
+                                 (unsigned long long)cont_va, (unsigned long long)body_rsp);
+                    __asm__ volatile (
+                        "mov %0, %%rsp\n\t"
+                        "jmp *%1\n\t"
+                        : : "r"(body_rsp), "r"(cont_va) : "memory"
+                    );
+                    __builtin_unreachable();
+                }
+
+                LSW_LOG_INFO("[exception] RaiseException: catch handled (no continuation)");
+                return;
+            }
+
+            /* No EH3/EH4 catch in this frame.
+             * Try full SEH dispatch: call the frame's language handler (e.g.
+             * NativeAOT's __FrameHandler3) with proper EXCEPTION_RECORD,
+             * CONTEXT, and DISPATCHER_CONTEXT.  If it decides to handle the
+             * exception it will call RtlUnwindEx, which we intercept via
+             * sigsetjmp to do the final RSP-restore + JMP. */
+            void* handler_data = NULL;
+            uint64_t seh_va = lsw_get_frame_seh_handler(rf, &handler_data);
+
+            if (seh_va) {
+                /* Build EXCEPTION_RECORD — for re-throws, use the ORIGINAL exception args
+                 * (not the null re-throw args) so language handlers see the correct magic. */
+                const uint64_t* seh_args  = lpArguments;
+                uint32_t        seh_code  = dwExceptionCode;
+                uint32_t        seh_flags = dwExceptionFlags;
+                uint32_t        seh_nargs = nNumberOfArguments;
+                if (is_rethrow && tls_cxx_exc_nargs > 0) {
+                    seh_code  = tls_cxx_exc_code;
+                    seh_flags = tls_cxx_exc_flags;
+                    seh_nargs = tls_cxx_exc_nargs;
+                    seh_args  = tls_cxx_exc_args;
+                }
+
+                lsw_EXCEPTION_RECORD exc_rec;
+                memset(&exc_rec, 0, sizeof(exc_rec));
+                exc_rec.ExceptionCode    = seh_code;
+                exc_rec.ExceptionFlags   = seh_flags;
+                exc_rec.ExceptionAddress = rip + 1;
+                exc_rec.NumberParameters = seh_nargs > 15 ? 15 : seh_nargs;
+                if (seh_args)
+                    for (uint32_t i = 0; i < exc_rec.NumberParameters; i++)
+                        exc_rec.ExceptionInformation[i] = seh_args[i];
+
+                /* Build minimal CONTEXT (0x4D0 bytes on Windows, all zeros OK) */
+                uint8_t ctx_buf[LSW_CTX_SIZE];
+                memset(ctx_buf, 0, sizeof(ctx_buf));
+                *(uint32_t*)(ctx_buf + LSW_CTX_OFFS_FLAGS) = 0x10001Fu; /* CONTEXT_ALL */
+                *(uint64_t*)(ctx_buf + LSW_CTX_OFFS_RSP)   = entry_rsp;
+                *(uint64_t*)(ctx_buf + LSW_CTX_OFFS_RIP)   = rip + 1;
+
+                /* Build DISPATCHER_CONTEXT */
+                lsw_DISPATCHER_CONTEXT dc;
+                memset(&dc, 0, sizeof(dc));
+                dc.ControlPc        = rip + 1;
+                dc.ImageBase        = g_lsw_image_base;
+                dc.FunctionEntry    = rf;
+                dc.EstablisherFrame = body_rsp; /* NativeAOT reads [EstablisherFrame+offset] = cookie; cookie stored at body_rsp+offset */
+                dc.TargetIp         = 0;   /* search phase */
+                dc.ContextRecord    = ctx_buf;
+                dc.LanguageHandler  = (void*)seh_va;
+                dc.HandlerData      = handler_data;
+
+                /* sigsetjmp: RtlUnwindEx will siglongjmp back here if the
+                 * handler decides to catch the exception. */
+                sigjmp_buf unwind_jmp;
+                sigjmp_buf* prev_jmp = tls_seh_unwind_jmp;
+                tls_seh_unwind_jmp = &unwind_jmp;
+
+                int jmp_val = sigsetjmp(unwind_jmp, 0);
+                if (jmp_val != 0) {
+                    /* RtlUnwindEx was called — transfer control to target */
+                    tls_seh_unwind_jmp = prev_jmp;
+                    uint64_t t_frame = tls_seh_target_frame;
+                    uint64_t t_ip    = tls_seh_target_ip;
+                    LSW_LOG_INFO("[exception] SEH unwind: frame=0x%llx ip=0x%llx",
+                                 (unsigned long long)t_frame, (unsigned long long)t_ip);
+                    __asm__ volatile (
+                        "mov %0, %%rsp\n\t"
+                        "xor %%rax, %%rax\n\t"
+                        "jmp *%1\n\t"
+                        : : "r"(t_frame), "r"(t_ip) : "memory"
+                    );
+                    __builtin_unreachable();
+                }
+
+                typedef int (__attribute__((ms_abi)) *seh_hfn)(void*, uint64_t, void*, void*);
+                seh_hfn hfn = (seh_hfn)seh_va;
+                LSW_LOG_INFO("[exception] SEH search: handler=0x%llx frame=0x%x "
+                             "ControlPc=0x%llx ImageBase=0x%llx ControlPc_rel=0x%llx "
+                             "EstabFrame=0x%llx nargs=%u exc0=0x%llx",
+                             (unsigned long long)seh_va, rf->BeginAddress,
+                             (unsigned long long)dc.ControlPc,
+                             (unsigned long long)dc.ImageBase,
+                             (unsigned long long)(dc.ControlPc - dc.ImageBase),
+                             (unsigned long long)body_rsp,
+                             exc_rec.NumberParameters,
+                             exc_rec.NumberParameters > 0 ? (unsigned long long)exc_rec.ExceptionInformation[0] : 0ULL);
+                /* Dump scope table for handler 0x5c4820 to debug why it returns 1 */
+                if ((seh_va - g_lsw_image_base) == 0x5c4820 && handler_data) {
+                    const uint32_t* hd = (const uint32_t*)handler_data;
+                    uint32_t cnt = hd[0];
+                    LSW_LOG_INFO("[exception] scope_table: HandlerData=%p count=%u", handler_data, cnt);
+                    for (uint32_t si = 0; si < cnt && si < 4; si++) {
+                        uint32_t base = 1 + si * 4;
+                        LSW_LOG_INFO("[exception] scope[%u]: begin=0x%x end=0x%x filter=0x%x handler=0x%x",
+                                     si, hd[base], hd[base+1], hd[base+2], hd[base+3]);
+                    }
+                    LSW_LOG_INFO("[exception] IAT[RtlUnwindEx]=0x%llx",
+                                 (unsigned long long)*(uint64_t*)(g_lsw_image_base + 0x611678));
+                }
+                int result = hfn(&exc_rec, body_rsp, ctx_buf, &dc);
+                tls_seh_unwind_jmp = prev_jmp;
+                LSW_LOG_INFO("[exception] SEH result=%d (frame=0x%x)",
+                             result, rf->BeginAddress);
+                /* ExceptionContinueSearch (1) → continue walk; other → ignored */
+            }
+
+            /* Unwind to parent */
+            rip      = caller_rip - 1;
+            body_rsp = caller_rsp;
+        }
+
+        LSW_LOG_ERROR("[exception] RaiseException: no catch handler found — aborting");
+        abort();
+    }
+
+    /* Non-C++ exception or unrecognised format — abort cleanly */
+    LSW_LOG_ERROR("[exception] RaiseException: unhandled exception code=0x%08x — aborting",
+                  dwExceptionCode);
+    abort();
+}
+
 int __attribute__((ms_abi)) lsw_SetConsoleCtrlHandler(void* HandlerRoutine, int Add) { (void)HandlerRoutine; (void)Add; return 1; }
 int __attribute__((ms_abi)) lsw_GenerateConsoleCtrlEvent(uint32_t dwCtrlEvent, uint32_t dwProcessGroupId) { (void)dwCtrlEvent; (void)dwProcessGroupId; return 1; }
 int __attribute__((ms_abi)) lsw_GetConsoleTitle(uint16_t* lpConsoleTitle, uint32_t nSize) { if (lpConsoleTitle && nSize > 3) { lpConsoleTitle[0]='L'; lpConsoleTitle[1]='S'; lpConsoleTitle[2]='W'; lpConsoleTitle[3]=0; } return 3; }
@@ -10147,6 +11783,459 @@ int __attribute__((ms_abi)) lsw_RemoveDirectoryA(const char* lpPathName) {
 // ============================================================================
 // SECTION: Missing KERNEL32/ADVAPI32/msvcrt stubs for real-world apps
 // ============================================================================
+
+/* ============================================================
+ * .NET CLR / runtime support functions
+ * These are needed for .NET 8 self-contained apps
+ * ============================================================ */
+
+/* VEH — Vectored Exception Handler. CLR needs a non-NULL handle back. */
+void* __attribute__((ms_abi)) lsw_AddVectoredExceptionHandler(uint32_t first, void* handler) {
+    (void)first; (void)handler;
+    return (void*)0x1; /* non-NULL fake handle */
+}
+uint32_t __attribute__((ms_abi)) lsw_RemoveVectoredExceptionHandler(void* handle) {
+    (void)handle; return 1;
+}
+void* __attribute__((ms_abi)) lsw_AddVectoredContinueHandler(uint32_t first, void* handler) {
+    (void)first; (void)handler;
+    return (void*)0x1;
+}
+uint32_t __attribute__((ms_abi)) lsw_RemoveVectoredContinueHandler(void* handle) {
+    (void)handle; return 1;
+}
+
+/* SLIST (singly-linked interlocked list) — used heavily by .NET CLR */
+/* On Windows x64, SLIST_HEADER is 16 bytes (two uint64_t fields).
+ * We implement a simple non-atomic version — sufficient for single-threaded
+ * .NET apps and CLR initialization. */
+typedef struct lsw_SLIST_ENTRY { struct lsw_SLIST_ENTRY *Next; } lsw_SLIST_ENTRY;
+typedef union {
+    struct { uint64_t Alignment; uint64_t Region; } s;
+    struct { lsw_SLIST_ENTRY *Next; uint16_t Depth; uint16_t CpuId; } li;
+} lsw_SLIST_HEADER;
+
+void __attribute__((ms_abi)) lsw_InitializeSListHead(lsw_SLIST_HEADER *list) {
+    if (list) { list->s.Alignment = 0; list->s.Region = 0; }
+}
+uint16_t __attribute__((ms_abi)) lsw_QueryDepthSList(lsw_SLIST_HEADER *list) {
+    if (!list) return 0;
+    return list->li.Depth;
+}
+lsw_SLIST_ENTRY* __attribute__((ms_abi)) lsw_InterlockedPushEntrySList(
+        lsw_SLIST_HEADER *list, lsw_SLIST_ENTRY *entry) {
+    if (!list || !entry) return NULL;
+    lsw_SLIST_ENTRY *old = list->li.Next;
+    entry->Next = old;
+    list->li.Next = entry;
+    list->li.Depth++;
+    return old;
+}
+lsw_SLIST_ENTRY* __attribute__((ms_abi)) lsw_InterlockedPopEntrySList(lsw_SLIST_HEADER *list) {
+    if (!list || !list->li.Next) return NULL;
+    lsw_SLIST_ENTRY *entry = list->li.Next;
+    list->li.Next = entry->Next;
+    list->li.Depth--;
+    return entry;
+}
+lsw_SLIST_ENTRY* __attribute__((ms_abi)) lsw_InterlockedFlushSList(lsw_SLIST_HEADER *list) {
+    if (!list) return NULL;
+    lsw_SLIST_ENTRY *head = list->li.Next;
+    list->li.Next = NULL;
+    list->li.Depth = 0;
+    return head;
+}
+
+/* FlushInstructionCache — no-op on x86-64 Linux (unified I/D cache) */
+int __attribute__((ms_abi)) lsw_FlushInstructionCache(void* hProcess, const void* lpBaseAddress, size_t dwSize) {
+    (void)hProcess; (void)lpBaseAddress; (void)dwSize;
+    return 1;
+}
+
+/* GetStringTypeW / GetStringTypeExW — character type classification */
+#include <wctype.h>
+int __attribute__((ms_abi)) lsw_GetStringTypeW(uint32_t dwInfoType, const uint16_t* lpSrcStr, int cchSrc, uint16_t* lpCharType) {
+    if (!lpSrcStr || !lpCharType) return 0;
+    /* CT_CTYPE1 = 1 */
+    int len = (cchSrc == -1) ? 0 : cchSrc;
+    if (cchSrc == -1) { const uint16_t *p = lpSrcStr; while (*p++) len++; }
+    for (int i = 0; i < len; i++) {
+        uint16_t c = lpSrcStr[i], t = 0;
+        if (iswupper(c))  t |= 0x0001; /* C1_UPPER */
+        if (iswlower(c))  t |= 0x0002; /* C1_LOWER */
+        if (iswdigit(c))  t |= 0x0004; /* C1_DIGIT */
+        if (iswspace(c))  t |= 0x0008; /* C1_SPACE */
+        if (iswpunct(c))  t |= 0x0010; /* C1_PUNCT */
+        if (iswcntrl(c))  t |= 0x0020; /* C1_CNTRL */
+        if (iswalpha(c))  t |= 0x0100; /* C1_ALPHA */
+        lpCharType[i] = t;
+    }
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetStringTypeExW(uint32_t locale, uint32_t dwInfoType, const uint16_t* lpSrcStr, int cchSrc, uint16_t* lpCharType) {
+    (void)locale;
+    return lsw_GetStringTypeW(dwInfoType, lpSrcStr, cchSrc, lpCharType);
+}
+int __attribute__((ms_abi)) lsw_GetStringTypeA(uint32_t locale, uint32_t dwInfoType, const char* lpSrcStr, int cchSrc, uint16_t* lpCharType) {
+    (void)locale; (void)dwInfoType;
+    if (!lpSrcStr || !lpCharType) return 0;
+    int len = (cchSrc == -1) ? (int)strlen(lpSrcStr) : cchSrc;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)lpSrcStr[i];
+        uint16_t t = 0;
+        if (isupper(c)) t |= 0x0001;
+        if (islower(c)) t |= 0x0002;
+        if (isdigit(c)) t |= 0x0004;
+        if (isspace(c)) t |= 0x0008;
+        if (ispunct(c)) t |= 0x0010;
+        if (iscntrl(c)) t |= 0x0020;
+        if (isalpha(c)) t |= 0x0100;
+        lpCharType[i] = t;
+    }
+    return 1;
+}
+
+/* QueueUserAPC — stub (no APC queue) */
+uint32_t __attribute__((ms_abi)) lsw_QueueUserAPC(void* pfnAPC, void* hThread, uintptr_t dwData) {
+    (void)pfnAPC; (void)hThread; (void)dwData;
+    return 0; /* not queued */
+}
+
+/* SignalObjectAndWait — atomically signal obj1 then wait on obj2 */
+uint32_t __attribute__((ms_abi)) lsw_SignalObjectAndWait(void* hObjectToSignal, void* hObjectToWaitOn, uint32_t dwMilliseconds, int bAlertable) {
+    (void)hObjectToSignal; (void)hObjectToWaitOn; (void)dwMilliseconds; (void)bAlertable;
+    return 0; /* WAIT_OBJECT_0 */
+}
+
+/* LocateXStateFeature — extended processor state (XSAVE). Return NULL = not supported */
+void* __attribute__((ms_abi)) lsw_LocateXStateFeature(void* Context, uint32_t FeatureId, uint32_t* Length) {
+    (void)Context; (void)FeatureId; (void)Length;
+    return NULL;
+}
+
+/* RtlDeleteFunctionTable — alias from KERNEL32.dll (already in ntdll) */
+extern int __attribute__((ms_abi)) lsw_RtlDeleteFunctionTable(void*);
+int __attribute__((ms_abi)) lsw_K32_RtlDeleteFunctionTable(void* func_table) {
+    return lsw_RtlDeleteFunctionTable(func_table);
+}
+
+/* RaiseFailFastException — like RaiseException but unrecoverable */
+void __attribute__((ms_abi)) lsw_RaiseFailFastException(void* pExceptionRecord, void* pContextRecord, uint32_t dwFlags) {
+    (void)pContextRecord; (void)dwFlags;
+    LSW_LOG_ERROR("RaiseFailFastException called — terminating");
+    _exit(1);
+}
+
+/* GetStringTypeW alias */
+int __attribute__((ms_abi)) lsw_GetStringTypeW_alias(uint32_t t, const uint16_t* s, int n, uint16_t* out) {
+    return lsw_GetStringTypeW(t, s, n, out);
+}
+
+/* GetEnvironmentStringsW — returns pointer to null-terminated environment block.
+ * .NET CLR reads this at startup to build its environment. NULL return = crash.
+ * We build a UTF-16 env block from our actual process environment. */
+static uint16_t* g_env_block_w = NULL;
+static void lsw_build_env_block_w(void) {
+    extern char **environ;
+    size_t total = 1; /* final empty string */
+    for (char **e = environ; *e; e++) {
+        size_t l = strlen(*e) + 1;
+        total += l;
+    }
+    g_env_block_w = (uint16_t*)malloc(total * sizeof(uint16_t));
+    if (!g_env_block_w) return;
+    uint16_t *p = g_env_block_w;
+    for (char **e = environ; *e; e++) {
+        const char *s = *e;
+        while (*s) *p++ = (uint16_t)(unsigned char)*s++;
+        *p++ = 0;
+    }
+    *p = 0; /* double-null terminator */
+}
+uint16_t* __attribute__((ms_abi)) lsw_GetEnvironmentStringsW(void) {
+    if (!g_env_block_w) lsw_build_env_block_w();
+    return g_env_block_w;
+}
+int __attribute__((ms_abi)) lsw_FreeEnvironmentStringsW(uint16_t* env) {
+    (void)env; return 1; /* don't free — static block */
+}
+char* __attribute__((ms_abi)) lsw_GetEnvironmentStrings(void) {
+    extern char **environ;
+    size_t total = 1;
+    for (char **e = environ; *e; e++) total += strlen(*e) + 1;
+    char *block = (char*)malloc(total);
+    if (!block) return NULL;
+    char *p = block;
+    for (char **e = environ; *e; e++) {
+        size_t l = strlen(*e) + 1;
+        memcpy(p, *e, l); p += l;
+    }
+    *p = 0;
+    return block;
+}
+int __attribute__((ms_abi)) lsw_FreeEnvironmentStringsA(char* env) {
+    free(env); return 1;
+}
+
+/* LCMapStringEx — extended locale string mapping (upper/lower/normalize).
+ * .NET uses this for string comparisons. We provide a basic implementation. */
+/* LCMAP flags */
+#define LCMAP_LOWERCASE  0x00000100
+#define LCMAP_UPPERCASE  0x00000200
+#define LCMAP_SORTKEY    0x00000400
+#define LCMAP_BYTEREV    0x00000800
+#define LCMAP_HIRAGANA   0x00100000
+#define LCMAP_KATAKANA   0x00200000
+#define LCMAP_HALFWIDTH  0x00400000
+#define LCMAP_FULLWIDTH  0x00800000
+#define LCMAP_LINGUISTIC_CASING 0x01000000
+int __attribute__((ms_abi)) lsw_LCMapStringEx(const uint16_t* lpLocaleName, uint32_t dwMapFlags,
+        const uint16_t* lpSrcStr, int cchSrc, uint16_t* lpDestStr, int cchDest,
+        void* lpVersionInformation, void* lpReserved, uintptr_t sortHandle) {
+    (void)lpLocaleName; (void)lpVersionInformation; (void)lpReserved; (void)sortHandle;
+    if (!lpSrcStr) return 0;
+    int len = cchSrc == -1 ? 0 : cchSrc;
+    if (cchSrc == -1) { const uint16_t *p = lpSrcStr; while (*p++) len++; }
+    if (dwMapFlags & LCMAP_SORTKEY) {
+        /* For sort keys, just copy as-is; good enough for most CLR uses */
+        if (!lpDestStr) return len + 1;
+        int copy = len < cchDest - 1 ? len : cchDest - 1;
+        memcpy(lpDestStr, lpSrcStr, copy * 2);
+        lpDestStr[copy] = 0;
+        return copy;
+    }
+    if (!lpDestStr) return len + (cchSrc == -1 ? 1 : 0);
+    int copy = len < cchDest ? len : cchDest;
+    for (int i = 0; i < copy; i++) {
+        uint16_t c = lpSrcStr[i];
+        if (dwMapFlags & LCMAP_UPPERCASE) c = (uint16_t)towupper(c);
+        else if (dwMapFlags & LCMAP_LOWERCASE) c = (uint16_t)towlower(c);
+        lpDestStr[i] = c;
+    }
+    return copy;
+}
+int __attribute__((ms_abi)) lsw_LCMapStringW(uint32_t locale, uint32_t dwMapFlags,
+        const uint16_t* lpSrcStr, int cchSrc, uint16_t* lpDestStr, int cchDest) {
+    (void)locale;
+    return lsw_LCMapStringEx(NULL, dwMapFlags, lpSrcStr, cchSrc, lpDestStr, cchDest, NULL, NULL, 0);
+}
+
+/* RtlAddFunctionTable — already in ntdll_api.c; aliases added to mapping table */
+/* RtlInstallFunctionTableCallback, RtlUnwind, RtlUnwindEx, RtlRestoreContext — also in ntdll_api.c */
+
+/* RtlPcToFileHeader — given a PC (code pointer), find which loaded module contains it.
+ * Returns the module's image base, and writes it to *BaseOfImage.
+ * The CLR calls this to validate that a function pointer belongs to a loaded PE module.
+ * If we return NULL the CLR throws a fatal C++ exception; returning the correct base lets
+ * the CLR throw the expected (catchable) exception with code 0x19930520 instead. */
+void* __attribute__((ms_abi)) lsw_RtlPcToFileHeader(void* PcValue, void** BaseOfImage) {
+    uintptr_t pc = (uintptr_t)PcValue;
+
+    /* Check main EXE image */
+    if (g_lsw_image_base && g_lsw_image_size) {
+        uintptr_t base = (uintptr_t)g_lsw_image_base;
+        uintptr_t end  = base + (uintptr_t)g_lsw_image_size;
+        if (pc >= base && pc < end) {
+            LSW_LOG_INFO("RtlPcToFileHeader: pc=%p -> main EXE base=%p", PcValue, (void*)base);
+            if (BaseOfImage) *BaseOfImage = (void*)base;
+            return (void*)base;
+        }
+    }
+
+    /* Check loaded PE DLL modules */
+    pthread_mutex_lock(&g_pe_module_lock);
+    for (int i = 0; i < g_pe_module_count && i < 64; i++) {
+        lsw_pe_hmodule_t* mod = &g_pe_modules[i];
+        if (mod->magic != LSW_PE_HMODULE_MAGIC || !mod->image_base) continue;
+        uintptr_t base = (uintptr_t)mod->image_base;
+        uintptr_t end  = base + mod->image_size;
+        if (pc >= base && pc < end) {
+            pthread_mutex_unlock(&g_pe_module_lock);
+            LSW_LOG_INFO("RtlPcToFileHeader: pc=%p -> DLL '%s' base=%p", PcValue, mod->dll_name, (void*)base);
+            if (BaseOfImage) *BaseOfImage = (void*)base;
+            return (void*)base;
+        }
+    }
+    pthread_mutex_unlock(&g_pe_module_lock);
+
+    LSW_LOG_WARN("RtlPcToFileHeader: pc=%p not in any known module -> NULL", PcValue);
+    if (BaseOfImage) *BaseOfImage = NULL;
+    return NULL;
+}
+
+
+/* GetSystemTimePreciseAsFileTime — high-precision system time (same as GetSystemTimeAsFileTime) */
+void __attribute__((ms_abi)) lsw_GetSystemTimePreciseAsFileTime(void* lpSystemTimeAsFileTime) {
+    lsw_GetSystemTimeAsFileTime(lpSystemTimeAsFileTime);
+}
+
+/* VerifyVersionInfoW — .NET uses this to check Windows version; always say OK */
+int __attribute__((ms_abi)) lsw_VerifyVersionInfoW(void* lpVersionInformation, uint32_t dwTypeMask, uint64_t dwlConditionMask) {
+    (void)lpVersionInformation; (void)dwTypeMask; (void)dwlConditionMask;
+    return 1; /* always return TRUE — we pretend to be the requested version */
+}
+
+/* InitializeContext / CopyContext — context manipulation for fibers/longjmp
+ * Return stub that won't crash the CLR (just say success with minimal context) */
+int __attribute__((ms_abi)) lsw_InitializeContext(void* Buffer, uint32_t ContextFlags, void** Context, uint32_t* ContextLength) {
+    if (!ContextLength) return 0;
+    if (!Buffer) { *ContextLength = 1024; return 0; } /* query size */
+    if (Context) *Context = Buffer;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_InitializeContext2(void* Buffer, uint32_t ContextFlags, void** Context, uint32_t* ContextLength, uint64_t XStateCompactionMask) {
+    (void)XStateCompactionMask;
+    return lsw_InitializeContext(Buffer, ContextFlags, Context, ContextLength);
+}
+int __attribute__((ms_abi)) lsw_CopyContext(void* Destination, uint32_t ContextFlags, void* Source) {
+    (void)ContextFlags;
+    if (!Destination || !Source) return 0;
+    memcpy(Destination, Source, 1232); /* CONTEXT struct is 1232 bytes on x64 */
+    return 1;
+}
+uint64_t __attribute__((ms_abi)) lsw_GetEnabledXStateFeatures(void) {
+    return 0; /* no XState features */
+}
+int __attribute__((ms_abi)) lsw_SetXStateFeaturesMask(void* Context, uint64_t FeatureMask) {
+    (void)Context; (void)FeatureMask; return 1;
+}
+
+/* GetThreadContext / SetThreadContext — used by CLR for stack unwinding */
+int __attribute__((ms_abi)) lsw_GetThreadContext(void* hThread, void* lpContext) {
+    (void)hThread; (void)lpContext; return 0; /* ERROR_INVALID_HANDLE */
+}
+int __attribute__((ms_abi)) lsw_SetThreadContext(void* hThread, const void* lpContext) {
+    (void)hThread; (void)lpContext; return 0;
+}
+
+/* FlushProcessWriteBuffers — memory barrier. On x86-64 mfence suffices. */
+void __attribute__((ms_abi)) lsw_FlushProcessWriteBuffers(void) {
+    __asm__ volatile("mfence" ::: "memory");
+}
+
+/* IsProcessInJob — return FALSE (not in a job) */
+int __attribute__((ms_abi)) lsw_IsProcessInJob(void* hProcess, void* hJob, int* result) {
+    (void)hProcess; (void)hJob;
+    if (result) *result = 0;
+    return 1;
+}
+
+/* GetLogicalProcessorInformation / Ex */
+int __attribute__((ms_abi)) lsw_GetLogicalProcessorInformation(void* Buffer, uint32_t* ReturnedLength) {
+    (void)Buffer;
+    if (ReturnedLength) *ReturnedLength = 0;
+    return 0;
+}
+int __attribute__((ms_abi)) lsw_GetLogicalProcessorInformationEx(uint32_t RelationshipType, void* Buffer, uint32_t* ReturnedLength) {
+    (void)RelationshipType; (void)Buffer;
+    if (ReturnedLength) *ReturnedLength = 0;
+    return 0;
+}
+
+/* K32GetProcessMemoryInfo */
+int __attribute__((ms_abi)) lsw_K32GetProcessMemoryInfo(void* Process, void* ppsmemCounters, uint32_t cb) {
+    if (ppsmemCounters && cb >= 8) memset(ppsmemCounters, 0, cb);
+    return 1;
+}
+
+/* GetNumaHighestNodeNumber */
+int __attribute__((ms_abi)) lsw_GetNumaHighestNodeNumber(uint32_t* HighestNodeNumber) {
+    if (HighestNodeNumber) *HighestNodeNumber = 0;
+    return 1;
+}
+
+/* Processor/thread group affinity stubs */
+int __attribute__((ms_abi)) lsw_GetThreadGroupAffinity(void* hThread, void* GroupAffinity) {
+    if (GroupAffinity) memset(GroupAffinity, 0, 16);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetThreadGroupAffinity(void* hThread, const void* GroupAffinity, void* PreviousGroupAffinity) {
+    (void)hThread; (void)GroupAffinity;
+    if (PreviousGroupAffinity) memset(PreviousGroupAffinity, 0, 16);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_SetThreadIdealProcessorEx(void* hThread, void* lpIdealProcessor, void* lpPreviousIdealProcessor) {
+    (void)hThread; (void)lpIdealProcessor;
+    if (lpPreviousIdealProcessor) memset(lpPreviousIdealProcessor, 0, 8);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetThreadIdealProcessorEx(void* hThread, void* lpIdealProcessor) {
+    (void)hThread;
+    if (lpIdealProcessor) memset(lpIdealProcessor, 0, 8);
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_GetProcessGroupAffinity(void* hProcess, uint32_t* GroupCount, uint16_t* GroupArray) {
+    (void)hProcess;
+    if (GroupCount) *GroupCount = 1;
+    if (GroupArray) *GroupArray = 0;
+    return 1;
+}
+uint32_t __attribute__((ms_abi)) lsw_GetCurrentProcessorNumberEx(void* ProcNumber) {
+    (void)ProcNumber; return 0;
+}
+void* __attribute__((ms_abi)) lsw_VirtualAllocExNuma(void* hProcess, void* lpAddress, size_t dwSize,
+        uint32_t flAllocationType, uint32_t flProtect, uint32_t nndPreferred) {
+    (void)hProcess; (void)nndPreferred;
+    return lsw_VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+}
+int __attribute__((ms_abi)) lsw_GetNumaProcessorNodeEx(void* Processor, uint16_t* NodeNumber) {
+    (void)Processor;
+    if (NodeNumber) *NodeNumber = 0;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_VirtualUnlock(void* lpAddress, size_t dwSize) {
+    (void)lpAddress; (void)dwSize; return 1;
+}
+uint32_t __attribute__((ms_abi)) lsw_QueryThreadCycleTime(void* hThread, uint64_t* CycleTime) {
+    (void)hThread;
+    if (CycleTime) *CycleTime = 0;
+    return 1;
+}
+
+/* WerRegisterRuntimeExceptionModule — Windows Error Reporting, no-op */
+uint32_t __attribute__((ms_abi)) lsw_WerRegisterRuntimeExceptionModule(const uint16_t* pwszOutOfProcessCallbackDll, void* pContext) {
+    (void)pwszOutOfProcessCallbackDll; (void)pContext;
+    return 0; /* S_OK */
+}
+
+/* CreateActCtxW / ActivateActCtx — Activation Context for COM/SxS, stubs */
+void* __attribute__((ms_abi)) lsw_CreateActCtxW(void* pActCtx) {
+    (void)pActCtx;
+    return (void*)(uintptr_t)0xFFFFFFFFFFFFFFFFULL; /* INVALID_HANDLE_VALUE */
+}
+int __attribute__((ms_abi)) lsw_ActivateActCtx(void* hActCtx, uintptr_t* lpCookie) {
+    (void)hActCtx;
+    if (lpCookie) *lpCookie = 1;
+    return 1;
+}
+int __attribute__((ms_abi)) lsw_DeactivateActCtx(uint32_t dwFlags, uintptr_t ulCookie) {
+    (void)dwFlags; (void)ulCookie; return 1;
+}
+void __attribute__((ms_abi)) lsw_ReleaseActCtx(void* hActCtx) { (void)hActCtx; }
+
+/* FindResourceW / FindResourceExW — resource stubs (already defined earlier) */
+void* __attribute__((ms_abi)) lsw_FindResourceW(void* hModule, const uint16_t* lpName, const uint16_t* lpType) {
+    return lsw_FindResourceExW(hModule, lpType, lpName, 0);
+}
+
+/* CreateMemoryResourceNotification — memory pressure events, stub */
+void* __attribute__((ms_abi)) lsw_CreateMemoryResourceNotification(uint32_t NotificationType) {
+    (void)NotificationType;
+    return (void*)0x1; /* fake handle */
+}
+int __attribute__((ms_abi)) lsw_QueryMemoryResourceNotification(void* ResourceNotificationHandle, int* ResourceState) {
+    (void)ResourceNotificationHandle;
+    if (ResourceState) *ResourceState = 0; /* not under pressure */
+    return 1;
+}
+
+/* QueryInformationJobObject — stub */
+int __attribute__((ms_abi)) lsw_QueryInformationJobObject(void* hJob, uint32_t JobObjectInfoClass,
+        void* lpJobObjectInfo, uint32_t cbJobObjectInfoLength, uint32_t* lpReturnLength) {
+    (void)hJob; (void)JobObjectInfoClass; (void)lpJobObjectInfo; (void)cbJobObjectInfoLength;
+    if (lpReturnLength) *lpReturnLength = 0;
+    return 0;
+}
 
 /* InterlockedIncrement/Decrement/Exchange — atomic ops via GCC builtins */
 long __attribute__((ms_abi)) lsw_InterlockedIncrement(volatile long* Addend) {
@@ -10352,8 +12441,21 @@ int __attribute__((ms_abi)) lsw_MoveFileWithProgressW(const wchar_t* lpExistingF
 
 /* OpenEventW — stub returning a non-null handle */
 void* __attribute__((ms_abi)) lsw_OpenEventW(uint32_t dwDesiredAccess, int bInheritHandle, const wchar_t* lpName) {
-    (void)dwDesiredAccess; (void)bInheritHandle; (void)lpName;
-    return (void*)1;  /* non-null fake handle */
+    (void)bInheritHandle;
+    /* Named events are cross-process objects that don't exist in our single-process emulation.
+     * Return NULL so callers that guard on this (e.g. .NET parent-process handshake) skip
+     * the cross-process wait entirely. */
+    if (lpName) {
+        char name_narrow[256] = {0};
+        for (int i = 0; i < 255 && lpName[i]; i++)
+            name_narrow[i] = (char)lpName[i];
+        LSW_LOG_INFO("OpenEventW: access=0x%x name='%s' -> NULL (no named events in single-process mode)",
+                     dwDesiredAccess, name_narrow);
+    } else {
+        LSW_LOG_INFO("OpenEventW: access=0x%x name=(null) -> NULL", dwDesiredAccess);
+    }
+    /* SetLastError(ERROR_FILE_NOT_FOUND) equivalent - set NTSTATUS-style status? */
+    return NULL;
 }
 
 /* ADVAPI32 stubs — GetSidIdentifierAuthority, InitializeSid, LookupPrivilegeDisplayNameW
@@ -10600,12 +12702,61 @@ uint64_t __attribute__((ms_abi)) lsw_VerSetConditionMask(uint64_t ConditionMask,
     (void)TypeMask; (void)Condition;
     return ConditionMask;
 }
-int __attribute__((ms_abi)) lsw_RtlVirtualUnwind(uint32_t HandlerType, uint64_t ImageBase, uint64_t ControlPc,
-                                                   void* FunctionEntry, void* ContextRecord, void** HandlerData,
-                                                   uint64_t* EstablisherFrame, void* ContextPointers) {
-    (void)HandlerType; (void)ImageBase; (void)ControlPc; (void)FunctionEntry;
-    (void)ContextRecord; (void)HandlerData; (void)EstablisherFrame; (void)ContextPointers;
-    return 0;
+void* __attribute__((ms_abi)) lsw_RtlVirtualUnwind(uint32_t HandlerType, uint64_t ImageBase, uint64_t ControlPc,
+                                                    void* FunctionEntry, void* ContextRecord, void** HandlerData,
+                                                    uint64_t* EstablisherFrame, void* ContextPointers) {
+    (void)HandlerType; (void)ImageBase; (void)ContextPointers;
+
+    lsw_RUNTIME_FUNCTION* rf = (lsw_RUNTIME_FUNCTION*)FunctionEntry;
+    uint8_t* ctx = (uint8_t*)ContextRecord;
+
+    if (HandlerData) *HandlerData = NULL;
+    if (EstablisherFrame) *EstablisherFrame = 0;
+
+    if (!rf || !ctx) return NULL;
+
+    /* Read RSP from CONTEXT (offset 0x98) */
+    uint64_t body_rsp = *(uint64_t*)(ctx + LSW_CTX_OFFS_RSP);
+
+    uint64_t caller_rip = 0, caller_rsp = 0;
+    uint64_t entry_rsp = lsw_unwind_frame(rf, body_rsp, &caller_rip, &caller_rsp);
+    if (!entry_rsp) {
+        LSW_LOG_WARN("[unwind] RtlVirtualUnwind: lsw_unwind_frame failed for rva=0x%x",
+                     rf->BeginAddress);
+        return NULL;
+    }
+
+    if (EstablisherFrame) *EstablisherFrame = entry_rsp;
+
+    /* Update CONTEXT to caller's frame */
+    *(uint64_t*)(ctx + LSW_CTX_OFFS_RIP) = caller_rip;
+    *(uint64_t*)(ctx + LSW_CTX_OFFS_RSP) = caller_rsp;
+
+    LSW_LOG_INFO("[unwind] RtlVirtualUnwind: rva=0x%x entry_rsp=0x%llx caller_rip=0x%llx",
+                 rf->BeginAddress,
+                 (unsigned long long)entry_rsp,
+                 (unsigned long long)caller_rip);
+
+    /* Extract language-specific handler from UNWIND_INFO */
+    void* handler_data_ptr = NULL;
+    uint64_t handler_va = lsw_get_frame_seh_handler(rf, &handler_data_ptr);
+    if (HandlerData) *HandlerData = handler_data_ptr;
+
+    return handler_va ? (void*)handler_va : NULL;
+}
+
+// ntdll!RtlDllShutdownInProgress — returns non-zero only if process is terminating
+uint8_t __attribute__((ms_abi)) lsw_RtlDllShutdownInProgress(void) {
+    return 0; /* Process is NOT shutting down */
+}
+
+// KERNEL32!QueueUserAPC2 — Windows 11+ extended APC; not available on older Windows
+// .NET uses it for thread interruption if available, falls back gracefully if absent
+uint32_t __attribute__((ms_abi)) lsw_QueueUserAPC2(void* apc_routine, void* thread_handle, uintptr_t data, uint32_t flags) {
+    (void)apc_routine; (void)thread_handle; (void)data; (void)flags;
+    LSW_LOG_WARN("QueueUserAPC2 called — not supported, returning ERROR_NOT_SUPPORTED");
+    /* SetLastError(ERROR_NOT_SUPPORTED = 50) */
+    return 0; /* FALSE */
 }
 
 /* ----------------------------------------------------------------
@@ -10701,7 +12852,17 @@ int __attribute__((ms_abi)) lsw_GetDateFormatW(uint32_t locale, uint32_t flags, 
 /* --- KERNEL32: RtlCaptureContext, RtlLookupFunctionEntry --- */
 /* NOTE: implementations are in ntdll_api.c — just need KERNEL32 alias mappings */
 extern void __attribute__((ms_abi)) lsw_RtlCaptureContext(void* ContextRecord);
-extern void* __attribute__((ms_abi)) lsw_RtlLookupFunctionEntry(uint64_t pc, uint64_t* imagebase, void* history);
+/* RtlLookupFunctionEntry — search the PE's .pdata table for the RUNTIME_FUNCTION
+ * that contains 'control_pc'.  Used by .NET's own exception dispatch machinery. */
+void* __attribute__((ms_abi)) lsw_RtlLookupFunctionEntry(
+    uint64_t control_pc, uint64_t* image_base, void* history_table)
+{
+    (void)history_table;
+    lsw_RUNTIME_FUNCTION* rf = lsw_find_rf(control_pc);
+    if (image_base)
+        *image_base = rf ? g_lsw_image_base : 0;
+    return (void*)rf;
+}
 
 /* --- IPHLPAPI stubs moved to misc_api.c --- */
 
@@ -11420,6 +13581,114 @@ int __attribute__((ms_abi)) lsw__vsnwprintf_s(wchar_t* buf, size_t bufSz, size_t
 }
 void __attribute__((ms_abi)) lsw__local_unwind(void* frame, void* target) {
     (void)frame; (void)target; /* no-op on Linux — no SEH unwinding needed */
+}
+
+/* --- Missing ucrtbase.dll / CRT functions --- */
+
+/* iswspace/iswupper/iswascii — wide character classification */
+int __attribute__((ms_abi)) lsw_iswspace(wint_t c)  { return iswspace(c); }
+int __attribute__((ms_abi)) lsw_iswupper(wint_t c)  { return iswupper(c); }
+int __attribute__((ms_abi)) lsw_iswlower(wint_t c)  { return iswlower(c); }
+int __attribute__((ms_abi)) lsw_iswdigit(wint_t c)  { return iswdigit(c); }
+int __attribute__((ms_abi)) lsw_iswalpha(wint_t c)  { return iswalpha(c); }
+int __attribute__((ms_abi)) lsw_iswprint(wint_t c)  { return iswprint(c); }
+int __attribute__((ms_abi)) lsw_iswascii(wint_t c)  { return (c >= 0 && c <= 127); }
+/* isxdigit/isascii/iscntrl/_is* — narrow character classification (new additions) */
+int __attribute__((ms_abi)) lsw_isxdigit(int c)      { return isxdigit(c); }
+int __attribute__((ms_abi)) lsw_isascii(int c)       { return isascii(c); }
+int __attribute__((ms_abi)) lsw_iscntrl(int c)       { return iscntrl(c); }
+int __attribute__((ms_abi)) lsw__isascii(int c)      { return (c >= 0 && c <= 127); }
+int __attribute__((ms_abi)) lsw__iscsym(int c)       { return (isalnum(c) || c == '_'); }
+int __attribute__((ms_abi)) lsw__iscsymf(int c)      { return (isalpha(c) || c == '_'); }
+
+/* strnlen — bounded strlen (safe for unterminated buffers) */
+size_t __attribute__((ms_abi)) lsw_strnlen(const char* s, size_t maxlen) {
+    if (!s) return 0;
+    return strnlen(s, maxlen);
+}
+/* Note: lsw_wcsnlen is defined earlier (line ~7848); the ucrtbase mapping references that */
+
+/* strncat_s / strtok_s / strcspn / __strncnt */
+int __attribute__((ms_abi)) lsw_strncat_s(char* dst, size_t dstSz, const char* src, size_t count) {
+    if (!dst || dstSz == 0) return 22; /* EINVAL */
+    if (!src) return 0;
+    size_t len = strlen(dst);
+    if (len >= dstSz) return 22;
+    size_t rem = dstSz - len - 1;
+    size_t n = (count == (size_t)-1 || count > rem) ? rem : count;
+    strncat(dst + len, src, n);
+    dst[len + n] = '\0';
+    return 0;
+}
+char* __attribute__((ms_abi)) lsw_strtok_s(char* str, const char* delim, char** ctx) {
+    return strtok_r(str, delim, ctx);
+}
+size_t __attribute__((ms_abi)) lsw_strcspn(const char* s, const char* reject) {
+    return strcspn(s, reject);
+}
+size_t __attribute__((ms_abi)) lsw_strspn(const char* s, const char* accept) {
+    return strspn(s, accept);
+}
+/* __strncnt — internal MSVCRT: count of chars up to n, similar to strnlen */
+size_t __attribute__((ms_abi)) lsw___strncnt(const char* s, size_t count) {
+    return strnlen(s, count);
+}
+
+/* setvbuf / fsetpos / _fseeki64 / _dup / _get_stream_buffer_pointers */
+int __attribute__((ms_abi)) lsw_setvbuf(void* stream, char* buf, int mode, size_t size) {
+    return setvbuf((FILE*)stream, buf, mode, size);
+}
+int __attribute__((ms_abi)) lsw_fsetpos(void* stream, const fpos_t* pos) {
+    return fsetpos((FILE*)stream, pos);
+}
+/* lsw_fgetpos is already defined earlier (takes FILE*); both are compatible via void* */
+int __attribute__((ms_abi)) lsw__fseeki64(void* stream, int64_t offset, int origin) {
+    return fseeko((FILE*)stream, (off_t)offset, origin);
+}
+int64_t __attribute__((ms_abi)) lsw__ftelli64(void* stream) {
+    return (int64_t)ftello((FILE*)stream);
+}
+int __attribute__((ms_abi)) lsw__dup(int fd) {
+    return dup(fd);
+}
+int __attribute__((ms_abi)) lsw__dup2(int oldfd, int newfd) {
+    return dup2(oldfd, newfd);
+}
+/* _get_stream_buffer_pointers — internal CRT function to get FILE buffer metadata */
+int __attribute__((ms_abi)) lsw__get_stream_buffer_pointers(void* stream,
+    char*** pbuf, char*** pbuf_end, char*** pcur) {
+    (void)stream;
+    /* Stub — return success with NULL pointers; CLR uses this for optimization */
+    if (pbuf)     *pbuf     = NULL;
+    if (pbuf_end) *pbuf_end = NULL;
+    if (pcur)     *pcur     = NULL;
+    return 0;
+}
+
+/* _wfsopen — wide-char fopen with share mode (ignore share mode, use _wfopen) */
+void* __attribute__((ms_abi)) lsw__wfsopen(const wchar_t* path, const wchar_t* mode, int shflag) {
+    (void)shflag;
+    return lsw__wfopen(path, mode);
+}
+
+/* __stdio_common_vsnprintf_s — secure snprintf with flags */
+int __attribute__((ms_abi)) lsw___stdio_common_vsnprintf_s(uint64_t options,
+    char* buf, size_t bufSz, size_t count, const char* fmt, void* locale, char* ap) {
+    (void)options; (void)locale;
+    if (!fmt) return -1;
+    size_t n = (count == (size_t)-1 || count >= bufSz) ? bufSz - 1 : count;
+    va_list sysv_ap; LSW_MS_TO_SYSV_VA(sysv_ap, ap);
+    int r = vsnprintf(buf, n + 1, fmt, sysv_ap);
+    if (buf && bufSz > 0) buf[bufSz - 1] = '\0';
+    return r;
+}
+
+/* ADVAPI32 missing stubs */
+int __attribute__((ms_abi)) lsw_SetKernelObjectSecurity(void* obj, uint32_t info, void* sd) {
+    (void)obj; (void)info; (void)sd; return 1; /* TRUE */
+}
+int __attribute__((ms_abi)) lsw_SetThreadToken(void** thread, void* token) {
+    (void)thread; (void)token; return 1; /* TRUE */
 }
 
 /* --- NetAPI / SMB / MPR stubs --- */
@@ -12314,9 +14583,13 @@ static const win32_api_mapping_t api_mappings[] = {
     {"api-ms-win-security-lsapolicy-l1-1-0.dll", "LsaLookupNames2",           (void*)lsw_LsaLookupNames2},
 
     // ntdll.dll — additional stubs
-    {"ntdll.dll", "RtlVerifyVersionInfo",  (void*)lsw_RtlVerifyVersionInfo},
-    {"ntdll.dll", "VerSetConditionMask",   (void*)lsw_VerSetConditionMask},
-    {"ntdll.dll", "RtlVirtualUnwind",      (void*)lsw_RtlVirtualUnwind},
+    {"ntdll.dll", "RtlVerifyVersionInfo",        (void*)lsw_RtlVerifyVersionInfo},
+    {"ntdll.dll", "VerSetConditionMask",         (void*)lsw_VerSetConditionMask},
+    {"ntdll.dll", "RtlVirtualUnwind",            (void*)lsw_RtlVirtualUnwind},
+    {"ntdll.dll", "RtlDllShutdownInProgress",    (void*)lsw_RtlDllShutdownInProgress},
+
+    // KERNEL32.dll — .NET-specific missing stubs
+    {"KERNEL32.dll", "QueueUserAPC2",            (void*)lsw_QueueUserAPC2},
 
     // USER32.dll — additional stubs
     {"USER32.dll", "LoadStringW",          (void*)lsw_LoadStringW},
@@ -12691,6 +14964,7 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "_o__c_exit",                  (void*)lsw__c_exit},
     {"ucrtbase.dll", "_o_exit",                     (void*)lsw_exit},
     {"ucrtbase.dll", "_o_terminate",                (void*)lsw_abort},
+    {"ucrtbase.dll", "_o_abort",                    (void*)lsw__o_abort},
     {"ucrtbase.dll", "_o_fflush",                   (void*)lsw_fflush},
     {"ucrtbase.dll", "_o_getwchar",                 (void*)lsw_getwchar},
     {"ucrtbase.dll", "_o__fileno",                  (void*)lsw__fileno},
@@ -12717,6 +14991,12 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "_o___p___argc",               (void*)lsw___p___argc},
     {"ucrtbase.dll", "_o___p___wargv",              (void*)lsw___p___wargv},
     {"ucrtbase.dll", "_o___p__commode",             (void*)lsw___p__commode},
+    {"ucrtbase.dll", "_o_malloc",                   (void*)lsw_malloc},
+    {"ucrtbase.dll", "_o_free",                     (void*)lsw_free},
+    {"ucrtbase.dll", "_o_calloc",                   (void*)lsw_calloc},
+    {"ucrtbase.dll", "_o_realloc",                  (void*)lsw_realloc},
+    {"ucrtbase.dll", "_o_strdup",                   (void*)lsw__strdup},
+    {"ucrtbase.dll", "_o__strdup",                  (void*)lsw__strdup},
     {"ucrtbase.dll", "__C_specific_handler",        (void*)lsw___C_specific_handler},
     {"ucrtbase.dll", "_c_exit",                     (void*)lsw__c_exit},
     /* ucrtbase.dll — memory/string/time/IO */
@@ -12804,6 +15084,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "strftime",     (void*)lsw_strftime},
     {"ucrtbase.dll", "getenv",       (void*)lsw_getenv},
     {"ucrtbase.dll", "_putenv",      (void*)lsw__putenv},
+    {"ucrtbase.dll", "_putenv_s",    (void*)lsw__putenv_s},
+    {"ucrtbase.dll", "_wputenv_s",   (void*)lsw__wputenv_s},
     {"ucrtbase.dll", "_wgetenv",     (void*)lsw__wgetenv},
     {"ucrtbase.dll", "_wstat64",     (void*)lsw__wstat64},
     {"ucrtbase.dll", "_wstat",       (void*)lsw__wstat},
@@ -12816,6 +15098,160 @@ static const win32_api_mapping_t api_mappings[] = {
     {"ucrtbase.dll", "_errno",       (void*)lsw__errno},
     {"ucrtbase.dll", "_get_errno",   (void*)lsw__get_errno},
     {"ucrtbase.dll", "_set_errno",   (void*)lsw__set_errno},
+    /* ucrtbase.dll — string classification / ctype */
+    {"ucrtbase.dll", "toupper",      (void*)lsw_toupper},
+    {"ucrtbase.dll", "tolower",      (void*)lsw_tolower},
+    {"ucrtbase.dll", "isalpha",      (void*)lsw_isalpha},
+    {"ucrtbase.dll", "isdigit",      (void*)lsw_isdigit},
+    {"ucrtbase.dll", "isspace",      (void*)lsw_isspace},
+    {"ucrtbase.dll", "isupper",      (void*)lsw_isupper},
+    {"ucrtbase.dll", "islower",      (void*)lsw_islower},
+    {"ucrtbase.dll", "isprint",      (void*)lsw_isprint},
+    {"ucrtbase.dll", "isxdigit",     (void*)lsw_isxdigit},
+    {"ucrtbase.dll", "ispunct",      (void*)lsw_ispunct},
+    {"ucrtbase.dll", "isalnum",      (void*)lsw_isalnum},
+    {"ucrtbase.dll", "isascii",      (void*)lsw_isascii},
+    {"ucrtbase.dll", "iscntrl",      (void*)lsw_iscntrl},
+    {"ucrtbase.dll", "_isascii",     (void*)lsw__isascii},
+    {"ucrtbase.dll", "_iscsym",      (void*)lsw__iscsym},
+    {"ucrtbase.dll", "_iscsymf",     (void*)lsw__iscsymf},
+    {"ucrtbase.dll", "towupper",     (void*)lsw_towupper},
+    {"ucrtbase.dll", "towlower",     (void*)lsw_towlower},
+    {"ucrtbase.dll", "iswspace",     (void*)lsw_iswspace},
+    {"ucrtbase.dll", "iswupper",     (void*)lsw_iswupper},
+    {"ucrtbase.dll", "iswlower",     (void*)lsw_iswlower},
+    {"ucrtbase.dll", "iswdigit",     (void*)lsw_iswdigit},
+    {"ucrtbase.dll", "iswalpha",     (void*)lsw_iswalpha},
+    {"ucrtbase.dll", "iswprint",     (void*)lsw_iswprint},
+    {"ucrtbase.dll", "iswascii",     (void*)lsw_iswascii},
+    /* ucrtbase.dll — string utility */
+    {"ucrtbase.dll", "strnlen",      (void*)lsw_strnlen},
+    {"ucrtbase.dll", "strncat_s",    (void*)lsw_strncat_s},
+    {"ucrtbase.dll", "wcsncat_s",    (void*)lsw_wcsncat_s},
+    {"ucrtbase.dll", "wcsncpy_s",    (void*)lsw_wcsncpy_s},
+    {"ucrtbase.dll", "strtok_s",     (void*)lsw_strtok_s},
+    {"ucrtbase.dll", "strcspn",      (void*)lsw_strcspn},
+    {"ucrtbase.dll", "strspn",       (void*)lsw_strspn},
+    {"ucrtbase.dll", "__strncnt",    (void*)lsw___strncnt},
+    {"ucrtbase.dll", "fputs",        (void*)lsw_fputs},
+    {"ucrtbase.dll", "fputwc",       (void*)lsw_fputwc},
+    {"ucrtbase.dll", "fputws",       (void*)lsw_fputws},
+    {"ucrtbase.dll", "ungetc",       (void*)lsw_ungetc},
+    /* ucrtbase.dll — IO extras */
+    {"ucrtbase.dll", "setvbuf",      (void*)lsw_setvbuf},
+    {"ucrtbase.dll", "fsetpos",      (void*)lsw_fsetpos},
+    {"ucrtbase.dll", "fgetpos",      (void*)lsw_fgetpos},
+    {"ucrtbase.dll", "_fseeki64",    (void*)lsw__fseeki64},
+    {"ucrtbase.dll", "_ftelli64",    (void*)lsw__ftelli64},
+    {"ucrtbase.dll", "_dup",         (void*)lsw__dup},
+    {"ucrtbase.dll", "_dup2",        (void*)lsw__dup2},
+    {"ucrtbase.dll", "_fileno",      (void*)lsw__fileno},
+    {"ucrtbase.dll", "_wfsopen",     (void*)lsw__wfsopen},
+    {"ucrtbase.dll", "_set_fmode",   (void*)lsw__set_fmode},
+    {"ucrtbase.dll", "_get_stream_buffer_pointers", (void*)lsw__get_stream_buffer_pointers},
+    {"ucrtbase.dll", "__stdio_common_vsnprintf_s",  (void*)lsw___stdio_common_vsnprintf_s},
+    /* ucrtbase.dll — CRT startup functions without _o_ prefix */
+    {"ucrtbase.dll", "_cexit",                       (void*)lsw__cexit},
+    {"ucrtbase.dll", "_exit",                        (void*)lsw__exit},
+    {"ucrtbase.dll", "_set_app_type",                (void*)lsw__set_app_type},
+    {"ucrtbase.dll", "_get_initial_wide_environment",(void*)lsw__get_initial_wide_environment},
+    {"ucrtbase.dll", "_get_initial_narrow_environment",(void*)lsw__get_initial_narrow_environment},
+    {"ucrtbase.dll", "_seh_filter_exe",              (void*)lsw__seh_filter_exe},
+    {"ucrtbase.dll", "_set_new_mode",                (void*)lsw__set_new_mode},
+    {"ucrtbase.dll", "_configthreadlocale",          (void*)lsw__configthreadlocale},
+    {"ucrtbase.dll", "_wcstoui64",                   (void*)lsw__wcstoui64},
+    {"ucrtbase.dll", "_beginthreadex",               (void*)lsw__beginthreadex},
+    {"ucrtbase.dll", "_beginthread",                 (void*)lsw__beginthread},
+    {"ucrtbase.dll", "_endthreadex",                 (void*)lsw__endthreadex},
+    {"ucrtbase.dll", "terminate",                    (void*)lsw_terminate},
+    {"ucrtbase.dll", "_initterm",                    (void*)lsw__initterm},
+    {"ucrtbase.dll", "_initterm_e",                  (void*)lsw__initterm_e},
+    {"ucrtbase.dll", "_configure_narrow_argv",       (void*)lsw__configure_narrow_argv},
+    {"ucrtbase.dll", "_configure_wide_argv",         (void*)lsw__configure_wide_argv},
+    {"ucrtbase.dll", "_initialize_narrow_environment",(void*)lsw__initialize_narrow_environment},
+    {"ucrtbase.dll", "_initialize_wide_environment", (void*)lsw__initialize_wide_environment},
+    {"ucrtbase.dll", "_initialize_onexit_table",     (void*)lsw__initialize_onexit_table},
+    {"ucrtbase.dll", "_register_onexit_function",    (void*)lsw__register_onexit_function},
+    {"ucrtbase.dll", "_execute_onexit_table",        (void*)lsw__execute_onexit_table},
+    {"ucrtbase.dll", "__p___argc",                   (void*)lsw___p___argc},
+    {"ucrtbase.dll", "__p___argv",                   (void*)lsw___p___argv},
+    {"ucrtbase.dll", "__p___wargv",                  (void*)lsw___p___wargv},
+    {"ucrtbase.dll", "__p__commode",                 (void*)lsw___p__commode},
+    {"ucrtbase.dll", "_crt_atexit",                  (void*)lsw__crt_atexit},
+    {"ucrtbase.dll", "__crt_at_quick_exit",          (void*)lsw___crt_at_quick_exit},
+    {"ucrtbase.dll", "_crtAssert",                   (void*)lsw__crt_atexit}, /* no-op */
+    /* ucrtbase.dll — new stub implementations */
+    {"ucrtbase.dll", "_invoke_watson",               (void*)lsw__invoke_watson},
+    {"ucrtbase.dll", "_invalid_parameter_noinfo",    (void*)lsw__invalid_parameter_noinfo},
+    {"ucrtbase.dll", "_invalid_parameter_noinfo_noreturn",(void*)lsw__invalid_parameter_noinfo_noreturn},
+    {"ucrtbase.dll", "_flushall",                    (void*)lsw__flushall},
+    {"ucrtbase.dll", "_fdopen",                      (void*)lsw__fdopen},
+    {"ucrtbase.dll", "_lock_file",                   (void*)lsw__lock_file},
+    {"ucrtbase.dll", "_unlock_file",                 (void*)lsw__unlock_file},
+    {"ucrtbase.dll", "_time64",                      (void*)lsw__time64},
+    {"ucrtbase.dll", "_gmtime64_s",                  (void*)lsw__gmtime64_s},
+    {"ucrtbase.dll", "_isnan",                       (void*)lsw__isnan},
+    {"ucrtbase.dll", "_isnanf",                      (void*)lsw__isnanf},
+    {"ucrtbase.dll", "_finite",                      (void*)lsw__finite},
+    {"ucrtbase.dll", "_finitef",                     (void*)lsw__finitef},
+    {"ucrtbase.dll", "_copysign",                    (void*)lsw__copysign},
+    {"ucrtbase.dll", "_copysignf",                   (void*)lsw__copysignf},
+    {"ucrtbase.dll", "_dclass",                      (void*)lsw__dclass},
+    {"ucrtbase.dll", "_ldclass",                     (void*)lsw__ldclass},
+    {"ucrtbase.dll", "__setusermatherr",             (void*)lsw___setusermatherr},
+    {"ucrtbase.dll", "_controlfp_s",                 (void*)lsw__controlfp_s},
+    {"ucrtbase.dll", "__pctype_func",                (void*)lsw___pctype_func},
+    {"ucrtbase.dll", "___lc_codepage_func",          (void*)lsw____lc_codepage_func},
+    {"ucrtbase.dll", "___lc_locale_name_func",       (void*)lsw____lc_locale_name_func},
+    {"ucrtbase.dll", "___mb_cur_max_func",           (void*)lsw____mb_cur_max_func},
+    {"ucrtbase.dll", "atol",                         (void*)lsw_atol},
+    {"ucrtbase.dll", "atoi",                         (void*)lsw_atoi},
+    {"ucrtbase.dll", "strtoull",                     (void*)lsw_strtoull},
+    {"ucrtbase.dll", "wcstoul",                      (void*)lsw_wcstoul_crt},
+    {"ucrtbase.dll", "wcsftime",                     (void*)lsw_wcsftime},
+    {"ucrtbase.dll", "_wcserror_s",                  (void*)lsw__wcserror_s},
+    {"ucrtbase.dll", "_wtoi",                        (void*)lsw__wtoi},
+    {"ucrtbase.dll", "_itow_s",                      (void*)lsw__itow_s},
+    {"ucrtbase.dll", "_ltow_s",                      (void*)lsw__ltow_s},
+    {"ucrtbase.dll", "localeconv",                   (void*)lsw_localeconv},
+    {"ucrtbase.dll", "__stdio_common_vsnwprintf_s",  (void*)lsw___stdio_common_vsnwprintf_s},
+    {"ucrtbase.dll", "__stdio_common_vsprintf_s",    (void*)lsw___stdio_common_vsprintf_s},
+    /* ucrtbase.dll — math stubs */
+    {"ucrtbase.dll", "acosf",   (void*)lsw_acosf},
+    {"ucrtbase.dll", "acosh",   (void*)lsw_acosh},
+    {"ucrtbase.dll", "acoshf",  (void*)lsw_acoshf},
+    {"ucrtbase.dll", "asinf",   (void*)lsw_asinf},
+    {"ucrtbase.dll", "asinh",   (void*)lsw_asinh},
+    {"ucrtbase.dll", "asinhf",  (void*)lsw_asinhf},
+    {"ucrtbase.dll", "atan2f",  (void*)lsw_atan2f},
+    {"ucrtbase.dll", "atanf",   (void*)lsw_atanf},
+    {"ucrtbase.dll", "atanh",   (void*)lsw_atanh},
+    {"ucrtbase.dll", "atanhf",  (void*)lsw_atanhf},
+    {"ucrtbase.dll", "cbrt",    (void*)lsw_cbrt},
+    {"ucrtbase.dll", "cbrtf",   (void*)lsw_cbrtf},
+    {"ucrtbase.dll", "cosh",    (void*)lsw_cosh},
+    {"ucrtbase.dll", "coshf",   (void*)lsw_coshf},
+    {"ucrtbase.dll", "fma",     (void*)lsw_fma},
+    {"ucrtbase.dll", "fmaf",    (void*)lsw_fmaf},
+    {"ucrtbase.dll", "ilogb",   (void*)lsw_ilogb},
+    {"ucrtbase.dll", "ilogbf",  (void*)lsw_ilogbf},
+    {"ucrtbase.dll", "log10f",  (void*)lsw_log10f},
+    {"ucrtbase.dll", "log2f",   (void*)lsw_log2f},
+    {"ucrtbase.dll", "modff",   (void*)lsw_modff},
+    {"ucrtbase.dll", "sinh",    (void*)lsw_sinh},
+    {"ucrtbase.dll", "sinhf",   (void*)lsw_sinhf},
+    {"ucrtbase.dll", "tanf",    (void*)lsw_tanf},
+    {"ucrtbase.dll", "tanh",    (void*)lsw_tanh},
+    {"ucrtbase.dll", "tanhf",   (void*)lsw_tanhf},
+    {"ucrtbase.dll", "trunc",   (void*)lsw_trunc},
+    {"ucrtbase.dll", "truncf",  (void*)lsw_truncf},
+    /* ucrtbase.dll — locale locking */
+    {"ucrtbase.dll", "_lock_locales",    (void*)lsw__lock_locales},
+    {"ucrtbase.dll", "_unlock_locales",  (void*)lsw__unlock_locales},
+    /* KERNEL32.dll — qsort/RoInitialize forwarded from api-ms-win-crt-utility / api-ms-win-core-winrt */
+    {"KERNEL32.dll", "qsort",            (void*)lsw_qsort},
+    {"KERNEL32.dll", "RoInitialize",     (void*)lsw_RoInitialize},
+    {"KERNEL32.dll", "RoUninitialize",   (void*)lsw_RoUninitialize},
     /* msvcr140.dll / msvcp140.dll — VS2015 runtime DLLs */
     {"msvcr140.dll", "malloc",       (void*)lsw_malloc},
     {"msvcr140.dll", "free",         (void*)lsw_free},
@@ -12846,6 +15282,17 @@ static const win32_api_mapping_t api_mappings[] = {
     {"msvcp140.dll", "free",         (void*)lsw_free},
     {"msvcp_win.dll","malloc",       (void*)lsw_malloc},
     {"msvcp_win.dll","free",         (void*)lsw_free},
+    {"msvcp_win.dll","_Mtx_init_in_situ",    (void*)lsw__Mtx_init_in_situ},
+    {"msvcp_win.dll","_Mtx_destroy_in_situ", (void*)lsw__Mtx_destroy_in_situ},
+    {"msvcp_win.dll","_Mtx_lock",            (void*)lsw__Mtx_lock},
+    {"msvcp_win.dll","_Mtx_unlock",          (void*)lsw__Mtx_unlock},
+    {"msvcp_win.dll","_Mtx_trylock",         (void*)lsw__Mtx_trylock},
+    {"msvcp_win.dll","_Cnd_init_in_situ",    (void*)lsw__Cnd_init_in_situ},
+    {"msvcp_win.dll","_Cnd_destroy_in_situ", (void*)lsw__Cnd_destroy_in_situ},
+    {"msvcp_win.dll","_Cnd_signal",          (void*)lsw__Cnd_signal},
+    {"msvcp_win.dll","_Cnd_broadcast",       (void*)lsw__Cnd_broadcast},
+    {"msvcp_win.dll","_Cnd_wait",            (void*)lsw__Cnd_wait},
+    {"msvcp_win.dll","_Cnd_timedwait",       (void*)lsw__Cnd_timedwait},
     /* ----------------------------------------------------------------
      * vcruntime140.dll / api-ms-win-crt-* stubs
      * ---------------------------------------------------------------- */
@@ -12876,6 +15323,39 @@ static const win32_api_mapping_t api_mappings[] = {
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__acrt_iob_func",          (void*)lsw___acrt_iob_func},
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vfprintf",  (void*)lsw___stdio_common_vfprintf},
     {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsprintf",  (void*)lsw___stdio_common_vsprintf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vswprintf", (void*)lsw___stdio_common_vswprintf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vfwprintf", (void*)lsw___stdio_common_vfwprintf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsscanf",   (void*)lsw___stdio_common_vsscanf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsnprintf_s",(void*)lsw___stdio_common_vsnprintf_s},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsnwprintf_s",(void*)lsw___stdio_common_vsnwprintf_s},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__stdio_common_vsprintf_s",(void*)lsw___stdio_common_vsprintf_s},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fopen",    (void*)lsw_fopen},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fclose",   (void*)lsw_fclose},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fread",    (void*)lsw_fread},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fwrite",   (void*)lsw_fwrite},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fflush",   (void*)lsw_fflush},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fgets",    (void*)lsw_fgets},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fputs",    (void*)lsw_fputs},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fgetc",    (void*)lsw_fgetc},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fputc",    (void*)lsw_fputc},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fputwc",   (void*)lsw_fputwc},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fputws",   (void*)lsw_fputws},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fgetpos",  (void*)lsw_fgetpos},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fsetpos",  (void*)lsw_fsetpos},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "ftell",    (void*)lsw_ftell},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "fseek",    (void*)lsw_fseek},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_fseeki64",(void*)lsw__fseeki64},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "ungetc",   (void*)lsw_ungetc},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "setvbuf",  (void*)lsw_setvbuf},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_setmode",             (void*)lsw__setmode},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_dup",                 (void*)lsw__dup},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_fileno",              (void*)lsw__fileno},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_flushall",            (void*)lsw__flushall},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_wfopen",              (void*)lsw__wfopen},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_wfsopen",             (void*)lsw__wfsopen},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "__p__commode",         (void*)lsw___p__commode},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_set_fmode",           (void*)lsw__set_fmode},
+    {"api-ms-win-crt-stdio-l1-1-0.dll",   "_get_stream_buffer_pointers",(void*)lsw__get_stream_buffer_pointers},
     {"api-ms-win-crt-runtime-l1-1-0.dll", "_configure_narrow_argv",   (void*)lsw__configure_narrow_argv},
     {"api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment", (void*)lsw__initialize_narrow_environment},
     {"api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_onexit_table", (void*)lsw__initialize_onexit_table},
@@ -13018,6 +15498,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "WaitForThreadpoolIoCallbacks",    (void*)lsw_WaitForThreadpoolIoCallbacks},
     {"KERNEL32.dll", "CloseThreadpoolIo",               (void*)lsw_CloseThreadpoolIo},
     {"KERNEL32.dll", "InitOnceExecuteOnce",      (void*)lsw_InitOnceExecuteOnce},
+    {"KERNEL32.dll", "InitOnceBeginInitialize",  (void*)lsw_InitOnceBeginInitialize},
+    {"KERNEL32.dll", "InitOnceComplete",         (void*)lsw_InitOnceComplete},
     {"KERNEL32.dll", "SetHandleInformation",     (void*)lsw_SetHandleInformation},
     {"KERNEL32.dll", "GetHandleInformation",     (void*)lsw_GetHandleInformation},
     {"KERNEL32.dll", "GetCommandLineW",          (void*)lsw_GetCommandLineW},
@@ -13078,6 +15560,8 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "OpenFileMappingA",         (void*)lsw_OpenFileMappingA},
     {"KERNEL32.dll", "CreateFileMappingA",       (void*)lsw_CreateFileMappingA},
     {"KERNEL32.dll", "MapViewOfFileEx",          (void*)lsw_MapViewOfFileEx},
+    {"KERNEL32.dll", "MapViewOfFile3",           (void*)lsw_MapViewOfFile3},
+    {"kernelbase.dll", "MapViewOfFile3",         (void*)lsw_MapViewOfFile3},
     {"KERNEL32.dll", "FlushViewOfFile",          (void*)lsw_FlushViewOfFile},
     {"KERNEL32.dll", "FlushFileBuffers",         (void*)lsw_FlushFileBuffers},
     {"KERNEL32.dll", "GetFileSizeEx",            (void*)lsw_GetFileSizeEx},
@@ -13330,11 +15814,83 @@ static const win32_api_mapping_t api_mappings[] = {
     {"KERNEL32.dll", "SetLocalTime",               (void*)lsw_SetLocalTime},
     {"KERNEL32.dll", "SetSystemTime",              (void*)lsw_SetSystemTime},
 
+    /* KERNEL32.dll — .NET CLR required stubs */
+    {"KERNEL32.dll", "AddVectoredExceptionHandler",  (void*)lsw_AddVectoredExceptionHandler},
+    {"KERNEL32.dll", "RemoveVectoredExceptionHandler",(void*)lsw_RemoveVectoredExceptionHandler},
+    {"KERNEL32.dll", "AddVectoredContinueHandler",   (void*)lsw_AddVectoredContinueHandler},
+    {"KERNEL32.dll", "RemoveVectoredContinueHandler",(void*)lsw_RemoveVectoredContinueHandler},
+    {"KERNEL32.dll", "InitializeSListHead",          (void*)lsw_InitializeSListHead},
+    {"KERNEL32.dll", "QueryDepthSList",              (void*)lsw_QueryDepthSList},
+    {"KERNEL32.dll", "InterlockedPushEntrySList",    (void*)lsw_InterlockedPushEntrySList},
+    {"KERNEL32.dll", "InterlockedPopEntrySList",     (void*)lsw_InterlockedPopEntrySList},
+    {"KERNEL32.dll", "InterlockedFlushSList",        (void*)lsw_InterlockedFlushSList},
+    {"KERNEL32.dll", "FlushInstructionCache",        (void*)lsw_FlushInstructionCache},
+    {"KERNEL32.dll", "GetStringTypeW",               (void*)lsw_GetStringTypeW},
+    {"KERNEL32.dll", "GetStringTypeExW",             (void*)lsw_GetStringTypeExW},
+    {"KERNEL32.dll", "GetStringTypeA",               (void*)lsw_GetStringTypeA},
+    {"KERNEL32.dll", "GetStringTypeExA",             (void*)lsw_GetStringTypeA},
+    {"KERNEL32.dll", "QueueUserAPC",                 (void*)lsw_QueueUserAPC},
+    {"KERNEL32.dll", "SignalObjectAndWait",          (void*)lsw_SignalObjectAndWait},
+    {"KERNEL32.dll", "LocateXStateFeature",          (void*)lsw_LocateXStateFeature},
+    {"KERNEL32.dll", "RtlDeleteFunctionTable",       (void*)lsw_K32_RtlDeleteFunctionTable},
+    {"KERNEL32.dll", "RaiseFailFastException",       (void*)lsw_RaiseFailFastException},
+    /* .NET CLR — environment, locale, exception handling */
+    {"KERNEL32.dll", "GetEnvironmentStringsW",       (void*)lsw_GetEnvironmentStringsW},
+    {"KERNEL32.dll", "FreeEnvironmentStringsW",      (void*)lsw_FreeEnvironmentStringsW},
+    {"KERNEL32.dll", "GetEnvironmentStrings",        (void*)lsw_GetEnvironmentStrings},
+    {"KERNEL32.dll", "FreeEnvironmentStringsA",      (void*)lsw_FreeEnvironmentStringsA},
+    {"KERNEL32.dll", "LCMapStringEx",                (void*)lsw_LCMapStringEx},
+    {"KERNEL32.dll", "LCMapStringW",                 (void*)lsw_LCMapStringW},
+    {"KERNEL32.dll", "RtlAddFunctionTable",          (void*)lsw_RtlAddFunctionTable},
+    {"KERNEL32.dll", "RtlInstallFunctionTableCallback",(void*)lsw_RtlInstallFunctionTableCallback},
+    {"KERNEL32.dll", "RtlUnwind",                    (void*)lsw_RtlUnwind},
+    {"KERNEL32.dll", "RtlUnwindEx",                  (void*)lsw_RtlUnwindEx},
+    {"KERNEL32.dll", "RtlPcToFileHeader",            (void*)lsw_RtlPcToFileHeader},
+    {"KERNEL32.dll", "RtlRestoreContext",             (void*)lsw_RtlRestoreContext},
+    {"KERNEL32.dll", "GetSystemTimePreciseAsFileTime",(void*)lsw_GetSystemTimePreciseAsFileTime},
+    {"KERNEL32.dll", "VerifyVersionInfoW",           (void*)lsw_VerifyVersionInfoW},
+    {"KERNEL32.dll", "InitializeContext",            (void*)lsw_InitializeContext},
+    {"KERNEL32.dll", "InitializeContext2",           (void*)lsw_InitializeContext2},
+    {"KERNEL32.dll", "CopyContext",                  (void*)lsw_CopyContext},
+    {"KERNEL32.dll", "GetEnabledXStateFeatures",     (void*)lsw_GetEnabledXStateFeatures},
+    {"KERNEL32.dll", "SetXStateFeaturesMask",        (void*)lsw_SetXStateFeaturesMask},
+    {"KERNEL32.dll", "GetThreadContext",             (void*)lsw_GetThreadContext},
+    {"KERNEL32.dll", "SetThreadContext",             (void*)lsw_SetThreadContext},
+    {"KERNEL32.dll", "FlushProcessWriteBuffers",     (void*)lsw_FlushProcessWriteBuffers},
+    {"KERNEL32.dll", "IsProcessInJob",               (void*)lsw_IsProcessInJob},
+    {"KERNEL32.dll", "GetLogicalProcessorInformation",(void*)lsw_GetLogicalProcessorInformation},
+    {"KERNEL32.dll", "GetLogicalProcessorInformationEx",(void*)lsw_GetLogicalProcessorInformationEx},
+    {"KERNEL32.dll", "K32GetProcessMemoryInfo",      (void*)lsw_K32GetProcessMemoryInfo},
+    {"KERNEL32.dll", "GetNumaHighestNodeNumber",     (void*)lsw_GetNumaHighestNodeNumber},
+    {"KERNEL32.dll", "GetThreadGroupAffinity",       (void*)lsw_GetThreadGroupAffinity},
+    {"KERNEL32.dll", "SetThreadGroupAffinity",       (void*)lsw_SetThreadGroupAffinity},
+    {"KERNEL32.dll", "SetThreadIdealProcessorEx",    (void*)lsw_SetThreadIdealProcessorEx},
+    {"KERNEL32.dll", "GetThreadIdealProcessorEx",    (void*)lsw_GetThreadIdealProcessorEx},
+    {"KERNEL32.dll", "GetProcessGroupAffinity",      (void*)lsw_GetProcessGroupAffinity},
+    {"KERNEL32.dll", "GetCurrentProcessorNumberEx",  (void*)lsw_GetCurrentProcessorNumberEx},
+    {"KERNEL32.dll", "VirtualAllocExNuma",           (void*)lsw_VirtualAllocExNuma},
+    {"KERNEL32.dll", "GetNumaProcessorNodeEx",       (void*)lsw_GetNumaProcessorNodeEx},
+    {"KERNEL32.dll", "VirtualUnlock",                (void*)lsw_VirtualUnlock},
+    {"KERNEL32.dll", "QueryThreadCycleTime",         (void*)lsw_QueryThreadCycleTime},
+    {"KERNEL32.dll", "WerRegisterRuntimeExceptionModule",(void*)lsw_WerRegisterRuntimeExceptionModule},
+    {"KERNEL32.dll", "CreateActCtxW",                (void*)lsw_CreateActCtxW},
+    {"KERNEL32.dll", "ActivateActCtx",               (void*)lsw_ActivateActCtx},
+    {"KERNEL32.dll", "DeactivateActCtx",             (void*)lsw_DeactivateActCtx},
+    {"KERNEL32.dll", "ReleaseActCtx",                (void*)lsw_ReleaseActCtx},
+    {"KERNEL32.dll", "FindResourceW",                (void*)lsw_FindResourceW},
+    {"KERNEL32.dll", "FindResourceExW",              (void*)lsw_FindResourceExW},
+    {"KERNEL32.dll", "CreateMemoryResourceNotification",(void*)lsw_CreateMemoryResourceNotification},
+    {"KERNEL32.dll", "QueryMemoryResourceNotification",(void*)lsw_QueryMemoryResourceNotification},
+    {"KERNEL32.dll", "QueryInformationJobObject",    (void*)lsw_QueryInformationJobObject},
+
     /* CRYPTBASE.dll — RtlGenRandom alias */
     {"CRYPTBASE.dll","SystemFunction036",          (void*)lsw_SystemFunction036},
 
     /* advapi32.dll — same RtlGenRandom export */
     {"ADVAPI32.dll", "SystemFunction036",          (void*)lsw_SystemFunction036},
+    /* ADVAPI32 — security stubs for .NET CLR */
+    {"ADVAPI32.dll", "SetKernelObjectSecurity",    (void*)lsw_SetKernelObjectSecurity},
+    {"ADVAPI32.dll", "SetThreadToken",             (void*)lsw_SetThreadToken},
 
     /* api-ms-win-service-management-l1-1-0.dll aliases */
     {"api-ms-win-service-management-l1-1-0.dll", "GetServiceDisplayNameW", (void*)lsw_GetServiceDisplayNameW},
@@ -13530,8 +16086,11 @@ static int __attribute__((ms_abi)) generic_stub(void) {
     return 0;
 }
 
+extern void lsw_dotnet_init(void); /* dotnet_host_api.c */
+
 void win32_api_init(void) {
     LSW_LOG_INFO("Initialized %zu Win32 API mappings", api_mappings_count);
+    lsw_dotnet_init();
 }
 
 void* win32_api_get_generic_stub(void) {
@@ -13684,6 +16243,8 @@ extern win32_api_mapping_t        win32_api_advapi32_mappings[];
 extern size_t                     win32_api_advapi32_mappings_count;
 extern const win32_api_mapping_t  win32_api_game_mappings[];
 extern const size_t               win32_api_game_mappings_count;
+extern const win32_api_mapping_t  win32_api_dotnet_mappings[];
+extern const size_t               win32_api_dotnet_mappings_count;
 
 void* win32_api_resolve(const char* dll_name, const char* function_name) {
     /* Primary table */
@@ -13774,6 +16335,40 @@ void* win32_api_resolve(const char* dll_name, const char* function_name) {
             return win32_api_game_mappings[i].implementation;
         }
     }
+    /* .NET CLR hosting (hostfxr.dll / nethost.dll) */
+    for (size_t i = 0; i < win32_api_dotnet_mappings_count; i++) {
+        if (strcasecmp(win32_api_dotnet_mappings[i].dll_name, dll_name) == 0 &&
+            strcmp(win32_api_dotnet_mappings[i].function_name, function_name) == 0) {
+            LSW_LOG_DEBUG("Resolved(dotnet) %s!%s -> %p", dll_name, function_name, win32_api_dotnet_mappings[i].implementation);
+            return win32_api_dotnet_mappings[i].implementation;
+        }
+    }
+
+    /* api-ms-win-crt-*.dll and api-ms-win-core-*.dll are Windows umbrella/forwarding
+     * DLLs that redirect everything to ucrtbase.dll or kernel32.dll.  If we didn't
+     * find the function under its original DLL name, retry with the known backing DLLs
+     * so we don't stub out basic CRT/kernel functions (memset, wcscmp, etc.). */
+    if (strncasecmp(dll_name, "api-ms-win-crt-", 15) == 0) {
+        static const char* crt_backings[] = {"ucrtbase.dll", "msvcrt.dll", NULL};
+        for (const char** b = crt_backings; *b; b++) {
+            void* addr = win32_api_resolve(*b, function_name);
+            if (addr && addr != (void*)(uintptr_t)generic_stub) {
+                LSW_LOG_DEBUG("CRT forwarding: %s!%s -> %s!%s -> %p", dll_name, function_name, *b, function_name, addr);
+                return addr;
+            }
+        }
+    }
+    if (strncasecmp(dll_name, "api-ms-win-core-", 16) == 0 ||
+        strncasecmp(dll_name, "api-ms-win-",      11) == 0) {
+        static const char* core_backings[] = {"KERNEL32.dll", "ntdll.dll", "ucrtbase.dll", NULL};
+        for (const char** b = core_backings; *b; b++) {
+            void* addr = win32_api_resolve(*b, function_name);
+            if (addr && addr != (void*)(uintptr_t)generic_stub) {
+                LSW_LOG_DEBUG("API-set forwarding: %s!%s -> %s!%s -> %p", dll_name, function_name, *b, function_name, addr);
+                return addr;
+            }
+        }
+    }
 
     LSW_LOG_WARN("Could not resolve %s!%s - returning stub", dll_name, function_name);
     return (void*)(uintptr_t)generic_stub;
@@ -13814,6 +16409,7 @@ void* win32_api_resolve_any(const char* function_name) {
     SEARCH_TABLE(win32_api_misc_mappings,    win32_api_misc_mappings_count)
     SEARCH_TABLE(win32_api_advapi32_mappings,win32_api_advapi32_mappings_count)
     SEARCH_TABLE(win32_api_game_mappings,    win32_api_game_mappings_count)
+    SEARCH_TABLE(win32_api_dotnet_mappings,  win32_api_dotnet_mappings_count)
     #undef SEARCH_TABLE
     return NULL;
 }
