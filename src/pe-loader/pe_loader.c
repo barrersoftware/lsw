@@ -27,6 +27,17 @@
 #include <ucontext.h>
 #include <setjmp.h>
 #include <ctype.h>
+#include <pthread.h>
+
+/* Main thread ID — crashes in other threads don't kill the process */
+static pthread_t g_main_thread_id = 0;
+
+/* TLS callbacks stored globally so new threads can receive DLL_THREAD_ATTACH.
+ * Filled by pe_process_tls_callbacks(); consumed by pe_call_tls_thread_attach(). */
+#define LSW_MAX_TLS_CALLBACKS 32
+static pe_tls_callback_t g_tls_callbacks[LSW_MAX_TLS_CALLBACKS];
+static int               g_tls_callback_count = 0;
+static void*             g_tls_cb_image_base  = NULL;
 
 // ============================================================================
 // DLL chain loader — real DLL search & export resolution
@@ -298,6 +309,91 @@ static int lsw_dispatch_exception(uint32_t code, siginfo_t* si, ucontext_t* uc) 
             (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
             (unsigned long long)uc->uc_mcontext.gregs[REG_RBX],
             (unsigned long long)uc->uc_mcontext.gregs[REG_RCX]);
+        LSW_LOG_ERROR("  RDI=0x%llx RSI=0x%llx RDX=0x%llx R8=0x%llx R9=0x%llx R10=0x%llx R11=0x%llx",
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RDI],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RSI],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_R8],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_R9],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_R10],
+            (unsigned long long)uc->uc_mcontext.gregs[REG_R11]);
+    }
+#endif
+
+    /* --- .NET 8 NativeAOT GC exception interceptors ---
+     *
+     * The NativeAOT GC write-barrier formula computes a card-table address:
+     *   card_offset = (slot_low16 - 0x1000) >> 7  (logical shift, unsigned)
+     *
+     * When a managed slot lives below region+0x1000 (heap_segment header on
+     * Linux is ~0x3e8 bytes, so first object lands at region+0x3e8), the
+     * subtraction wraps to a large positive value.  After shr by 7 the result
+     * is non-canonical (> 0x7fffffffffff on Linux), producing a #GP that the
+     * kernel reports as SIGSEGV.  Non-canonical addresses cannot be mapped, so
+     * we must SKIP the instruction rather than fix the fault address.
+     *
+     * Interceptor 1 — write-barrier card overflow:
+     *   movzbl (%rdi,%rbx,1), %eax  [0F B6 04 1F, 4 bytes]
+     *   RDI is the overflowed card offset (non-canonical).
+     *   Fix: RAX=0 ("card already dirty" → write-barrier fast return), RIP+=4.
+     *
+     * Interceptor 2 — GC card-scan secondary null-deref:
+     *   movzbl 0x690(%r10), %eax  [41 0F B6 82 90 06 00 00, 8 bytes]
+     *   Occurs during GC scan when the card-table base (R10) is near-null
+     *   because prior card marks were skipped.
+     *   Fix: RAX=0 ("no dirty cards in this range"), RIP+=8.
+     * --------------------------------------------------------------- */
+#ifdef __x86_64__
+    if (code == WIN_EXCEPTION_ACCESS_VIOLATION && uc) {
+        uint64_t rdi = (uint64_t)(unsigned long long)uc->uc_mcontext.gregs[REG_RDI];
+        uint64_t rip = (uint64_t)(unsigned long long)uc->uc_mcontext.gregs[REG_RIP];
+        const uint8_t *ip = (const uint8_t *)(uintptr_t)rip;
+
+        /* Interceptor 1: write-barrier overflow — non-canonical RDI */
+        if (rdi > 0x00007fffffffffffULL &&
+            ip[0] == 0x0f && ip[1] == 0xb6 && ip[2] == 0x04 && ip[3] == 0x1f) {
+            /* Set RAX=0 (AL=0) — the write barrier checks "if AL==0, skip via 'je' to epilogue".
+             * Card byte = 0 means "clean/no-action-needed"; the je skips the card write
+             * at the non-canonical address, jumps directly to the function epilogue. */
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 4);
+            LSW_LOG_WARN("write-barrier overflow at 0x%llx (rdi=0x%llx) — skipping card mark",
+                         (unsigned long long)rip, (unsigned long long)rdi);
+            return 1;
+        }
+
+        /* Interceptor 2: GC card-scan fault — movzbl 0x690(%r10), %eax
+         * [41 0F B6 82 90 06 00 00, 8 bytes]
+         * Fires when GC card scanning reaches unmapped card-table memory.
+         * R10 may be non-null but points past the allocated card-table region.
+         *
+         * The surrounding function (decoded at RVA 0x22c4b1):
+         *   movzbl 0x690(%r10), %eax   ← crash here
+         *   cmp $0xff, %al             ; is card byte 0xff?
+         *   je  step2                  ; if yes → jump (skip heavy path)
+         *   lea 0x8(%rax), %rcx        ; else: compute scan pos from card value
+         *   shl $0x9, %rcx
+         *   add %r9, %rcx              ; rcx = heap_base + computed_offset
+         *   step2: test %rcx, %rcx     ; rcx=0 → nothing to scan
+         *   je   done                  ; → return 0
+         *   movzbl 0x618(%r10), %eax   ← second crash if we reach here
+         *   ...
+         *   done: mov %rcx, %rax ; ret
+         *
+         * Fix: set AL=0xFF → je step2 taken; with RCX forced to 0 the
+         * "test %rcx,%rcx → je done" path fires immediately → function
+         * returns 0 ("no segments to scan"), bypassing both crash sites. */
+        uint64_t r10 = (uint64_t)(unsigned long long)uc->uc_mcontext.gregs[REG_R10];
+        if (ip[0] == 0x41 && ip[1] == 0x0f && ip[2] == 0xb6 &&
+            ip[3] == 0x82 && ip[4] == 0x90 && ip[5] == 0x06 &&
+            ip[6] == 0x00 && ip[7] == 0x00) {
+            uc->uc_mcontext.gregs[REG_RAX] = 0xFF; /* card byte = end-of-list marker */
+            uc->uc_mcontext.gregs[REG_RCX] = 0;    /* no current scan position */
+            uc->uc_mcontext.gregs[REG_RIP] = (greg_t)(rip + 8);
+            LSW_LOG_WARN("GC scan fault at 0x%llx (r10=0x%llx) — returning end-of-list",
+                         (unsigned long long)rip, (unsigned long long)r10);
+            return 1;
+        }
     }
 #endif
 
@@ -366,6 +462,12 @@ static void lsw_signal_handler(int sig, siginfo_t* si, void* ctx) {
     }
 
     if (!lsw_dispatch_exception(code, si, uc)) {
+        if (g_main_thread_id != 0 && !pthread_equal(pthread_self(), g_main_thread_id)) {
+            /* Background thread crash — log and exit just this thread */
+            LSW_LOG_WARN("Background thread crash: signal %d at %p — exiting thread only",
+                         sig, si->si_addr);
+            pthread_exit(NULL);
+        }
         LSW_LOG_ERROR("Fatal: unhandled signal %d at %p — terminating", sig, si->si_addr);
         _exit(139);
     }
@@ -596,6 +698,14 @@ bool pe_apply_section_permissions(pe_image_t* image) {
         if (ch & PE_SCN_MEM_EXECUTE) prot |= PROT_READ | PROT_EXEC;
         if (prot == 0) prot = PROT_READ; // at least readable
 
+        /* Windows maps "READONLY" data sections (e.g. .rdata) as PAGE_WRITECOPY,
+         * which grants write-on-first-touch per process.  The .NET runtime (and MSVC
+         * CRT) write into .rdata during startup for lazy-init slots and thread-local
+         * storage.  On Linux we simulate that by keeping the WRITE bit set for any
+         * section flagged as DATA, even when it lacks the explicit WRITE characteristic. */
+        if ((ch & PE_SCN_CNT_INITIALIZED_DATA) || (ch & PE_SCN_CNT_UNINITIALIZED_DATA))
+            prot |= PROT_WRITE;
+
         void* va   = (uint8_t*)image->image_base + sec->VirtualAddress;
         size_t sz  = sec->VirtualSize ? sec->VirtualSize : sec->SizeOfRawData;
 
@@ -697,7 +807,8 @@ bool pe_resolve_imports(pe_image_t* image) {
             if (!func_addr)
                 func_addr = resolve_import_with_dll_chain(dll_name, func_name);
             if (func_addr) {
-                LSW_LOG_DEBUG("    ✓ %s -> %p", func_name, func_addr);
+                void* iat_slot = (void*)&((uint64_t*)iat_base)[i];
+                LSW_LOG_DEBUG("    ✓ %s -> %p (iat=%p)", func_name, func_addr, iat_slot);
             } else {
                 LSW_LOG_WARN("    ✗ %s!%s - unresolved, using stub", dll_name, func_name);
                 func_addr = win32_api_get_generic_stub();
@@ -961,29 +1072,95 @@ bool pe_apply_relocations(pe_image_t* image) {
 }
 
 /*
- * pe_process_tls_callbacks - Execute TLS callbacks before the entry point.
+ * pe_process_tls_callbacks - Set up TLS storage and execute TLS callbacks.
  *
  * Windows PE files may have a TLS (Thread-Local Storage) directory that
- * contains a NULL-terminated list of callback function pointers.  These
- * must be invoked with reason DLL_PROCESS_ATTACH (1) before the executable
- * entry point runs — typically the MSVC CRT uses them to call per-module
- * C++ static constructors.
+ * describes per-thread data and a NULL-terminated list of callback functions.
+ * These callbacks must be invoked with reason DLL_PROCESS_ATTACH (1) before
+ * the executable entry point runs.
+ *
+ * Critically, this function also sets up TEB.ThreadLocalStoragePointer
+ * (gs:0x58).  The .NET CLR and many other runtimes read this field to access
+ * their thread-local state.  If it is NULL the CLR will immediately crash with
+ * a null-pointer dereference inside the runtime initialisation code.
+ *
+ * What we do:
+ *   1. Parse the TLS directory to find the raw data template and index slot.
+ *   2. Allocate a TLS data block and copy the template into it.
+ *   3. Allocate a TLS slot array (256 void* pointers — enough for .NET + DLLs).
+ *   4. Write TLS index 0 into *AddressOfIndex.
+ *   5. Set tls_array[0] = tls_data_block.
+ *   6. Set TEB.ThreadLocalStoragePointer = tls_array.
+ *   7. Run TLS callbacks.
  *
  * Both 32-bit and 64-bit TLS directory layouts are handled.
- * If there is no TLS directory the function returns true immediately.
+ * If there is no TLS directory the function still allocates a minimal
+ * TLS array so that gs:0x58 is never NULL.
  */
 bool pe_process_tls_callbacks(pe_image_t* image) {
-    pe_data_directory_t* tls_dir = pe_get_data_directory(&image->pe, PE_DIR_TLS);
-    if (!tls_dir || tls_dir->VirtualAddress == 0 || tls_dir->Size == 0) {
-        return true;  /* No TLS directory — nothing to do */
+    /* Always allocate a TLS slot array so gs:0x58 is never NULL.
+     * 256 slots covers all practical scenarios (.NET, DLLs, etc.) */
+    void** tls_array = (void**)calloc(256, sizeof(void*));
+    if (!tls_array) {
+        LSW_LOG_ERROR("Failed to allocate TLS slot array");
+        return false;
     }
 
-    LSW_LOG_INFO("TLS directory found at RVA 0x%x — processing callbacks", tls_dir->VirtualAddress);
+    /* TEB must be initialized before we can set ThreadLocalStoragePointer.
+     * win32_teb_init() is idempotent — safe to call if already initialized. */
+    win32_teb_t* teb = win32_teb_get();
+    if (!teb) {
+        if (win32_teb_init() == 0)
+            teb = win32_teb_get();
+    }
+    if (teb) {
+        teb->ThreadLocalStoragePointer = tls_array;
+        LSW_LOG_INFO("TLS: slot array at %p set into TEB.ThreadLocalStoragePointer", tls_array);
+    } else {
+        LSW_LOG_WARN("TLS: TEB not available — ThreadLocalStoragePointer not set (CLR will crash)");
+    }
+
+    pe_data_directory_t* tls_dir = pe_get_data_directory(&image->pe, PE_DIR_TLS);
+    if (!tls_dir || tls_dir->VirtualAddress == 0 || tls_dir->Size == 0) {
+        /* No TLS directory — minimal setup is done; register empty template
+         * so secondary threads still allocate a valid (zeroed) TLS block. */
+        win32_tls_register_template(NULL, 0, 0);
+        return true;  /* No TLS directory — minimal setup done */
+    }
+
+    LSW_LOG_INFO("TLS directory found at RVA 0x%x — setting up TLS data + callbacks", tls_dir->VirtualAddress);
 
     if (image->pe.is_64bit) {
         pe_tls_directory64_t* tls = (pe_tls_directory64_t*)(
             (uint8_t*)image->image_base + tls_dir->VirtualAddress);
 
+        /* Allocate TLS data block and populate slot 0 */
+        size_t raw_size = 0;
+        if (tls->EndAddressOfRawData > tls->StartAddressOfRawData)
+            raw_size = (size_t)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+        size_t total_size = raw_size + tls->SizeOfZeroFill;
+
+        if (total_size > 0) {
+            void* tls_data = calloc(1, total_size + 16);
+            if (tls_data && raw_size > 0)
+                memcpy(tls_data, (void*)(uintptr_t)tls->StartAddressOfRawData, raw_size);
+            tls_array[0] = tls_data;
+            LSW_LOG_INFO("TLS: data block %p (%zu raw + %u zero bytes) → slot[0]",
+                         tls_data, raw_size, tls->SizeOfZeroFill);
+        }
+
+        /* Register template BEFORE running callbacks: the DLL_PROCESS_ATTACH
+         * callbacks may create background threads immediately, and those threads
+         * call win32_teb_init() which needs the template to build their TLS blocks. */
+        win32_tls_register_template(
+            raw_size > 0 ? (void*)(uintptr_t)tls->StartAddressOfRawData : NULL,
+            raw_size, tls->SizeOfZeroFill);
+
+        /* Write TLS index (0) into the module's index variable */
+        if (tls->AddressOfIndex)
+            *(uint32_t*)(uintptr_t)tls->AddressOfIndex = 0;
+
+        /* Run TLS callbacks */
         if (tls->AddressOfCallBacks) {
             pe_tls_callback_t* cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
             int n = 0;
@@ -994,11 +1171,42 @@ bool pe_process_tls_callbacks(pe_image_t* image) {
                 n++;
             }
             LSW_LOG_INFO("  Executed %d TLS callback(s)", n);
+            /* Store callbacks for DLL_THREAD_ATTACH calls on future threads */
+            g_tls_cb_image_base = image->image_base;
+            cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
+            g_tls_callback_count = 0;
+            while (*cb && g_tls_callback_count < LSW_MAX_TLS_CALLBACKS)
+                g_tls_callbacks[g_tls_callback_count++] = *cb++;
+        } else {
+            g_tls_cb_image_base = image->image_base;
         }
     } else {
         pe_tls_directory32_t* tls = (pe_tls_directory32_t*)(
             (uint8_t*)image->image_base + tls_dir->VirtualAddress);
 
+        /* Allocate TLS data block and populate slot 0 */
+        size_t raw_size = 0;
+        if (tls->EndAddressOfRawData > tls->StartAddressOfRawData)
+            raw_size = (size_t)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+        size_t total_size = raw_size + tls->SizeOfZeroFill;
+
+        if (total_size > 0) {
+            void* tls_data = calloc(1, total_size + 16);
+            if (tls_data && raw_size > 0)
+                memcpy(tls_data, (void*)(uintptr_t)tls->StartAddressOfRawData, raw_size);
+            tls_array[0] = tls_data;
+        }
+
+        /* Register template BEFORE callbacks (same reasoning as 64-bit path above) */
+        win32_tls_register_template(
+            raw_size > 0 ? (void*)(uintptr_t)tls->StartAddressOfRawData : NULL,
+            raw_size, tls->SizeOfZeroFill);
+
+        /* Write TLS index (0) into the module's index variable */
+        if (tls->AddressOfIndex)
+            *(uint32_t*)(uintptr_t)tls->AddressOfIndex = 0;
+
+        /* Run TLS callbacks */
         if (tls->AddressOfCallBacks) {
             pe_tls_callback_t* cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
             int n = 0;
@@ -1009,10 +1217,33 @@ bool pe_process_tls_callbacks(pe_image_t* image) {
                 n++;
             }
             LSW_LOG_INFO("  Executed %d TLS callback(s)", n);
+            /* Store callbacks for DLL_THREAD_ATTACH calls on future threads */
+            g_tls_cb_image_base = image->image_base;
+            cb = (pe_tls_callback_t*)(uintptr_t)tls->AddressOfCallBacks;
+            g_tls_callback_count = 0;
+            while (*cb && g_tls_callback_count < LSW_MAX_TLS_CALLBACKS)
+                g_tls_callbacks[g_tls_callback_count++] = *cb++;
+        } else {
+            g_tls_cb_image_base = image->image_base;
         }
     }
 
     return true;
+}
+
+/*
+ * Call stored TLS callbacks with DLL_THREAD_ATTACH for the calling thread.
+ * Mirrors what Windows does when a new thread starts: every loaded module's
+ * DllMain (or, for a NativeAOT exe, its TLS callbacks) is invoked so the
+ * runtime can set up per-thread state — GC thread-local segments, CRT data, etc.
+ */
+void pe_call_tls_thread_attach(void) {
+    if (g_tls_callback_count == 0)
+        return;
+    for (int i = 0; i < g_tls_callback_count; i++) {
+        if (g_tls_callbacks[i])
+            g_tls_callbacks[i](g_tls_cb_image_base, 2 /* DLL_THREAD_ATTACH */, NULL);
+    }
 }
 
 int pe_execute(pe_image_t* image, int argc, char** argv) {
@@ -1075,6 +1306,9 @@ int pe_execute(pe_image_t* image, int argc, char** argv) {
     
     // Install SEH-emulating signal handlers
     lsw_install_signal_handlers();
+    
+    /* Record main thread ID so background thread crashes don't kill the process */
+    g_main_thread_id = pthread_self();
     
     LSW_LOG_INFO("Entry point type: %s", 
                  image->pe.nt_headers64 && image->pe.nt_headers64->OptionalHeader.Subsystem == 3 ? 

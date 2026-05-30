@@ -141,6 +141,7 @@ sudo insmod build/lsw.ko
 - ✅ MSI installer launch
 - ✅ 7-Zip, compression tools
 - ✅ Windows system utilities (ipconfig, netstat, systeminfo, etc.)
+- ✅ **.NET 8 NativeAOT self-contained executables** — 20/20 stability, GC write-barrier and card-scan exceptions fully intercepted
 
 ## What Doesn't Work Yet
 
@@ -149,6 +150,7 @@ sudo insmod build/lsw.ko
 - ❌ **WMI-heavy tools** — `tasklist.exe` needs framedynos.dll CHString vtable emulation
 - ❌ **Full NT file I/O** — `NtOpenFile`/`NtQueryDirectoryFile` are stubs; apps using NT paths for file enumeration see no files
 - ❌ **Driver-dependent features** — anything requiring actual Windows kernel drivers
+- ❌ **.NET CLR runtime hosting** — framework-dependent .NET apps (not self-contained) still need CLR hosting support
 
 ---
 
@@ -177,7 +179,7 @@ If anyone charges you for LSW, report it: legal@barrersoftware.com
 - DirectX → Vulkan translation layer
 
 ### Long Term
-- `.NET` / CLR runtime hosting
+- `.NET` CLR runtime hosting (framework-dependent apps, not self-contained NativeAOT)
 - UWP / AppX support
 - MSI full installation (registry, shortcuts, services)
 
